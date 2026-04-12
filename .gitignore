@@ -1,0 +1,13 @@
+# Backend 
+__pycache__/ 
+*.pyc 
+.env 
+venv/ 
+env/ 
+ECHO is on.
+# Frontend 
+node_modules/ 
+.env.local 
+.cache/ 
+dist/ 
+build/ 

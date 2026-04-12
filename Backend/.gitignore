@@ -1,0 +1,22 @@
+# Python virtual environment
+venv/
+backend/venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Flutter
+.build/
+.dart_tool/
+
+# Android
+*.iml
+.gradle/
+local.properties
+# Environment variables
+.env
+backend/.env
