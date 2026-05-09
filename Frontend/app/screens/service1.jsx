@@ -151,7 +151,7 @@ const styles = StyleSheet.create({
   description: {
     fontSize: 16,
     fontFamily: "Poppins-Regular",
-    color: "#06020b00",
+    color: "#10baf382",
     textAlign: "center",
     lineHeight: 24,
   },

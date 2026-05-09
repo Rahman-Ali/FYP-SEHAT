@@ -1,10 +1,6 @@
+//D:\project\Frontend\app\services\api.jsx
 import axios from "axios";
-
-
-//faculty : 10.10.40.230
-//itel : 192.168.4.134
-//kaxhi    10.17.158.134
-const BASE_IP = "10.17.158.134"; 
+const BASE_IP = "10.10.40.104"; 
 const BASE_URL = `http://${BASE_IP}:8000/api`;
 
 const api = axios.create({

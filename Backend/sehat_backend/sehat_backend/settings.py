@@ -10,7 +10,7 @@ DEBUG = config('DEBUG', default=True, cast=bool)
 #itel : 192.168.4.134
 #kaxhi    10.17.158.134
 
-ALLOWED_HOSTS = ['localhost','154.80.22.201' '127.0.0.1','10.10.40.163','192.168.4.134' ,'10.17.158.134','*']
+ALLOWED_HOSTS = ['10.10.40.60','localhost','154.80.22.201' ,'127.0.0.1','10.10.40.163','192.168.4.134' ,'10.17.158.134','*']
 
 # Applications
 INSTALLED_APPS = [

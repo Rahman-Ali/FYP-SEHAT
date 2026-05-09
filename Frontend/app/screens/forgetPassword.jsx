@@ -1,7 +1,9 @@
+//D:\project\Frontend\app\screens\forgetPassword.jsx
 import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { useState } from "react";
 import {
+  ActivityIndicator,
   Image,
   ImageBackground,
   Platform,
@@ -12,12 +14,15 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { sendPasswordResetEmail } from "firebase/auth";
+import { auth } from "../../firebase.config";
 
 export default function ForgetPassword() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [errorMessage, setErrorMessage] = useState(null);
   const [successMessage, setSuccessMessage] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
 
   const handleInputChange = (setter) => (value) => {
     setter(value);
@@ -25,7 +30,7 @@ export default function ForgetPassword() {
     if (successMessage) setSuccessMessage(null);
   };
 
-  const handleReset = () => {
+  const handleReset = async () => {
     setErrorMessage(null);
     setSuccessMessage(null);
 
@@ -34,7 +39,23 @@ export default function ForgetPassword() {
       return;
     }
 
-    setSuccessMessage("Password reset email sent! Check your inbox.");
+    setIsLoading(true);
+
+    try {
+      await sendPasswordResetEmail(auth, email);
+      setSuccessMessage("Password reset email sent! Check your inbox.");
+      setEmail("");
+    } catch (error) {
+      if (error.code === "auth/user-not-found") {
+        setErrorMessage("No account found with this email");
+      } else if (error.code === "auth/invalid-email") {
+        setErrorMessage("Invalid email address");
+      } else {
+        setErrorMessage(error.message || "Failed to send reset email");
+      }
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleBackToLogin = () => {
@@ -51,8 +72,6 @@ export default function ForgetPassword() {
       >
         <View style={styles.safeArea}>
           <View style={styles.content}>
-
-            
             <View style={styles.logoContainer}>
               <Image
                 source={require("../../assets/images/sehat_logo.png")}
@@ -65,7 +84,6 @@ export default function ForgetPassword() {
               </Text>
             </View>
 
-            
             <View style={styles.form}>
               <TextInput
                 placeholder="Email"
@@ -74,17 +92,17 @@ export default function ForgetPassword() {
                 style={styles.input}
                 placeholderTextColor="#999"
                 keyboardType="email-address"
+                autoCapitalize="none"
               />
             </View>
 
-            
             {errorMessage && (
               <Text style={{ color: "red", marginBottom: 10 }}>
                 {errorMessage}
               </Text>
             )}
             {successMessage && (
-              <Text style={{ color: "green", marginBottom: 10 }}>
+              <Text style={{ color: "green", marginBottom: 10, textAlign: "center" }}>
                 {successMessage}
               </Text>
             )}
@@ -93,6 +111,7 @@ export default function ForgetPassword() {
               activeOpacity={0.8}
               style={styles.buttonShadow}
               onPress={handleReset}
+              disabled={isLoading}
             >
               <LinearGradient
                 colors={["#5DB8FF", "#3EADCF", "#ABE098"]}
@@ -100,7 +119,11 @@ export default function ForgetPassword() {
                 end={{ x: 1, y: 0.5 }}
                 style={styles.button}
               >
-                <Text style={styles.buttonText}>RESET PASSWORD</Text>
+                {isLoading ? (
+                  <ActivityIndicator size="small" color="#FFF" />
+                ) : (
+                  <Text style={styles.buttonText}>RESET PASSWORD</Text>
+                )}
               </LinearGradient>
             </TouchableOpacity>
 
@@ -110,7 +133,6 @@ export default function ForgetPassword() {
                 <Text style={styles.signinText}> Login In</Text>
               </TouchableOpacity>
             </View>
-
           </View>
         </View>
       </ImageBackground>
@@ -119,84 +141,20 @@ export default function ForgetPassword() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  background: {
-    flex: 1,
-  },
-  safeArea: {
-    flex: 1,
-    paddingTop: Platform.OS === "android" ? StatusBar.currentHeight : 0,
-  },
-  content: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "space-around",
-    paddingHorizontal: 20,
-  },
-  logoContainer: {
-    alignItems: "center",
-    marginTop: 40,
-  },
-  logo: {
-    width: 200,
-    height: 200,
-  },
-  title: {
-    fontSize: 22,
-    fontWeight: "bold",
-    color: "#333",
-    marginTop: 10,
-  },
-  subtitle: {
-    fontSize: 14,
-    color: "#666",
-    marginTop: 5,
-    textAlign: "center",
-    paddingHorizontal: 20,
-  },
-  form: {
-    width: "100%",
-    marginTop: 10,
-  },
-  input: {
-    backgroundColor: "#FFFFFF",
-    borderRadius: 25,
-    paddingVertical: 14,
-    paddingHorizontal: 20,
-    marginBottom: 15,
-    fontSize: 15,
-    elevation: 3,
-  },
-  buttonShadow: {
-    width: "75%",
-    borderRadius: 30,
-    elevation: 8,
-    marginBottom: 20,
-  },
-  button: {
-    paddingVertical: 18,
-    borderRadius: 30,
-    alignItems: "center",
-  },
-  buttonText: {
-    color: "#FFF",
-    fontWeight: "bold",
-    fontSize: 16,
-    letterSpacing: 1.2,
-  },
-  footer: {
-    flexDirection: "row",
-    marginBottom: 30,
-  },
-  footerText: {
-    color: "#555",
-    fontSize: 14,
-  },
-  signinText: {
-    color: "#3EADCF",
-    fontWeight: "bold",
-    fontSize: 14,
-  },
+  container: { flex: 1 },
+  background: { flex: 1 },
+  safeArea: { flex: 1, paddingTop: Platform.OS === "android" ? StatusBar.currentHeight : 0 },
+  content: { flex: 1, alignItems: "center", justifyContent: "space-around", paddingHorizontal: 20 },
+  logoContainer: { alignItems: "center", marginTop: 40 },
+  logo: { width: 200, height: 200 },
+  title: { fontSize: 22, fontWeight: "bold", color: "#333", marginTop: 10 },
+  subtitle: { fontSize: 14, color: "#666", marginTop: 5, textAlign: "center", paddingHorizontal: 20 },
+  form: { width: "100%", marginTop: 10 },
+  input: { backgroundColor: "#FFFFFF", borderRadius: 25, paddingVertical: 14, paddingHorizontal: 20, marginBottom: 15, fontSize: 15, elevation: 3 },
+  buttonShadow: { width: "75%", borderRadius: 30, elevation: 8, marginBottom: 20 },
+  button: { paddingVertical: 18, borderRadius: 30, alignItems: "center" },
+  buttonText: { color: "#FFF", fontWeight: "bold", fontSize: 16, letterSpacing: 1.2 },
+  footer: { flexDirection: "row", marginBottom: 30 },
+  footerText: { color: "#555", fontSize: 14 },
+  signinText: { color: "#3EADCF", fontWeight: "bold", fontSize: 14 },
 });

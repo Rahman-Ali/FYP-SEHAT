@@ -21,7 +21,10 @@ class VectorStoreService:
         self._all_chunks = []
         self.is_ready = False
         
-        self.NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        self.NEO4J_URI = os.getenv(
+        "NEO4J_URI",
+        "neo4j+s://98b70f75.databases.neo4j.io"
+)
         self.NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
         self.NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
         self.NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
@@ -30,7 +33,6 @@ class VectorStoreService:
         self._test_connection()
 
     def _initialize_models(self):
-        """Load embedding models."""
         try:
             socket.setdefaulttimeout(60)
             self.embeddings_model = HuggingFaceEmbeddings(
@@ -42,11 +44,10 @@ class VectorStoreService:
             print(f"Embedding model load failed: {e}")
 
     def _test_connection(self):
-        """Test Neo4j connection."""
         try:
             driver = GraphDatabase.driver(
-                self.NEO4J_URI,
-                auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD)
+            self.NEO4J_URI,
+            auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD)
             )
             driver.verify_connectivity()
             driver.close()
@@ -56,7 +57,6 @@ class VectorStoreService:
             raise
 
     def add_chunks_to_store(self, chunks):
-        """Add document chunks to Neo4j vector store and BM25 index."""
         print(f"Adding {len(chunks)} chunks to Neo4j...")
         
         try:
@@ -104,8 +104,94 @@ class VectorStoreService:
         
         print(f"Total chunks in store: {len(self._all_chunks)}")
 
+    def delete_chunks_by_source(self, source_file: str) -> int:
+        """Delete all chunks from Neo4j that belong to a specific source file."""
+        try:
+            driver = GraphDatabase.driver(
+                self.NEO4J_URI,
+                auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD)
+            )
+            with driver.session(database=self.NEO4J_DATABASE) as session:
+                # Match by source_file property
+                result = session.run(
+                    "MATCH (n:MedicalDocument) "
+                    "WHERE n.source_file = $source "
+                    "DETACH DELETE n "
+                    "RETURN count(n) AS deleted_count",
+                    source=source_file
+                )
+                record = result.single()
+                deleted_count = record["deleted_count"] if record else 0
+                
+                print(f"Deleted {deleted_count} chunks from Neo4j for: {source_file}")
+                
+                # If 0 deleted, try alternate query with source file in text
+                if deleted_count == 0:
+                    result2 = session.run(
+                        "MATCH (n:MedicalDocument) "
+                        "WHERE n.text CONTAINS $source "
+                        "DETACH DELETE n "
+                        "RETURN count(n) AS deleted_count",
+                        source=source_file
+                    )
+                    record2 = result2.single()
+                    deleted_count = record2["deleted_count"] if record2 else 0
+                    print(f"Alternate query deleted {deleted_count} chunks for: {source_file}")
+            
+            driver.close()
+            
+            # Update local BM25 index
+            self._all_chunks = [
+                chunk for chunk in self._all_chunks 
+                if chunk.metadata.get("source_file") != source_file
+            ]
+            
+            if self._all_chunks:
+                self.sparse_retriever = BM25Retriever.from_documents(self._all_chunks)
+                self.sparse_retriever.k = 10
+            
+            return deleted_count
+            
+        except Exception as e:
+            print(f"Error deleting chunks from Neo4j: {e}")
+            return 0
+    def get_document_list(self) -> list:
+    
+        try:
+            # Retry connection if dropped
+            try:
+                driver = GraphDatabase.driver(
+                    self.NEO4J_URI,
+                    auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD)
+                )
+                driver.verify_connectivity()
+            except:
+                print("Neo4j connection lost, retrying...")
+                self._test_connection()
+                driver = GraphDatabase.driver(
+                    self.NEO4J_URI,
+                    auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD)
+                )
+            
+            with driver.session(database=self.NEO4J_DATABASE) as session:
+                result = session.run(
+                    "MATCH (n:MedicalDocument) "
+                    "RETURN DISTINCT n.source_file AS source_file, "
+                    "count(n) AS chunk_count"
+                )
+                documents = []
+                for record in result:
+                    documents.append({
+                        "source_file": record["source_file"],
+                        "chunk_count": record["chunk_count"]
+                    })
+            driver.close()
+            return documents
+        except Exception as e:
+            print(f"Error getting document list: {e}")
+            return []
+
     def hybrid_search(self, english_query: str) -> list:
-        """Neo4j Vector + BM25 hybrid search."""
         if not self.is_ready:
             print("Vector store not ready")
             return []

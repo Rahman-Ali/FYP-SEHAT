@@ -14,9 +14,12 @@ class RAGService:
         self.doc_service = DocumentService()
         self.vector_service = VectorStoreService()
         self.llm_service = LLMService()
+        self.medical_docs_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            'medical_documents'
+        )
 
     def load_document(self, pdf_path: str, book_name: str) -> str:
-        """Load a PDF document into the RAG system."""
         try:
             print(f"Loading: {pdf_path}")
             chunks = self.doc_service.load_and_split_pdf(pdf_path)
@@ -27,9 +30,57 @@ class RAGService:
             print(f"Failed to load '{book_name}': {e}")
             return f"Error: {e}"
 
+    def remove_document(self, filename: str) -> dict:
+        """Remove a document from file system and Neo4j."""
+        try:
+            file_path = os.path.join(self.medical_docs_dir, filename)
+            
+            deleted_chunks = self.vector_service.delete_chunks_by_source(filename)
+            
+            file_deleted = self.doc_service.delete_pdf(file_path)
+            
+            return {
+                "success": True,
+                "filename": filename,
+                "chunks_deleted": deleted_chunks,
+                "file_deleted": file_deleted,
+                "message": f"Document '{filename}' removed successfully. {deleted_chunks} chunks deleted."
+            }
+        except Exception as e:
+            print(f"Error removing document: {e}")
+            return {
+                "success": False,
+                "filename": filename,
+                "error": str(e)
+            }
+
+    def get_loaded_documents(self) -> list:
+        """Get list of all documents currently in the system."""
+        try:
+            neo4j_docs = self.vector_service.get_document_list()
+            
+            file_docs = self.doc_service.list_pdf_files(self.medical_docs_dir)
+            
+            neo4j_filenames = {doc["source_file"] for doc in neo4j_docs if doc["source_file"]}
+            
+            result = []
+            for filename in file_docs:
+                neo4j_info = next(
+                    (doc for doc in neo4j_docs if doc["source_file"] == filename),
+                    None
+                )
+                result.append({
+                    "filename": filename,
+                    "indexed": filename in neo4j_filenames,
+                    "chunk_count": neo4j_info["chunk_count"] if neo4j_info else 0
+                })
+            
+            return result
+        except Exception as e:
+            print(f"Error getting document list: {e}")
+            return []
+
     def retrieve_context(self, query: str) -> dict:
-        """Steps 1-4 of RAG pipeline."""
-        
         status = self.llm_service.validate_query(query)
         
         base_response = {
@@ -66,7 +117,6 @@ class RAGService:
         return base_response
 
     def _build_citations(self, context_docs: list) -> tuple:
-        """Build retrieved text and citation block."""
         blocks = []
         pages = []
         citations_dict = {}
@@ -98,8 +148,6 @@ class RAGService:
         return retrieved_text, cite, pages_str
 
     def generate_with_context(self, query: str, context_data: dict) -> dict:
-        """Steps 5-6 of RAG pipeline."""
-        
         def no_info(lang):
             if lang == "roman_urdu":
                 return ("Maafi chahta hoon, is sawaal ka jawab mere paas mojood documents "

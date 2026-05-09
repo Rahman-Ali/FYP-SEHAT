@@ -46,6 +46,14 @@ export default function Service4() {
               <Text style={styles.tagline}>Let's Start to the Modern Approach!</Text>
             </View>
 
+            <View style={styles.textContainer}>
+              <Text style={styles.description}>
+                SEHAT is your all-in-one health companion, providing personalized
+                insights, real-time monitoring, and expert guidance to help you
+                achieve your wellness goals. Join us on a journey to better
+                health and a happier life!
+              </Text>  
+             </View> 
             
             <View style={styles.footer}>
               <TouchableOpacity
@@ -106,6 +114,18 @@ const styles = StyleSheet.create({
     marginTop: 10,
     textAlign: "center",
     fontWeight: "bold",
+  },
+   textContainer: {
+    alignItems: "center",
+    paddingHorizontal: 24,
+  },
+  description: {
+    fontSize: 16,
+    fontFamily: "Poppins-Regular",
+    color: "#10baf382",
+    textAlign: "center",
+    lineHeight: 20,
+    marginTop: -60,
   },
   footer: {
     width: "100%",

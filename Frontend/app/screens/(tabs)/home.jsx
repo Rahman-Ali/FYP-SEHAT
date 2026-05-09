@@ -1,3 +1,4 @@
+//D:\project\Frontend\app\screens\(tabs)\home.jsx
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { LinearGradient } from "expo-linear-gradient";
@@ -105,8 +106,10 @@ export default function HomeScreen() {
     return healthTips[Math.floor(Math.random() * healthTips.length)];
   };
 
-  const showComingSoon = (feature) => {
-    Alert.alert("Coming Soon", `${feature} feature is currently under development.`);
+  const profileRediect = () => {
+    router.push({
+      pathname: "/screens/profile"
+    })
   };
 
   const navigateToActivity = (item) => {
@@ -132,16 +135,16 @@ export default function HomeScreen() {
         >
           <View style={styles.header}>
             <View>
-              <Text style={styles.greeting}>Welcome back, {userName}! 👋</Text>
+              <Text style={styles.greeting}>Welcome, {userName.toUpperCase()}!</Text>
               <Text style={styles.healthStatus}>
                 How are you feeling today?
               </Text>
             </View>
             <TouchableOpacity
               style={styles.notificationBtn}
-              onPress={() => showComingSoon("Profile")}
+              onPress={() => profileRediect()}
             >
-              <MaterialCommunityIcons name="account" size={24} color="#FFF" />
+              <MaterialCommunityIcons name="account-tie" size={24} color="#FFF" />
             </TouchableOpacity>
           </View>
         </LinearGradient>
@@ -220,7 +223,7 @@ export default function HomeScreen() {
           </LinearGradient>
         </View>
 
-        <View style={styles.emergencySection}>
+        {/* <View style={styles.emergencySection}>
           <Text style={styles.sectionTitle}>Emergency Access</Text>
           <TouchableOpacity
             style={styles.emergencyCard}
@@ -241,7 +244,7 @@ export default function HomeScreen() {
               </View>
             </LinearGradient>
           </TouchableOpacity>
-        </View>
+        </View> */}
       </ScrollView>
     </SafeAreaView>
   );

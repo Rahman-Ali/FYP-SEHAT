@@ -1,0 +1,7 @@
+cd /d D:\Project\Backend
+venv\Scripts\activate
+cd sehat_backend
+python manage.py runserver 0.0.0.0:8000
+
+cd /d D:\Project\Frontend
+npx expo start

@@ -1,11 +1,11 @@
+# backend/chat/views.py
 import os
 from pathlib import Path
 from rest_framework import status
-from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
 from django.shortcuts import get_object_or_404
-from django.http import Http404
+from django.views.decorators.csrf import csrf_exempt
 
 from .models import ChatSession, Message
 from .serializers import (
@@ -15,70 +15,73 @@ from .serializers import (
 )
 from .services import ChatService
 
-
+# Initialize Service
 chat_service = ChatService()
 
-
-
+# -------------------------------------------------------
+# DYNAMIC PDF LOADING - No hardcoded file names
+# -------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 MEDICAL_DOCS_DIR = os.path.join(BASE_DIR, 'medical_documents')
 
-PDF_BOOKS = [
-    ("1-DENGUE-WHO-BOOK.pdf", "Dengue Guidelines"),
-    ("4-INFLUENZA-WHO-BOOK.pdf", "Influenza Guidelines"),
-    ("2-DIARRHOEA-WGO-BOOK.pdf", "DIARRHOEA Guidelines"),
-    ("7-Skin-Allergy-Dermatitis-BOOK.pdf", "Skin-Allergy Guidelines"),
-    ("8-Typhoid-Fever-WHO-BOOK.pdf", "Typhoid-Fever Guidelines"),
-]
-
-
 print(f"RAG SYSTEM INIT")
-print(f"LOADING {len(PDF_BOOKS)} BOOK(S)...")
+print(f"MEDICAL DOCS DIR: {MEDICAL_DOCS_DIR}")
 
-loaded_count = 0
-for filename, book_name in PDF_BOOKS:
-    pdf_path = os.path.join(MEDICAL_DOCS_DIR, filename)
-    if os.path.exists(pdf_path):
+# Ensure the directory exists
+os.makedirs(MEDICAL_DOCS_DIR, exist_ok=True)
+
+# Get all PDF files from the directory
+pdf_files = [f for f in os.listdir(MEDICAL_DOCS_DIR) if f.endswith('.pdf')]
+
+if not pdf_files:
+    print("WARNING: No PDF files found in medical_documents directory")
+else:
+    print(f"LOADING {len(pdf_files)} BOOK(S)...")
+    
+    loaded_count = 0
+    for filename in pdf_files:
+        pdf_path = os.path.join(MEDICAL_DOCS_DIR, filename)
+        # Use filename (without .pdf) as the display name
+        book_name = filename.replace('.pdf', '').replace('-', ' ').replace('_', ' ')
+        
         try:
             result = chat_service.rag_service.load_document(pdf_path, book_name)
-            print(f"{book_name}: {result}")
+            print(f"  {book_name}: {result}")
             loaded_count += 1
         except Exception as e:
-            print(f"ERROR loading '{book_name}': {e}")
-    else:
-        print(f"NOT FOUND: {pdf_path}")
+            print(f"  ERROR loading '{filename}': {e}")
+    
+    print(f"LOADED: {loaded_count}/{len(pdf_files)} books successfully")
 
-print(f"LOADED: {loaded_count}/{len(PDF_BOOKS)} books successfully")
+print(f"----------------------------------------")
 
- 
+# ==========================================================
+# REST OF THE FILE REMAINS EXACTLY THE SAME
+# ==========================================================
+# ... (all existing code from HELPER functions to ADMIN VIEWS) ...
 
 
+# ==========================================================
+# HELPER: Validate User Owns Session
+# ==========================================================
 def get_user_session_or_404(session_id, firebase_uid):
-   
     try:
         session = ChatSession.objects.get(id=session_id)
         if session.firebase_uid != firebase_uid:
+            from django.http import Http404
             raise Http404("Session not found")
         return session
     except ChatSession.DoesNotExist:
+        from django.http import Http404
         raise Http404("Session not found")
 
 
-def get_user_message_or_404(message_id, firebase_uid):
-    try:
-        message = Message.objects.select_related('session').get(id=message_id)
-        if message.session.firebase_uid != firebase_uid:
-            raise Http404("Message not found")
-        return message
-    except Message.DoesNotExist:
-        raise Http404("Message not found")
-
-
-
+# ==========================================================
+# PUBLIC API VIEWS
+# ==========================================================
 
 @api_view(['GET'])
 def health_check(request):
-   
     return Response({
         'status': 'ok',
         'message': 'SEHAT Backend is running'
@@ -87,7 +90,6 @@ def health_check(request):
 
 @api_view(['POST'])
 def create_session(request):
-   
     firebase_uid = request.data.get('firebase_uid')
     title = request.data.get('title', 'New Chat')
     
@@ -102,9 +104,8 @@ def create_session(request):
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-@api_view(['POST'])  
+@api_view(['POST'])
 def get_user_sessions(request):
-
     firebase_uid = request.data.get('firebase_uid')
     
     if not firebase_uid:
@@ -118,9 +119,8 @@ def get_user_sessions(request):
     return Response(serializer.data)
 
 
-@api_view(['POST'])  
+@api_view(['POST'])
 def get_session_detail(request):
-   
     session_id = request.data.get('session_id')
     firebase_uid = request.data.get('firebase_uid')
     
@@ -135,9 +135,8 @@ def get_session_detail(request):
     return Response(serializer.data)
 
 
-@api_view(['POST'])  
+@api_view(['POST'])
 def get_session_messages(request):
-  
     session_id = request.data.get('session_id')
     firebase_uid = request.data.get('firebase_uid')
     
@@ -159,7 +158,6 @@ def get_session_messages(request):
 
 @api_view(['POST'])
 def process_query(request):
-
     session_id = request.data.get('session_id')
     query = request.data.get('query')
     firebase_uid = request.data.get('firebase_uid')
@@ -188,7 +186,6 @@ def process_query(request):
 
 @api_view(['DELETE'])
 def delete_session(request):
-   
     session_id = request.data.get('session_id')
     firebase_uid = request.data.get('firebase_uid')
     
@@ -209,7 +206,6 @@ def delete_session(request):
 
 @api_view(['DELETE'])
 def delete_message(request):
-   
     message_id = request.data.get('message_id')
     firebase_uid = request.data.get('firebase_uid')
     
@@ -219,8 +215,15 @@ def delete_message(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    message = get_user_message_or_404(message_id, firebase_uid)
-    message.delete()
+    try:
+        message = Message.objects.get(id=message_id)
+        if message.session.firebase_uid != firebase_uid:
+            from django.http import Http404
+            raise Http404("Message not found")
+        message.delete()
+    except Message.DoesNotExist:
+        from django.http import Http404
+        raise Http404("Message not found")
     
     return Response(
         {'message': 'Message deleted successfully'},
@@ -230,7 +233,6 @@ def delete_message(request):
 
 @api_view(['PATCH'])
 def update_session_title(request):
-   
     session_id = request.data.get('session_id')
     title = request.data.get('title')
     firebase_uid = request.data.get('firebase_uid')
@@ -247,3 +249,106 @@ def update_session_title(request):
     
     serializer = ChatSessionSerializer(session)
     return Response(serializer.data)
+
+
+# ==========================================================
+# ADMIN API VIEWS
+# ==========================================================
+
+@api_view(['GET'])
+def admin_list_documents(request):
+    """List all documents in the knowledge base."""
+    try:
+        documents = chat_service.get_documents()
+        return Response({
+            'success': True,
+            'documents': documents,
+            'count': len(documents)
+        })
+    except Exception as e:
+        return Response(
+            {'error': str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+
+@csrf_exempt
+@api_view(['POST'])
+def admin_add_document(request):
+    """Add a new medical PDF document."""
+    
+    # 🔥 DEBUG LOGS
+    print("[ADMIN ADD] Request received")
+    print("[ADMIN ADD] FILES:", request.FILES)
+    print("[ADMIN ADD] KEYS:", request.FILES.keys())
+    print("[ADMIN ADD] Content-Type:", request.content_type)
+    
+    uploaded_file = request.FILES.get('document')
+    
+    if not uploaded_file:
+        print("[ADMIN ADD] No 'document' in FILES")
+        return Response(
+            {'error': 'No document file provided. Available keys: ' + str(list(request.FILES.keys()))},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    filename = uploaded_file.name
+    print(f"[ADMIN ADD] File: {filename}, Size: {uploaded_file.size}")
+    
+    if not filename.endswith('.pdf'):
+        return Response(
+            {'error': 'Only PDF files are allowed'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        result = chat_service.add_document(uploaded_file, filename)
+        print(f"[ADMIN ADD] Result: {result}")
+        
+        if result.get('success'):
+            return Response(result, status=status.HTTP_201_CREATED)
+        else:
+            return Response(
+                {'error': result.get('error', 'Unknown error')},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    except Exception as e:
+        print(f"[ADMIN ADD] Exception: {e}")
+        import traceback
+        traceback.print_exc()
+        return Response(
+            {'error': str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+@csrf_exempt
+@api_view(['DELETE'])
+def admin_remove_document(request):
+    """Remove a document from the knowledge base."""
+    filename = request.data.get('filename')
+    print(f"[ADMIN DELETE] Request to delete: {filename}")
+    
+    if not filename:
+        return Response(
+            {'error': 'filename is required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        result = chat_service.remove_document(filename)
+        print(f"[ADMIN DELETE] Result: {result}")
+        
+        if result.get('success'):
+            return Response(result)
+        else:
+            return Response(
+                {'error': result.get('error', 'Unknown error')},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    except Exception as e:
+        print(f"[ADMIN DELETE] Exception: {e}")
+        return Response(
+            {'error': str(e)},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )

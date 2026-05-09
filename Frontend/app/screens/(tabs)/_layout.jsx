@@ -1,4 +1,4 @@
-
+//D:\project\Frontend\app\screens\(tabs)\_layout.jsx
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { Tabs } from "expo-router";
 
