@@ -1,6 +1,6 @@
 //D:\project\Frontend\app\services\api.jsx
 import axios from "axios";
-const BASE_IP = "10.10.40.104"; 
+const BASE_IP = "10.10.40.138"; 
 const BASE_URL = `http://${BASE_IP}:8000/api`;
 
 const api = axios.create({
@@ -134,40 +134,39 @@ export const apiService = {
     }
   },
 
-  
-sendMessage: async (sessionId, messageText) => {
-  try {
-    const firebaseUid = apiService._getFirebaseUid();
-    
-    const response = await api.post("/chat/query/", {
-      session_id: sessionId,
-      query: messageText,
-      firebase_uid: firebaseUid,
-    });
 
-    const data = response.data;
-    const botMessage = data.bot_message || {};
-    
-   
-    return {
-      userMessage: data.user_message || null,
-      botMessage: {
-        id: botMessage.id,
-        message_text: botMessage.message_text || data.response || "I've received your message.",
-        metadata: botMessage.metadata || {},
-        timestamp: botMessage.timestamp,
-      },
+sendMessage: async (sessionId, messageText, chatHistory = []) => {
+    try {
+      const firebaseUid = apiService._getFirebaseUid();
       
-      advice: botMessage.message_text || data.response || "I've received your message.",
-      possible_condition: botMessage.metadata?.condition || null,
-      triage_level: botMessage.metadata?.triage_level || null,
-      status: "success",
-    };
-  } catch (error) {
-    console.error("Send Message Error:", error.message);
-    throw error;
-  }
-},
+      // [MEMORY] Frontend already formatted — use directly
+      const recentHistory = (chatHistory || []).slice(-6);
+
+      const response = await api.post("/chat/query/", {
+        session_id: sessionId,
+        query: messageText,
+        firebase_uid: firebaseUid,
+        chat_history: recentHistory
+      });
+
+      const data = response.data;
+      const botMessage = data.bot_message || {};
+
+      return {
+        userMessage: data.user_message || null,
+        botMessage: {
+          id: botMessage.id,
+          message_text: botMessage.message_text || data.response || "I've received your message.",
+          metadata: botMessage.metadata || {},
+          timestamp: botMessage.timestamp,
+        },
+        status: "success",
+      };
+    } catch (error) {
+      console.error("Send Message Error:", error.message);
+      throw error;
+    }
+  },
 
   
   updateSessionTitle: async (sessionId, newTitle) => {

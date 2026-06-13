@@ -5,3 +5,23 @@ python manage.py runserver 0.0.0.0:8000
 
 cd /d D:\Project\Frontend
 npx expo start
+
+
+
+
+
+
+
+
+cd /d D:\Project
+
+git status
+
+git add .
+
+git status
+
+git commit -m "Updated project files"
+
+
+git push origin main

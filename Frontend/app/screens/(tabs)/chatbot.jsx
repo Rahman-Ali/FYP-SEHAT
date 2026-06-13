@@ -86,95 +86,77 @@ export default function ChatbotScreen() {
     }
   };
 
-  const loadAllChatSessions = async (uid) => {
-    if (!uid) return [];
-    try {
-      const sessions = await apiService.getAllSessions(uid);
-      if (sessions && Array.isArray(sessions)) {
-        // Filter + clean: check each session for real user messages
-        // Delete empty sessions from server so they don't accumulate
-        const validSessions = [];
-        const deletePromises = [];
+const loadAllChatSessions = async (uid) => {
+  if (!uid) return [];
+  try {
+    // 🎯 ONLY fetch session list - NO messages inside loop
+    const sessions = await apiService.getAllSessions();
+    
+    if (sessions && Array.isArray(sessions)) {
+      setChatHistory(sessions);
+      await AsyncStorage.setItem("api_chat_history", JSON.stringify(sessions));
+      return sessions;
+    }
+    return [];
+  } catch (error) {
+    console.error("Session list error:", error);
+    const local = await AsyncStorage.getItem("local_chat_history");
+    if (local) {
+      const parsed = JSON.parse(local);
+      setChatHistory(parsed);
+      return parsed;
+    }
+    return [];
+  }
+};
 
-        for (const session of sessions) {
-          try {
-            const msgs = await apiService.getSessionMessages(session.id);
-            const hasUserMsg = msgs && msgs.some((m) => m.sender !== "bot");
-            if (hasUserMsg) {
-              validSessions.push(session);
-            } else {
-              // Empty session — delete from server silently
-              deletePromises.push(apiService.deleteSession(session.id).catch(() => {}));
-            }
-          } catch {
-            // If we can't check, keep it to be safe
-            validSessions.push(session);
-          }
-        }
+ const loadPreviousChat = async (sid, title) => {
+  try {
+    setIsLoading(true);
+    setShowHistory(false);
+    setSessionId(sid);
+    setCurrentChatTitle(title || "Chat");
 
-        // Fire deletes in background
-        Promise.all(deletePromises);
+    const result = await apiService.getSessionMessages(sid);
+    
+    // 🎯 FIX: API returns {count, messages} object, not direct array
+    const serverMessages = result.messages || result || [];
 
-        setChatHistory(validSessions);
-        await AsyncStorage.setItem("api_chat_history", JSON.stringify(validSessions));
-        return validSessions;
-      }
-      return [];
-    } catch (error) {
-      const local = await AsyncStorage.getItem("local_chat_history");
+    if (serverMessages && Array.isArray(serverMessages) && serverMessages.length > 0) {
+      const sorted = serverMessages.sort(
+        (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
+      );
+      const formatted = sorted.map((msg, index) => ({
+        id: msg.id || index,
+        text: msg.message_text,
+        isBot: msg.sender === "bot",
+        time: msg.timestamp
+          ? new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : "Recent",
+        condition: msg.possible_condition,
+        triage: msg.triage_level,
+      }));
+      setMessages(formatted);
+      // Loaded chat has real messages — not empty
+      isCurrentSessionEmpty.current = false;
+      await saveMessagesLocally(sid, formatted);
+    } else {
+      const local = await AsyncStorage.getItem(`messages_${sid}`);
       if (local) {
         const parsed = JSON.parse(local);
-        setChatHistory(parsed);
-        return parsed;
-      }
-      return [];
-    }
-  };
-
-  const loadPreviousChat = async (sid, title) => {
-    try {
-      setIsLoading(true);
-      setShowHistory(false);
-      setSessionId(sid);
-      setCurrentChatTitle(title || "Chat");
-
-      const serverMessages = await apiService.getSessionMessages(sid);
-
-      if (serverMessages && Array.isArray(serverMessages) && serverMessages.length > 0) {
-        const sorted = serverMessages.sort(
-          (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
-        );
-        const formatted = sorted.map((msg, index) => ({
-          id: msg.id || index,
-          text: msg.message_text,
-          isBot: msg.sender === "bot",
-          time: msg.timestamp
-            ? new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-            : "Recent",
-          condition: msg.possible_condition,
-          triage: msg.triage_level,
-        }));
-        setMessages(formatted);
-        // Loaded chat has real messages — not empty
-        isCurrentSessionEmpty.current = false;
-        await saveMessagesLocally(sid, formatted);
+        setMessages(parsed);
+        isCurrentSessionEmpty.current = parsed.filter(m => !m.isBot).length === 0;
       } else {
-        const local = await AsyncStorage.getItem(`messages_${sid}`);
-        if (local) {
-          const parsed = JSON.parse(local);
-          setMessages(parsed);
-          isCurrentSessionEmpty.current = parsed.filter(m => !m.isBot).length === 0;
-        } else {
-          setMessages([createMessage("Chat history loaded.", true)]);
-          isCurrentSessionEmpty.current = true;
-        }
+        setMessages([createMessage("Chat history loaded.", true)]);
+        isCurrentSessionEmpty.current = true;
       }
-    } catch (error) {
-      Alert.alert("Error", "Could not load chat");
-    } finally {
-      setIsLoading(false);
     }
-  };
+  } catch (error) {
+    Alert.alert("Error", "Could not load chat");
+  } finally {
+    setIsLoading(false);
+  }
+};
 
   const createNewSession = () => {
     // DO NOT call API here — session only created on server when first message is sent
@@ -204,7 +186,7 @@ export default function ChatbotScreen() {
       setShowHistory(false);
       Alert.alert(
         "Already in New Chat",
-        "Aap pehle se ek naye chat mein hain. Koi message type karein.",
+        "Type any query",
         [{ text: "OK", style: "default" }]
       );
       return;
@@ -213,67 +195,80 @@ export default function ChatbotScreen() {
     createNewSession();
   }, []);
 
-  const handleSend = async () => {
-    if (!inputText.trim() || isSending) return;
+const handleSend = async () => {
+  if (!inputText.trim() || isSending) return;
 
-    const userText = inputText.trim();
-    setInputText("");
+  const userText = inputText.trim();
 
-    const userMessage = createMessage(userText, false);
-    const updatedMessages = [...messages, userMessage];
-    setMessages(updatedMessages);
-    setIsSending(true);
+  // [SECURITY] Length check
+  if (userText.length > 500) {
+    Alert.alert("Too Long", "Please keep your message under 500 characters.");
+    return;
+  }
 
-    try {
-      let activeSessionId = sessionId;
+  setInputText("");
 
-      // If sessionId is null — this is the first message, create session on server NOW
-      if (!activeSessionId) {
-        const result = await apiService.createChatSession(userUid);
-        if (!result || (!result.session_id && !result.id)) {
-          throw new Error("Failed to create session");
-        }
-        activeSessionId = result.session_id || result.id;
-        setSessionId(activeSessionId);
-        setIsOnline(true); // Connected to server successfully
+  const userMessage = createMessage(userText, false);
+  const updatedMessages = [...messages, userMessage];
+  setMessages(updatedMessages);
+  setIsSending(true);
+
+  try {
+    let activeSessionId = sessionId;
+
+    // Create session if not exists
+    if (!activeSessionId) {
+      const result = await apiService.createChatSession(userUid);
+      if (!result || (!result.session_id && !result.id)) {
+        throw new Error("Failed to create session");
       }
-
-      // Mark session as no longer empty
-      isCurrentSessionEmpty.current = false;
-
-      const response = await apiService.sendMessage(activeSessionId, userText);
-
-      // On first real user message — update title and refresh history
-      const userMsgCount = updatedMessages.filter(m => !m.isBot).length;
-      if (userMsgCount === 1) {
-        const newTitle = userText.length > 25 ? userText.substring(0, 25) + "..." : userText;
-        setCurrentChatTitle(newTitle);
-        await apiService.updateSessionTitle(activeSessionId, newTitle);
-        loadAllChatSessions(userUid);
-      }
-
-      const botText =
-        response.botMessage?.message_text ||
-        response.response ||
-        "I've received your message.";
-      const botCondition = response.botMessage?.metadata?.condition || null;
-      const botTriage = response.botMessage?.metadata?.triage_level || null;
-
-      const botMessage = createMessage(botText, true, botCondition, botTriage);
-      const finalMessages = [...updatedMessages, botMessage];
-      setMessages(finalMessages);
-      await saveMessagesLocally(activeSessionId, finalMessages);
-    } catch (error) {
-      console.error("Send Error:", error);
-      // Revert empty flag so user can retry
-      isCurrentSessionEmpty.current = true;
-      const errorMsg = createMessage("Connection Error. Please try again.", true, "Error", "Emergency");
-      setMessages([...updatedMessages, errorMsg]);
-    } finally {
-      setIsSending(false);
+      activeSessionId = result.session_id || result.id;
+      setSessionId(activeSessionId);
+      setIsOnline(true);
     }
-  };
 
+    // Session no longer empty
+    isCurrentSessionEmpty.current = false;
+
+    
+    const recentMessages = updatedMessages.slice(-6).map(msg => ({
+      sender: msg.isBot ? 'bot' : 'user',
+      text: msg.text
+    }));
+
+    const response = await apiService.sendMessage(
+      activeSessionId,
+      userText,
+      recentMessages
+    );
+
+    // Update title on first user message
+    const userMsgCount = updatedMessages.filter(m => !m.isBot).length;
+    if (userMsgCount === 1) {
+      const newTitle = userText.length > 25 ? userText.substring(0, 25) + "..." : userText;
+      setCurrentChatTitle(newTitle);
+      await apiService.updateSessionTitle(activeSessionId, newTitle);
+      loadAllChatSessions(userUid);
+    }
+
+    const botText = response.botMessage?.message_text || response.response || "I've received your message.";
+    const botCondition = response.botMessage?.metadata?.condition || null;
+    const botTriage = response.botMessage?.metadata?.triage_level || null;
+
+    const botMessage = createMessage(botText, true, botCondition, botTriage);
+    const finalMessages = [...updatedMessages, botMessage];
+    setMessages(finalMessages);
+    await saveMessagesLocally(activeSessionId, finalMessages);
+
+  } catch (error) {
+    console.error("Send Error:", error);
+    isCurrentSessionEmpty.current = true;
+    const errorMsg = createMessage("Connection Error. Please try again.", true, "Error", "Emergency");
+    setMessages([...updatedMessages, errorMsg]);
+  } finally {
+    setIsSending(false);
+  }
+};
   const handleDeleteSession = (id) => {
     Alert.alert("Delete Chat", "Are you sure?", [
       { text: "Cancel", style: "cancel" },
@@ -295,10 +290,18 @@ export default function ChatbotScreen() {
     ]);
   };
 
-  const toggleHistory = () => {
-    setShowHistory((prev) => !prev);
-    if (!showHistory) loadAllChatSessions(userUid);
-  };
+const toggleHistory = () => {
+  setShowHistory((prev) => {
+    const willShow = !prev;
+    
+    // 🎯 ONLY fetch when OPENING history, skip if already loaded
+    if (willShow && userUid && chatHistory.length === 0) {
+      loadAllChatSessions(userUid);
+    }
+    
+    return willShow;
+  });
+};
 
   const createMessage = (text, isBot, condition = null, triage = null) => ({
     id: Date.now() + Math.random(),

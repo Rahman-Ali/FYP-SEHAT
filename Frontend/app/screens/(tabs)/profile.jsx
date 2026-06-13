@@ -1,15 +1,20 @@
 //D:\project\Frontend\app\screens\(tabs)\profile.jsx
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { getAuth, signOut, updateProfile } from "firebase/auth";
-import { doc, getDoc, updateDoc } from "firebase/firestore";
-import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import * as ImagePicker from "expo-image-picker";
+import {
+  EmailAuthProvider,
+  fetchSignInMethodsForEmail,
+  reauthenticateWithCredential,
+  signOut,
+  updatePassword,
+  updateProfile,
+  verifyBeforeUpdateEmail,
+} from "firebase/auth";
+import { deleteField, doc, onSnapshot, updateDoc } from "firebase/firestore";
 import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  Image,
   Modal,
   ScrollView,
   StatusBar,
@@ -24,107 +29,232 @@ import { auth, db } from "../../../firebase.config";
 
 export default function ProfileScreen() {
   const router = useRouter();
-  
+
   const [user, setUser] = useState(null);
   const [userData, setUserData] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [showMenu, setShowMenu] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
-  
+
   // Edit state
   const [editName, setEditName] = useState("");
-  const [editProfilePic, setEditProfilePic] = useState(null);
+  const [editEmail, setEditEmail] = useState("");
+  const [editPassword, setEditPassword] = useState("");
+  const [editConfirmPassword, setEditConfirmPassword] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+  const [showCurrentPass, setShowCurrentPass] = useState(false);
+  const [showNewPass, setShowNewPass] = useState(false);
+  const [showConfirmPass, setShowConfirmPass] = useState(false);
+
+  const PENDING_EMAIL_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
   useEffect(() => {
-    loadUserData();
-  }, []);
+    const currentUser = auth.currentUser;
+    if (!currentUser) {
+      router.replace("/screens/login");
+      return;
+    }
 
-  const loadUserData = async () => {
-    try {
-      const currentUser = auth.currentUser;
-      if (!currentUser) {
-        router.replace("/screens/login");
+    setUser(currentUser);
+    setEditEmail(currentUser.email || "");
+
+    const userDocRef = doc(db, "users", currentUser.uid);
+
+    // onSnapshot — realtime listener: fires instantly on any Firestore change
+    const unsubscribe = onSnapshot(userDocRef, async (snap) => {
+      if (!snap.exists()) return;
+
+      const data = snap.data();
+      const now = Date.now();
+      const sentAt = data.pendingEmailSentAt || 0;
+
+      // Case 1: TTL expired — silently clear pending email
+      if (data.pendingEmail && (now - sentAt) > PENDING_EMAIL_TTL_MS) {
+        await updateDoc(userDocRef, {
+          pendingEmail: deleteField(),
+          pendingEmailSentAt: deleteField(),
+        });
+        // onSnapshot fires again automatically with cleared data
         return;
       }
-      setUser(currentUser);
-      
-      // Fetch Firestore data
-      const userDocRef = doc(db, "users", currentUser.uid);
-      const userDocSnap = await getDoc(userDocRef);
-      
-      if (userDocSnap.exists()) {
-        const data = userDocSnap.data();
+
+      // Case 2: pendingEmail present — check if Firebase Auth email already updated
+      if (data.pendingEmail) {
+        try {
+          await auth.currentUser?.reload();
+          const refreshed = auth.currentUser;
+          if (
+            refreshed?.email &&
+            refreshed.email.toLowerCase() === data.pendingEmail.toLowerCase()
+          ) {
+            // User confirmed — update Firestore email and clear pending
+            // onSnapshot will fire again, hitting Case 3 below
+            await updateDoc(userDocRef, {
+              email: refreshed.email,
+              pendingEmail: deleteField(),
+              pendingEmailSentAt: deleteField(),
+            });
+            return;
+          }
+        } catch (_) {}
+
+        // Not confirmed yet — just update UI with current data
         setUserData(data);
         setEditName(data.fullName || "");
+        setIsLoading(false);
+        return;
       }
-    } catch (error) {
-      console.error("Error loading user:", error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
-  const handlePickImage = async () => {
-    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!permission.granted) {
-      Alert.alert("Permission Denied", "Please allow access to photos.");
-      return;
-    }
-    
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.7,
+      // Case 3: No pendingEmail + Firestore email differs from original Auth email
+      // This fires right after Case 2 clears pendingEmail — means email was just confirmed
+      if (
+        data.email &&
+        data.email.toLowerCase() !== currentUser.email.toLowerCase()
+      ) {
+        // Sign out so user logs in fresh with new email
+        await signOut(auth);
+        Alert.alert(
+          "Email Verified ✓",
+          `Your email has been successfully changed to:
+
+${data.email}
+
+Please log in again with your new email.`,
+          [{ text: "Login", onPress: () => router.replace("/screens/login") }]
+        );
+        return;
+      }
+
+      // Default: normal Firestore update (name, role, etc.)
+      setUserData(data);
+      setEditName(data.fullName || "");
+      setIsLoading(false);
     });
-    
-    if (!result.canceled) {
-      setEditProfilePic(result.assets[0].uri);
-    }
-  };
+
+    return () => unsubscribe();
+  }, []);
+
+
+  // Basic email format check
+  const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
   const handleSaveProfile = async () => {
+    // --- Validations ---
     if (!editName.trim()) {
-      Alert.alert("Error", "Name cannot be empty");
+      Alert.alert("Validation Error", "Name cannot be empty.");
       return;
     }
-    
+
+    const newEmail = editEmail.trim().toLowerCase();
+    const currentEmail = user.email.toLowerCase();
+    const emailChanged = newEmail !== currentEmail;
+
+    if (emailChanged && !isValidEmail(newEmail)) {
+      Alert.alert("Invalid Email", "Please enter a valid email address (e.g. user@example.com).");
+      return;
+    }
+
+    if (!currentPassword) {
+      Alert.alert("Password Required", "Please enter your current password to save changes.");
+      return;
+    }
+
+    if (editPassword && editPassword.length < 6) {
+      Alert.alert("Weak Password", "New password must be at least 6 characters long.");
+      return;
+    }
+
+    if (editPassword && editPassword !== editConfirmPassword) {
+      Alert.alert("Password Mismatch", "New password and confirm password do not match.");
+      return;
+    }
+
     setIsSaving(true);
-    
+
     try {
-      // Update Firestore
-      const userDocRef = doc(db, "users", user.uid);
-      await updateDoc(userDocRef, {
-        fullName: editName.trim(),
-      });
-      
-      // Update Firebase Auth display name
-      await updateProfile(user, {
-        displayName: editName.trim(),
-      });
-      
-      // Upload profile picture if selected
-      if (editProfilePic) {
-        const storage = getStorage();
-        const storageRef = ref(storage, `profile_pictures/${user.uid}.jpg`);
-        
-        const response = await fetch(editProfilePic);
-        const blob = await response.blob();
-        
-        await uploadBytes(storageRef, blob);
-        const photoURL = await getDownloadURL(storageRef);
-        
-        await updateProfile(user, { photoURL });
-        await updateDoc(userDocRef, { profilePic: photoURL });
+      // Step 1: Re-authenticate
+      const credential = EmailAuthProvider.credential(user.email, currentPassword);
+      await reauthenticateWithCredential(user, credential);
+
+      // Step 2: Check if new email already exists (before sending verification)
+      if (emailChanged) {
+        const methods = await fetchSignInMethodsForEmail(auth, newEmail);
+        if (methods && methods.length > 0) {
+          Alert.alert(
+            "Email Already in Use",
+            "This email address is already registered with another account. Please use a different email."
+          );
+          setIsSaving(false);
+          return;
+        }
       }
-      
-      Alert.alert("Success", "Profile updated successfully");
+
+      const userDocRef = doc(db, "users", user.uid);
+      const firestoreUpdates = { fullName: editName.trim() };
+
+      // Step 3: Update display name
+      await updateProfile(user, { displayName: editName.trim() });
+
+      // Step 4: Send verification to new email (does NOT change email until user clicks link)
+      if (emailChanged) {
+        await verifyBeforeUpdateEmail(user, newEmail);
+        // Store pending email in Firestore so we can show it as "pending"
+        await updateDoc(userDocRef, {
+          ...firestoreUpdates,
+          pendingEmail: newEmail,
+          pendingEmailSentAt: Date.now(),
+        });
+
+        // Step 5: Update password if also changed
+        if (editPassword) {
+          await updatePassword(user, editPassword);
+        }
+
+        setShowEditModal(false);
+        setCurrentPassword("");
+        setEditPassword("");
+        setEditConfirmPassword("");
+
+        Alert.alert(
+          "Verification Email Sent",
+          `A verification link has been sent to:\n\n${newEmail}\n\nPlease open that email and click the link to complete your email change. Until then, your current email remains active.`,
+          [{ text: "Got it", style: "default" }]
+        );
+        return;
+      }
+
+      // Step 5 (no email change): Update password if provided
+      if (editPassword) {
+        await updatePassword(user, editPassword);
+      }
+
+      // Step 6: Update Firestore
+      await updateDoc(userDocRef, firestoreUpdates);
+
+      Alert.alert("Success", "Profile updated successfully.");
       setShowEditModal(false);
-      loadUserData(); // Reload data
+      setCurrentPassword("");
+      setEditPassword("");
+      setEditConfirmPassword("");
+      // onSnapshot automatically reflects Firestore changes
+
     } catch (error) {
-      console.error("Error updating profile:", error);
-      Alert.alert("Error", "Failed to update profile");
+      const code = error?.code || "";
+      if (code === "auth/wrong-password" || code === "auth/invalid-credential") {
+        Alert.alert("Incorrect Password", "The current password you entered is wrong. Please try again.");
+      } else if (code === "auth/email-already-in-use") {
+        Alert.alert("Email Already in Use", "This email is already registered with another account.");
+      } else if (code === "auth/invalid-email") {
+        Alert.alert("Invalid Email", "Please enter a valid email address.");
+      } else if (code === "auth/too-many-requests") {
+        Alert.alert("Too Many Attempts", "Account temporarily locked. Please try again after some time.");
+      } else if (code === "auth/network-request-failed") {
+        Alert.alert("No Internet", "Please check your internet connection and try again.");
+      } else if (code === "auth/requires-recent-login") {
+        Alert.alert("Session Expired", "Please log out and log in again before making this change.");
+      } else {
+        Alert.alert("Update Failed", "Something went wrong. Please try again.");
+      }
     } finally {
       setIsSaving(false);
     }
@@ -140,12 +270,19 @@ export default function ProfileScreen() {
           try {
             await signOut(auth);
             router.replace("/screens/login");
-          } catch (error) {
-            console.error("Logout error:", error);
-          }
+          } catch (_) {}
         },
       },
     ]);
+  };
+
+  const handleOpenEditModal = () => {
+    setEditName(userData?.fullName || "");
+    setEditEmail(user?.email || "");
+    setCurrentPassword("");
+    setEditPassword("");
+    setEditConfirmPassword("");
+    setShowEditModal(true);
   };
 
   if (isLoading) {
@@ -166,51 +303,9 @@ export default function ProfileScreen() {
       {/* Header */}
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Profile</Text>
-        {/* <TouchableOpacity 
-          style={styles.menuButton} 
-          onPress={() => setShowMenu(!showMenu)}
-        >
-          <MaterialCommunityIcons name="dots-vertical" size={24} color="#1E293B" />
-        </TouchableOpacity> */}
       </View>
-     {/* Dropdown Menu
-      {showMenu && (
-        <View style={styles.dropdownMenu}>
-          <TouchableOpacity 
-            style={styles.dropdownItem}
-            onPress={() => { setShowMenu(false); setShowEditModal(true); }}
-          >
-            <MaterialCommunityIcons name="account-edit" size={20} color="#334155" />
-            <Text style={styles.dropdownText}>Update Details</Text>
-          </TouchableOpacity>
-          <View style={styles.dropdownDivider} />
-          <TouchableOpacity 
-            style={styles.dropdownItem}
-            onPress={() => { setShowMenu(false); handleLogout(); }}
-          >
-            <MaterialCommunityIcons name="logout" size={20} color="#EF4444" />
-            <Text style={[styles.dropdownText, { color: "#EF4444" }]}>Logout</Text>
-          </TouchableOpacity>
-        </View>
-      )} */}
- 
-      <ScrollView style={styles.container} showsVerticalScrollIndicator={false}>
-        {/* Profile Picture */}
-        <View style={styles.profilePicSection}>
-          <View style={styles.profilePicContainer}>
-            {userData?.profilePic || user?.photoURL ? (
-              <Image 
-                source={{ uri: userData?.profilePic || user?.photoURL }} 
-                style={styles.profilePic} 
-              />
-            ) : (
-              <View style={styles.profilePicPlaceholder}>
-                <MaterialCommunityIcons name="account" size={60} color="#94A3B8" />
-              </View>
-            )}
-          </View>
-        </View>
 
+      <ScrollView style={styles.container} showsVerticalScrollIndicator={false}>
         {/* User Info Cards */}
         <View style={styles.infoSection}>
           {/* Name */}
@@ -232,6 +327,12 @@ export default function ProfileScreen() {
             <View style={styles.infoContent}>
               <Text style={styles.infoLabel}>Email</Text>
               <Text style={styles.infoValue}>{userData?.email || user?.email || "Not set"}</Text>
+              {userData?.pendingEmail && (
+                <View style={styles.pendingEmailWrap}>
+                  <MaterialCommunityIcons name="clock-outline" size={12} color="#D97706" />
+                  <Text style={styles.pendingEmailText}>Pending: {userData.pendingEmail}</Text>
+                </View>
+              )}
             </View>
           </View>
 
@@ -258,11 +359,11 @@ export default function ProfileScreen() {
             <View style={styles.infoContent}>
               <Text style={styles.infoLabel}>Member Since</Text>
               <Text style={styles.infoValue}>
-                {userData?.createdAt 
+                {userData?.createdAt
                   ? new Date(userData.createdAt).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })
                   : user?.metadata?.creationTime
-                    ? new Date(user.metadata.creationTime).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })
-                    : "Unknown"}
+                  ? new Date(user.metadata.creationTime).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })
+                  : "Unknown"}
               </Text>
             </View>
           </View>
@@ -271,8 +372,8 @@ export default function ProfileScreen() {
         {/* Quick Actions */}
         <View style={styles.actionsSection}>
           <Text style={styles.actionsTitle}>Quick Actions</Text>
-          
-          <TouchableOpacity style={styles.actionCard} onPress={() => setShowEditModal(true)}>
+
+          <TouchableOpacity style={styles.actionCard} onPress={handleOpenEditModal}>
             <MaterialCommunityIcons name="account-edit" size={22} color="#3B82F6" />
             <Text style={styles.actionText}>Edit Profile</Text>
             <MaterialCommunityIcons name="chevron-right" size={20} color="#94A3B8" />
@@ -299,49 +400,119 @@ export default function ProfileScreen() {
               </TouchableOpacity>
             </View>
 
-            {/* Profile Picture Edit */}
-            <TouchableOpacity style={styles.editPicSection} onPress={handlePickImage}>
-              <View style={styles.editPicContainer}>
-                {editProfilePic ? (
-                  <Image source={{ uri: editProfilePic }} style={styles.editPic} />
-                ) : userData?.profilePic || user?.photoURL ? (
-                  <Image source={{ uri: userData?.profilePic || user?.photoURL }} style={styles.editPic} />
-                ) : (
-                  <View style={styles.editPicPlaceholder}>
-                    <MaterialCommunityIcons name="camera" size={30} color="#94A3B8" />
-                  </View>
-                )}
-                <View style={styles.cameraIconWrap}>
-                  <MaterialCommunityIcons name="camera-plus" size={16} color="#FFF" />
+            <ScrollView showsVerticalScrollIndicator={false}>
+              {/* Name Input */}
+              <View style={styles.editInputWrap}>
+                <Text style={styles.editInputLabel}>Full Name</Text>
+                <TextInput
+                  style={styles.editInput}
+                  value={editName}
+                  onChangeText={setEditName}
+                  placeholder="Enter your name"
+                  placeholderTextColor="#94A3B8"
+                />
+              </View>
+
+              {/* Email Input */}
+              <View style={styles.editInputWrap}>
+                <Text style={styles.editInputLabel}>Email Address</Text>
+                <TextInput
+                  style={styles.editInput}
+                  value={editEmail}
+                  onChangeText={setEditEmail}
+                  placeholder="Enter your email"
+                  placeholderTextColor="#94A3B8"
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                />
+              </View>
+
+              {/* Divider */}
+              <View style={styles.sectionDivider}>
+                <View style={styles.dividerLine} />
+                <Text style={styles.dividerText}>Change Password (optional)</Text>
+                <View style={styles.dividerLine} />
+              </View>
+
+              {/* New Password */}
+              <View style={styles.editInputWrap}>
+                <Text style={styles.editInputLabel}>New Password</Text>
+                <View style={styles.passwordWrap}>
+                  <TextInput
+                    style={styles.passwordInput}
+                    value={editPassword}
+                    onChangeText={setEditPassword}
+                    placeholder="Leave blank to keep current"
+                    placeholderTextColor="#94A3B8"
+                    secureTextEntry={!showNewPass}
+                    autoCapitalize="none"
+                  />
+                  <TouchableOpacity onPress={() => setShowNewPass(!showNewPass)} style={styles.eyeBtn}>
+                    <MaterialCommunityIcons name={showNewPass ? "eye-off" : "eye"} size={20} color="#94A3B8" />
+                  </TouchableOpacity>
                 </View>
               </View>
-              <Text style={styles.editPicLabel}>Change Photo</Text>
-            </TouchableOpacity>
 
-            {/* Name Input */}
-            <View style={styles.editInputWrap}>
-              <Text style={styles.editInputLabel}>Full Name</Text>
-              <TextInput
-                style={styles.editInput}
-                value={editName}
-                onChangeText={setEditName}
-                placeholder="Enter your name"
-                placeholderTextColor="#94A3B8"
-              />
-            </View>
+              {/* Confirm New Password */}
+              <View style={styles.editInputWrap}>
+                <Text style={styles.editInputLabel}>Confirm New Password</Text>
+                <View style={styles.passwordWrap}>
+                  <TextInput
+                    style={styles.passwordInput}
+                    value={editConfirmPassword}
+                    onChangeText={setEditConfirmPassword}
+                    placeholder="Re-enter new password"
+                    placeholderTextColor="#94A3B8"
+                    secureTextEntry={!showConfirmPass}
+                    autoCapitalize="none"
+                  />
+                  <TouchableOpacity onPress={() => setShowConfirmPass(!showConfirmPass)} style={styles.eyeBtn}>
+                    <MaterialCommunityIcons name={showConfirmPass ? "eye-off" : "eye"} size={20} color="#94A3B8" />
+                  </TouchableOpacity>
+                </View>
+              </View>
 
-            {/* Save Button */}
-            <TouchableOpacity 
-              style={[styles.saveButton, isSaving && { opacity: 0.6 }]} 
-              onPress={handleSaveProfile}
-              disabled={isSaving}
-            >
-              {isSaving ? (
-                <ActivityIndicator size="small" color="#FFF" />
-              ) : (
-                <Text style={styles.saveButtonText}>Save Changes</Text>
-              )}
-            </TouchableOpacity>
+              {/* Divider */}
+              <View style={styles.sectionDivider}>
+                <View style={styles.dividerLine} />
+                <Text style={styles.dividerText}>Confirm Identity</Text>
+                <View style={styles.dividerLine} />
+              </View>
+
+              {/* Current Password (required to save) */}
+              <View style={styles.editInputWrap}>
+                <Text style={styles.editInputLabel}>Current Password <Text style={styles.requiredText}>(required)</Text></Text>
+                <View style={styles.passwordWrap}>
+                  <TextInput
+                    style={styles.passwordInput}
+                    value={currentPassword}
+                    onChangeText={setCurrentPassword}
+                    placeholder="Enter current password to confirm"
+                    placeholderTextColor="#94A3B8"
+                    secureTextEntry={!showCurrentPass}
+                    autoCapitalize="none"
+                  />
+                  <TouchableOpacity onPress={() => setShowCurrentPass(!showCurrentPass)} style={styles.eyeBtn}>
+                    <MaterialCommunityIcons name={showCurrentPass ? "eye-off" : "eye"} size={20} color="#94A3B8" />
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              {/* Save Button */}
+              <TouchableOpacity
+                style={[styles.saveButton, isSaving && { opacity: 0.6 }]}
+                onPress={handleSaveProfile}
+                disabled={isSaving}
+              >
+                {isSaving ? (
+                  <ActivityIndicator size="small" color="#FFF" />
+                ) : (
+                  <Text style={styles.saveButtonText}>Save Changes</Text>
+                )}
+              </TouchableOpacity>
+
+              <View style={{ height: 20 }} />
+            </ScrollView>
           </View>
         </View>
       </Modal>
@@ -353,28 +524,15 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: "#F8FAFC" },
   loadingContainer: { flex: 1, justifyContent: "center", alignItems: "center" },
   loadingText: { marginTop: 12, fontSize: 15, color: "#64748B" },
-  
+
   // Header
   header: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 20, paddingVertical: 16, backgroundColor: "#FFF", borderBottomWidth: 1, borderBottomColor: "#E2E8F0" },
   headerTitle: { fontSize: 20, fontWeight: "700", color: "#0F172A" },
-  //menuButton: { width: 40, height: 40, borderRadius: 20, backgroundColor: "#F1F5F9", justifyContent: "center", alignItems: "center" },
-  
-  // Dropdown
-  // dropdownMenu: { position: "absolute", top: 65, right: 16, backgroundColor: "#FFF", borderRadius: 14, paddingVertical: 4, elevation: 8, shadowColor: "#000", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.12, shadowRadius: 8, zIndex: 100, minWidth: 180, borderWidth: 1, borderColor: "#F1F5F9" },
-  // dropdownItem: { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 12, gap: 10 },
-  // dropdownText: { fontSize: 14, color: "#334155", fontWeight: "500" },
-  // dropdownDivider: { height: 1, backgroundColor: "#F1F5F9", marginHorizontal: 12 },
-  
+
   container: { flex: 1 },
-  
-  // Profile Picture
-  profilePicSection: { alignItems: "center", paddingVertical: 30 },
-  profilePicContainer: { width: 120, height: 120, borderRadius: 60, overflow: "hidden", borderWidth: 3, borderColor: "#E2E8F0" },
-  profilePic: { width: "100%", height: "100%" },
-  profilePicPlaceholder: { width: "100%", height: "100%", backgroundColor: "#F1F5F9", justifyContent: "center", alignItems: "center" },
-  
+
   // Info Cards
-  infoSection: { paddingHorizontal: 16, gap: 10 },
+  infoSection: { paddingHorizontal: 16, paddingTop: 20, gap: 10 },
   infoCard: { flexDirection: "row", alignItems: "center", backgroundColor: "#FFF", padding: 16, borderRadius: 14, elevation: 1, borderWidth: 1, borderColor: "#F1F5F9" },
   infoIconWrap: { width: 42, height: 42, borderRadius: 12, backgroundColor: "#EFF6FF", justifyContent: "center", alignItems: "center", marginRight: 14 },
   infoContent: { flex: 1 },
@@ -382,31 +540,37 @@ const styles = StyleSheet.create({
   infoValue: { fontSize: 15, color: "#1E293B", fontWeight: "600" },
   roleBadge: { alignSelf: "flex-start", paddingHorizontal: 10, paddingVertical: 3, backgroundColor: "#FEF3C7", borderRadius: 12, marginTop: 4 },
   roleText: { fontSize: 12, color: "#D97706", fontWeight: "600" },
-  
+  pendingEmailWrap: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 },
+  pendingEmailText: { fontSize: 11, color: "#D97706", fontWeight: "500", fontStyle: "italic" },
+
   // Actions
   actionsSection: { paddingHorizontal: 16, marginTop: 24 },
   actionsTitle: { fontSize: 16, fontWeight: "700", color: "#0F172A", marginBottom: 12 },
   actionCard: { flexDirection: "row", alignItems: "center", backgroundColor: "#FFF", padding: 16, borderRadius: 14, marginBottom: 8, gap: 12, elevation: 1, borderWidth: 1, borderColor: "#F1F5F9" },
   actionText: { flex: 1, fontSize: 15, color: "#334155", fontWeight: "500" },
   logoutCard: { borderColor: "#FEE2E2", backgroundColor: "#FFF5F5" },
-  
+
   // Modal
   modalOverlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
-  modalContent: { backgroundColor: "#FFF", borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 20, paddingBottom: 30, maxHeight: "80%" },
-  modalHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 18, borderBottomWidth: 1, borderBottomColor: "#F1F5F9" },
+  modalContent: { backgroundColor: "#FFF", borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 20, paddingBottom: 10, maxHeight: "90%" },
+  modalHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 18, borderBottomWidth: 1, borderBottomColor: "#F1F5F9", marginBottom: 8 },
   modalTitle: { fontSize: 18, fontWeight: "700", color: "#0F172A" },
-  
-  editPicSection: { alignItems: "center", paddingVertical: 20 },
-  editPicContainer: { width: 100, height: 100, borderRadius: 50, overflow: "hidden", borderWidth: 2, borderColor: "#E2E8F0", position: "relative" },
-  editPic: { width: "100%", height: "100%" },
-  editPicPlaceholder: { width: "100%", height: "100%", backgroundColor: "#F1F5F9", justifyContent: "center", alignItems: "center" },
-  cameraIconWrap: { position: "absolute", bottom: 0, right: 0, width: 30, height: 30, borderRadius: 15, backgroundColor: "#3B82F6", justifyContent: "center", alignItems: "center", borderWidth: 2, borderColor: "#FFF" },
-  editPicLabel: { fontSize: 13, color: "#3B82F6", fontWeight: "500", marginTop: 8 },
-  
-  editInputWrap: { marginBottom: 16 },
+
+  editInputWrap: { marginBottom: 14 },
   editInputLabel: { fontSize: 13, color: "#64748B", marginBottom: 6, fontWeight: "500" },
   editInput: { backgroundColor: "#F8FAFC", borderRadius: 12, paddingHorizontal: 16, paddingVertical: 12, fontSize: 15, color: "#1E293B", borderWidth: 1, borderColor: "#E2E8F0" },
-  
-  saveButton: { backgroundColor: "#2563EB", borderRadius: 14, paddingVertical: 15, alignItems: "center", marginTop: 10 },
+
+  // Password field
+  passwordWrap: { flexDirection: "row", alignItems: "center", backgroundColor: "#F8FAFC", borderRadius: 12, borderWidth: 1, borderColor: "#E2E8F0" },
+  passwordInput: { flex: 1, paddingHorizontal: 16, paddingVertical: 12, fontSize: 15, color: "#1E293B" },
+  eyeBtn: { paddingHorizontal: 14 },
+
+  // Divider
+  sectionDivider: { flexDirection: "row", alignItems: "center", marginVertical: 14, gap: 8 },
+  dividerLine: { flex: 1, height: 1, backgroundColor: "#E2E8F0" },
+  dividerText: { fontSize: 11, color: "#94A3B8", fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.5 },
+  requiredText: { color: "#EF4444", fontWeight: "400" },
+
+  saveButton: { backgroundColor: "#2563EB", borderRadius: 14, paddingVertical: 15, alignItems: "center", marginTop: 6 },
   saveButtonText: { color: "#FFF", fontSize: 16, fontWeight: "600" },
 });

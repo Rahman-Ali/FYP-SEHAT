@@ -22,7 +22,10 @@ class ChatService:
         messages = session.messages.all().order_by('timestamp')[offset:offset + limit]
         return messages
     
-    def process_user_query(self, session_id, query):
+    # backend/chat/services.py
+
+    def process_user_query(self, session_id, query, chat_history=None):
+        """Process user query through RAG pipeline with memory support."""
         session = ChatSession.objects.get(id=session_id)
         
         user_msg = Message.objects.create(
@@ -31,8 +34,33 @@ class ChatService:
             message_text=query
         )
         
-        context = self.rag_service.retrieve_context(query)
-        response = self.rag_service.generate_with_context(query, context)
+        # [MEMORY] Use frontend history if provided, else fetch from DB
+        if not chat_history:
+            previous_messages = Message.objects.filter(
+                session=session
+            ).order_by('-timestamp')[:10]
+            
+            chat_history = []
+            for msg in reversed(list(previous_messages)):
+                chat_history.append({
+                    "sender": msg.sender,
+                    "text": msg.message_text
+                })
+        
+        # Ensure correct format
+        formatted_history = []
+        for msg in (chat_history or [])[-6:]:
+            formatted_history.append({
+                "sender": msg.get("sender", "user"),
+                "text": msg.get("text", msg.get("message_text", ""))
+            })
+        
+        print(f"[MEMORY] History messages: {len(formatted_history)}")
+        for i, msg in enumerate(formatted_history):
+            print(f"[MEMORY]   [{i}] {msg['sender']}: {msg['text'][:50]}...")
+        
+        context = self.rag_service.retrieve_context(query, formatted_history)
+        response = self.rag_service.generate_with_context(query, context, formatted_history)
         
         bot_msg = Message.objects.create(
             session=session,
@@ -44,6 +72,8 @@ class ChatService:
         session.save()
         
         return user_msg, bot_msg
+        
+       
     
     def delete_session(self, session_id):
         session = ChatSession.objects.get(id=session_id)
@@ -95,7 +125,23 @@ class ChatService:
     
     def get_documents(self) -> list:
         """Get list of all loaded documents."""
-        return self.rag_service.get_loaded_documents()
+        result = self.rag_service.get_loaded_documents()
+        
+        # Handle double-nested response
+        if isinstance(result, dict):
+            if result.get('success') and 'documents' in result:
+                docs = result['documents']
+                # Check if documents is also a dict (double-nested)
+                if isinstance(docs, dict) and 'documents' in docs:
+                    return docs['documents']
+                # If documents is a list, return directly
+                if isinstance(docs, list):
+                    return docs
+            # Direct list
+            if 'documents' in result and isinstance(result['documents'], list):
+                return result['documents']
+        
+        return result if isinstance(result, list) else []
 
 
 class AuthenticationService:

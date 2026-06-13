@@ -6,6 +6,8 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
+import time
+from collections import defaultdict
 
 from .models import ChatSession, Message
 from .serializers import (
@@ -14,6 +16,8 @@ from .serializers import (
     MessageSerializer
 )
 from .services import ChatService
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Initialize Service
 chat_service = ChatService()
@@ -156,11 +160,32 @@ def get_session_messages(request):
     }, status=status.HTTP_200_OK)
 
 
+
+
+# Simple in-memory rate limiter (use Redis in production)
+rate_limit_cache = defaultdict(list)
+
+def check_rate_limit(firebase_uid, max_requests=10, window_seconds=60):
+    """Allow max_requests per window_seconds."""
+    now = time.time()
+    user_requests = rate_limit_cache[firebase_uid]
+    
+    # Remove old requests
+    user_requests = [t for t in user_requests if now - t < window_seconds]
+    rate_limit_cache[firebase_uid] = user_requests
+    
+    if len(user_requests) >= max_requests:
+        return False
+    
+    user_requests.append(now)
+    return True
+
 @api_view(['POST'])
 def process_query(request):
     session_id = request.data.get('session_id')
     query = request.data.get('query')
     firebase_uid = request.data.get('firebase_uid')
+    chat_history = request.data.get('chat_history', [])  # [MEMORY] Extract history
     
     if not session_id or not query or not firebase_uid:
         return Response(
@@ -168,10 +193,27 @@ def process_query(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
+    # [SECURITY] Rate limit check
+    if not check_rate_limit(firebase_uid):
+        return Response(
+            {'error': 'Too many requests. Please wait a moment.'},
+            status=status.HTTP_429_TOO_MANY_REQUESTS
+        )
+    
+    # [SECURITY] Length check
+    if len(query) > 500:
+        return Response(
+            {'error': 'Query too long. Maximum 500 characters allowed.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
     session = get_user_session_or_404(session_id, firebase_uid)
     
     try:
-        user_msg, bot_msg = chat_service.process_user_query(str(session.id), query)
+        # [MEMORY] Pass chat_history to service
+        user_msg, bot_msg = chat_service.process_user_query(
+            str(session.id), query, chat_history
+        )
         return Response({
             'user_message': MessageSerializer(user_msg).data,
             'bot_message': MessageSerializer(bot_msg).data
@@ -182,8 +224,6 @@ def process_query(request):
             {'error': str(e)},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
-
-
 @api_view(['DELETE'])
 def delete_session(request):
     session_id = request.data.get('session_id')
@@ -278,7 +318,7 @@ def admin_list_documents(request):
 def admin_add_document(request):
     """Add a new medical PDF document."""
     
-    # 🔥 DEBUG LOGS
+  
     print("[ADMIN ADD] Request received")
     print("[ADMIN ADD] FILES:", request.FILES)
     print("[ADMIN ADD] KEYS:", request.FILES.keys())
