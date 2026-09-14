@@ -5,8 +5,14 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 from sentence_transformers import util
+import google.generativeai as genai
 
 load_dotenv()
+if not os.getenv("GOOGLE_API_KEY"):
+    from pathlib import Path
+    _env_file = Path(__file__).resolve().parent.parent.parent.parent / ".env"
+    if _env_file.exists():
+        load_dotenv(dotenv_path=_env_file)
 
 logger = logging.getLogger(__name__)
 
@@ -381,8 +387,69 @@ class LLMService:
             return True
         
     # ═══════════════════════════════════════════════════════════════
-    # ANSWER GENERATION
+    # ANSWER GENERATION (GEMINI PRIMARY -> GROQ FALLBACK)
     # ═══════════════════════════════════════════════════════════════
+    def _call_generation_llm(self, prompt: str) -> str:
+        """
+        Generate answer using Google Gemini (gemini-3.1-flash-lite) as sole primary.
+        Falls back to Groq (llama-3.1-8b-instant) on exception, timeout, or empty response.
+        No OpenAI call anywhere in this path.
+        """
+        # 1. Primary: Google Gemini (gemini-3.1-flash-lite)
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        if google_api_key:
+            google_api_key = google_api_key.strip().strip('"').strip("'")
+
+        if google_api_key:
+            try:
+                genai.configure(api_key=google_api_key)
+                model = genai.GenerativeModel("gemini-3.1-flash-lite")
+                resp = model.generate_content(
+                    prompt,
+                    generation_config={
+                        "temperature": 0.3,
+                        "max_output_tokens": 1024,
+                    },
+                )
+                if resp and hasattr(resp, "text") and resp.text and resp.text.strip():
+                    logger.info("Generated answer using Gemini (gemini-3.1-flash-lite)")
+                    return resp.text.strip()
+                else:
+                    logger.warning("Gemini returned empty response, falling back to Groq")
+            except Exception as e:
+                logger.warning("Gemini generation failed: %s. Falling back to Groq", e)
+        else:
+            logger.warning("GOOGLE_API_KEY not configured or empty, falling back to Groq")
+
+        # 2. Fallback: Groq (LLaMA 3.1 8B)
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        if groq_api_key:
+            groq_api_key = groq_api_key.strip().strip('"').strip("'")
+
+        if groq_api_key:
+            try:
+                groq_client = ChatGroq(
+                    model_name="llama-3.1-8b-instant",
+                    groq_api_key=groq_api_key,
+                    temperature=0.2,
+                    max_tokens=1024,
+                    timeout=30,
+                    max_retries=2,
+                )
+                resp = groq_client.invoke(prompt)
+                text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+                if text:
+                    logger.info("Generated answer using Groq fallback (llama-3.1-8b-instant)")
+                    return text
+                else:
+                    logger.warning("Groq fallback returned empty response")
+            except Exception as e:
+                logger.error("Groq fallback generation failed: %s", e)
+        else:
+            logger.error("GROQ_API_KEY not configured or empty")
+
+        raise RuntimeError("Both Gemini and Groq generation failed or returned empty responses.")
+
     def generate_answer(
         self, original_query: str, retrieved_text: str,
         language: str, chat_history: list = None
@@ -442,13 +509,10 @@ class LLMService:
                 "knowledge base. Please consult a doctor."
             )
 
-        # Format chat history (with length limit)
         # Format chat history with proper context
-                # Format chat history with proper context
         history_context = ""
         if chat_history and len(chat_history) > 0:
             history_parts = []
-            
             for msg in chat_history[-6:]:  # Last 6 messages
                 sender = msg.get("sender", "user")
                 text = msg.get("text", msg.get("message_text", ""))
@@ -491,11 +555,7 @@ class LLMService:
         )
 
         try:
-            resp = self.llm.invoke(prompt)
-            answer = (
-                resp.content if hasattr(resp, "content")
-                else str(resp)
-            ).strip()
+            answer = self._call_generation_llm(prompt)
             answer = answer.replace("**", "").replace("##", "").replace("__", "")
 
             # Handle contradictory content
@@ -547,11 +607,7 @@ class LLMService:
                         "Pure Roman Urdu version:"
                     )
                     try:
-                        retry_resp = self.llm.invoke(retry_prompt)
-                        retry_answer = (
-                            retry_resp.content if hasattr(retry_resp, "content")
-                            else str(retry_resp)
-                        ).strip()
+                        retry_answer = self._call_generation_llm(retry_prompt)
                         if retry_answer and len(retry_answer) > 20:
                             answer = retry_answer
                             # Add disclaimer in Roman Urdu
