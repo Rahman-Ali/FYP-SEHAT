@@ -15,12 +15,42 @@ from .serializers import (
     ChatSessionDetailSerializer,
     MessageSerializer
 )
-from .services import ChatService
+from .services import ChatService, AuthenticationService
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# Initialize Service
+# Initialize Services
 chat_service = ChatService()
+auth_service = AuthenticationService()
+
+
+def extract_and_verify_token(request):
+    """
+    Extracts Bearer token from Authorization header or request body,
+    verifies it via AuthenticationService, and returns (verified_uid, error_response).
+    If verification fails, returns (None, Response(..., status=401)).
+    """
+    auth_header = request.headers.get('Authorization') or request.META.get('HTTP_AUTHORIZATION')
+    token = None
+    if auth_header and auth_header.strip().lower().startswith('bearer '):
+        token = auth_header.strip()[7:].strip()
+    elif isinstance(request.data, dict):
+        token = request.data.get('id_token') or request.data.get('token')
+
+    if not token:
+        return None, Response(
+            {'error': 'Authentication required: missing authentication token'},
+            status=status.HTTP_401_UNAUTHORIZED
+        )
+
+    verified_uid = auth_service.verify_firebase_token(token)
+    if not verified_uid:
+        return None, Response(
+            {'error': 'Authentication failed: invalid or expired Firebase token'},
+            status=status.HTTP_401_UNAUTHORIZED
+        )
+
+    return verified_uid, None
 
 # -------------------------------------------------------
 # DYNAMIC PDF LOADING - No hardcoded file names
@@ -94,15 +124,11 @@ def health_check(request):
 
 @api_view(['POST'])
 def create_session(request):
-    firebase_uid = request.data.get('firebase_uid')
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
     title = request.data.get('title', 'New Chat')
-    
-    if not firebase_uid:
-        return Response(
-            {'error': 'firebase_uid is required'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    
     session = chat_service.create_new_session(firebase_uid, title)
     serializer = ChatSessionSerializer(session)
     return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -110,14 +136,10 @@ def create_session(request):
 
 @api_view(['POST'])
 def get_user_sessions(request):
-    firebase_uid = request.data.get('firebase_uid')
-    
-    if not firebase_uid:
-        return Response(
-            {'error': 'firebase_uid is required'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
     sessions = ChatSession.objects.filter(firebase_uid=firebase_uid).order_by('-updated_at')
     serializer = ChatSessionSerializer(sessions, many=True)
     return Response(serializer.data)
@@ -125,15 +147,17 @@ def get_user_sessions(request):
 
 @api_view(['POST'])
 def get_session_detail(request):
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
     session_id = request.data.get('session_id')
-    firebase_uid = request.data.get('firebase_uid')
-    
-    if not session_id or not firebase_uid:
+    if not session_id:
         return Response(
-            {'error': 'session_id and firebase_uid are required'},
+            {'error': 'session_id is required'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    
+
     session = get_user_session_or_404(session_id, firebase_uid)
     serializer = ChatSessionDetailSerializer(session)
     return Response(serializer.data)
@@ -141,19 +165,21 @@ def get_session_detail(request):
 
 @api_view(['POST'])
 def get_session_messages(request):
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
     session_id = request.data.get('session_id')
-    firebase_uid = request.data.get('firebase_uid')
-    
-    if not session_id or not firebase_uid:
+    if not session_id:
         return Response(
-            {'error': 'session_id and firebase_uid are required'},
+            {'error': 'session_id is required'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    
+
     session = get_user_session_or_404(session_id, firebase_uid)
     messages = session.messages.all().order_by('timestamp')
     serializer = MessageSerializer(messages, many=True)
-    
+
     return Response({
         'count': messages.count(),
         'messages': serializer.data
@@ -169,46 +195,49 @@ def check_rate_limit(firebase_uid, max_requests=10, window_seconds=60):
     """Allow max_requests per window_seconds."""
     now = time.time()
     user_requests = rate_limit_cache[firebase_uid]
-    
+
     # Remove old requests
     user_requests = [t for t in user_requests if now - t < window_seconds]
     rate_limit_cache[firebase_uid] = user_requests
-    
+
     if len(user_requests) >= max_requests:
         return False
-    
+
     user_requests.append(now)
     return True
 
 @api_view(['POST'])
 def process_query(request):
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
     session_id = request.data.get('session_id')
     query = request.data.get('query')
-    firebase_uid = request.data.get('firebase_uid')
     chat_history = request.data.get('chat_history', [])  # [MEMORY] Extract history
-    
-    if not session_id or not query or not firebase_uid:
+
+    if not session_id or not query:
         return Response(
-            {'error': 'session_id, query, and firebase_uid are required'},
+            {'error': 'session_id and query are required'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    
-    # [SECURITY] Rate limit check
+
+    # [SECURITY] Rate limit check with verified UID
     if not check_rate_limit(firebase_uid):
         return Response(
             {'error': 'Too many requests. Please wait a moment.'},
             status=status.HTTP_429_TOO_MANY_REQUESTS
         )
-    
+
     # [SECURITY] Length check
     if len(query) > 500:
         return Response(
             {'error': 'Query too long. Maximum 500 characters allowed.'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    
+
     session = get_user_session_or_404(session_id, firebase_uid)
-    
+
     try:
         # [MEMORY] Pass chat_history to service
         user_msg, bot_msg = chat_service.process_user_query(
@@ -224,20 +253,24 @@ def process_query(request):
             {'error': str(e)},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+
 @api_view(['DELETE'])
 def delete_session(request):
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
     session_id = request.data.get('session_id')
-    firebase_uid = request.data.get('firebase_uid')
-    
-    if not session_id or not firebase_uid:
+    if not session_id:
         return Response(
-            {'error': 'session_id and firebase_uid are required'},
+            {'error': 'session_id is required'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    
+
     session = get_user_session_or_404(session_id, firebase_uid)
     session.delete()
-    
+
     return Response(
         {'message': 'Session deleted successfully'},
         status=status.HTTP_200_OK
@@ -246,15 +279,17 @@ def delete_session(request):
 
 @api_view(['DELETE'])
 def delete_message(request):
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
     message_id = request.data.get('message_id')
-    firebase_uid = request.data.get('firebase_uid')
-    
-    if not message_id or not firebase_uid:
+    if not message_id:
         return Response(
-            {'error': 'message_id and firebase_uid are required'},
+            {'error': 'message_id is required'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    
+
     try:
         message = Message.objects.get(id=message_id)
         if message.session.firebase_uid != firebase_uid:
@@ -264,7 +299,7 @@ def delete_message(request):
     except Message.DoesNotExist:
         from django.http import Http404
         raise Http404("Message not found")
-    
+
     return Response(
         {'message': 'Message deleted successfully'},
         status=status.HTTP_200_OK
@@ -273,20 +308,23 @@ def delete_message(request):
 
 @api_view(['PATCH'])
 def update_session_title(request):
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
     session_id = request.data.get('session_id')
     title = request.data.get('title')
-    firebase_uid = request.data.get('firebase_uid')
-    
-    if not session_id or not title or not firebase_uid:
+
+    if not session_id or not title:
         return Response(
-            {'error': 'session_id, title, and firebase_uid are required'},
+            {'error': 'session_id and title are required'},
             status=status.HTTP_400_BAD_REQUEST
         )
-    
+
     session = get_user_session_or_404(session_id, firebase_uid)
     session.title = title
     session.save()
-    
+
     serializer = ChatSessionSerializer(session)
     return Response(serializer.data)
 
