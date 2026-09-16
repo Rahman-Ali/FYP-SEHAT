@@ -73,6 +73,7 @@ else:
     print(f"LOADING {len(pdf_files)} BOOK(S)...")
     
     loaded_count = 0
+    skipped_count = 0
     for filename in pdf_files:
         pdf_path = os.path.join(MEDICAL_DOCS_DIR, filename)
         # Use filename (without .pdf) as the display name
@@ -81,11 +82,23 @@ else:
         try:
             result = chat_service.rag_service.load_document(pdf_path, book_name)
             print(f"  {book_name}: {result}")
-            loaded_count += 1
+            if result.startswith("Skipped"):
+                skipped_count += 1
+            else:
+                loaded_count += 1
         except Exception as e:
             print(f"  ERROR loading '{filename}': {e}")
-    
-    print(f"LOADED: {loaded_count}/{len(pdf_files)} books successfully")
+
+    # If any files were skipped (hash unchanged), warm up BM25 from Neo4j text
+    # so the sparse retriever is still functional this session.
+    if skipped_count:
+        chat_service.rag_service.vector_service.warm_up_bm25_from_neo4j()
+
+    print(
+        f"INGESTION DONE: {loaded_count} re-indexed, "
+        f"{skipped_count} skipped (unchanged), "
+        f"{len(pdf_files) - loaded_count - skipped_count} errored"
+    )
 
 print(f"----------------------------------------")
 

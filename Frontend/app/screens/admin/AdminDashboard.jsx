@@ -17,8 +17,9 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { auth, getUserRole } from "../../../firebase.config";
+import { BASE_URL as ROOT_API_URL } from "../../services/api";
 
-const BASE_URL = "http://10.10.40.138:8000/api/chat";
+const BASE_URL = `${ROOT_API_URL}/chat`;
 
 // ─── Doc Card (memoized) ─────────────────────────────────────────────────────
 const DocCard = memo(function DocCard({ item, onRemove, isRemoving }) {
