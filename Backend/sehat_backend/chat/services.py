@@ -21,29 +21,39 @@ def initialize_firebase_admin():
         _firebase_initialized = True
         return
 
-    cred_val = (
-        os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
-        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        or os.getenv("FIREBASE_CREDENTIALS_PATH")
-    )
-    project_id = os.getenv("FIREBASE_PROJECT_ID", "sehat-538ee")
-
     cred = None
-    if cred_val:
-        cred_val = cred_val.strip().strip('"').strip("'")
-        if os.path.isfile(cred_val):
-            try:
-                cred = credentials.Certificate(cred_val)
-                logger.info("Firebase Admin initialized with certificate from %s", cred_val)
-            except Exception as e:
-                logger.error("Failed to load Firebase credentials from %s: %s", cred_val, e)
-        elif cred_val.startswith("{") and cred_val.endswith("}"):
-            try:
-                cred_dict = json.loads(cred_val)
-                cred = credentials.Certificate(cred_dict)
-                logger.info("Firebase Admin initialized with JSON certificate from env")
-            except Exception as e:
-                logger.error("Failed to parse Firebase certificate JSON: %s", e)
+    cred_json_env = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if cred_json_env:
+        try:
+            cred_dict = json.loads(cred_json_env)
+            cred = credentials.Certificate(cred_dict)
+            logger.info("Firebase Admin initialized with FIREBASE_SERVICE_ACCOUNT_JSON env var")
+        except Exception as e:
+            logger.error("Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: %s", e)
+
+    if not cred:
+        cred_val = (
+            os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
+            or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.getenv("FIREBASE_CREDENTIALS_PATH")
+        )
+        if cred_val:
+            cred_val = cred_val.strip().strip('"').strip("'")
+            if os.path.isfile(cred_val):
+                try:
+                    cred = credentials.Certificate(cred_val)
+                    logger.info("Firebase Admin initialized with certificate from %s", cred_val)
+                except Exception as e:
+                    logger.error("Failed to load Firebase credentials from %s: %s", cred_val, e)
+            elif cred_val.startswith("{") and cred_val.endswith("}"):
+                try:
+                    cred_dict = json.loads(cred_val)
+                    cred = credentials.Certificate(cred_dict)
+                    logger.info("Firebase Admin initialized with JSON certificate from env")
+                except Exception as e:
+                    logger.error("Failed to parse Firebase certificate JSON: %s", e)
+
+    project_id = os.getenv("FIREBASE_PROJECT_ID", "sehat-538ee")
 
     try:
         if cred:

@@ -1,9 +1,7 @@
 //D:\project\Frontend\app\services\api.jsx
 import axios from "axios";
 import { getAuth, onAuthStateChanged } from "firebase/auth";
-export const BASE_IP = "10.185.171.104";
-// export const BASE_IP = "localhost";
-export const BASE_URL = `http://${BASE_IP}:8000/api`;
+export const BASE_URL = process.env.EXPO_PUBLIC_API_URL || "http://localhost:8000/api";
 
 const api = axios.create({
   baseURL: BASE_URL,

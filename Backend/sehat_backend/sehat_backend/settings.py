@@ -1,16 +1,19 @@
 import os
+import sys
 from pathlib import Path
 from decouple import config
+import dj_database_url
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-temp-key-change-in-production')
 
-DEBUG = config('DEBUG', default=True, cast=bool)
-#itel : 192.168.4.134
-#kaxhi    10.17.158.134
+DJANGO_DEBUG = os.getenv('DJANGO_DEBUG', 'False')
+DEBUG = DJANGO_DEBUG.lower() in ('true', '1', 't')
 
-ALLOWED_HOSTS = ['10.10.40.60','localhost','154.80.22.201' ,'127.0.0.1','10.10.40.163','192.168.4.134' ,'10.17.158.134','*']
+ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', '').split(',') if host.strip()]
+if not ALLOWED_HOSTS and any('runserver' in arg for arg in sys.argv):
+    ALLOWED_HOSTS = ['localhost', '127.0.0.1', '0.0.0.0', '*']
 
 # Applications
 INSTALLED_APPS = [
@@ -33,6 +36,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',  # Must be first
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -63,7 +67,10 @@ WSGI_APPLICATION = 'sehat_backend.wsgi.application'
 
 # PostgreSQL Database
 DATABASES = {
-    'default': {
+    'default': dj_database_url.config(
+        default=os.getenv("DATABASE_URL"),
+        conn_max_age=600
+    ) or {
         'ENGINE': 'django.db.backends.postgresql',
         'NAME': config('DB_NAME', default='sehat'),
         'USER': config('DB_USER', default='postgres'),
@@ -87,11 +94,17 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # CORS Settings (React Native ke liye)
 CORS_ALLOW_ALL_ORIGINS = True  # Development only
+CORS_ALLOW_ALL_ORIGINS = (DJANGO_DEBUG == "False")
+CORS_ALLOWED_ORIGINS = [
+    'http://localhost:8081',
+]
 CORS_ALLOW_CREDENTIALS = True
 
 # REST Framework Settings
