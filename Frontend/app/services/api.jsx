@@ -1,7 +1,7 @@
 //D:\project\Frontend\app\services\api.jsx
 import axios from "axios";
-const BASE_IP = "10.10.40.138"; 
-const BASE_URL = `http://${BASE_IP}:8000/api`;
+import { getAuth, onAuthStateChanged } from "firebase/auth";
+export const BASE_URL = process.env.EXPO_PUBLIC_API_URL || "http://localhost:8000/api";
 
 const api = axios.create({
   baseURL: BASE_URL,
@@ -10,6 +10,49 @@ const api = axios.create({
     "Content-Type": "application/json",
     Accept: "application/json",
   },
+});
+
+const getResolvedUser = (auth, timeoutMs = 3000) => {
+  if (auth.currentUser) {
+    return Promise.resolve(auth.currentUser);
+  }
+
+  return new Promise((resolve) => {
+    let unsubscribe;
+    const timer = setTimeout(() => {
+      if (unsubscribe) unsubscribe();
+      resolve(null);
+    }, timeoutMs);
+
+    unsubscribe = onAuthStateChanged(
+      auth,
+      (user) => {
+        clearTimeout(timer);
+        if (unsubscribe) unsubscribe();
+        resolve(user);
+      },
+      () => {
+        clearTimeout(timer);
+        if (unsubscribe) unsubscribe();
+        resolve(null);
+      }
+    );
+  });
+};
+
+// Firebase Auth Token Interceptor (runs before logging)
+api.interceptors.request.use(async (config) => {
+  try {
+    const auth = getAuth();
+    const user = await getResolvedUser(auth, 3000);
+    if (user) {
+      const token = await user.getIdToken();
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+  } catch (err) {
+    console.warn("Auth token resolution skipped:", err?.message || err);
+  }
+  return config;
 });
 
 api.interceptors.request.use(
@@ -38,16 +81,16 @@ api.interceptors.response.use(
 
 
 export const apiService = {
-  
-  
+
+
   _firebaseUid: null,
-  
+
 
   setFirebaseUid: (uid) => {
     apiService._firebaseUid = uid;
     console.log("🔐 Firebase UID set:", uid);
   },
-  
+
 
   _getFirebaseUid: () => {
     if (!apiService._firebaseUid) {
@@ -56,7 +99,7 @@ export const apiService = {
     return apiService._firebaseUid;
   },
 
- 
+
   createChatSession: async (firebaseUid) => {
     try {
       const response = await api.post("/chat/sessions/create/", {
@@ -70,15 +113,15 @@ export const apiService = {
     }
   },
 
-  
+
   getAllSessions: async () => {
     try {
       const firebaseUid = apiService._getFirebaseUid();
-      
+
       const response = await api.post("/chat/sessions/list/", {
         firebase_uid: firebaseUid,
       });
-      
+
       const sessionsData = response.data || [];
 
       return sessionsData.map((session) => ({
@@ -94,17 +137,17 @@ export const apiService = {
     }
   },
 
- 
+
   getSessionDetail: async (sessionId) => {
     try {
       const firebaseUid = apiService._getFirebaseUid();
-      
-     
+
+
       const response = await api.post("/chat/sessions/detail/", {
         session_id: sessionId,
         firebase_uid: firebaseUid,
       });
-      
+
       return response.data;
     } catch (error) {
       console.error("Get Session Detail Error:", error.message);
@@ -112,17 +155,17 @@ export const apiService = {
     }
   },
 
- 
+
   getSessionMessages: async (sessionId) => {
     try {
       const firebaseUid = apiService._getFirebaseUid();
-      
-      
+
+
       const response = await api.post("/chat/messages/list/", {
         session_id: sessionId,
         firebase_uid: firebaseUid,
       });
-      
+
       const data = response.data;
       return {
         count: data.count || 0,
@@ -135,10 +178,10 @@ export const apiService = {
   },
 
 
-sendMessage: async (sessionId, messageText, chatHistory = []) => {
+  sendMessage: async (sessionId, messageText, chatHistory = []) => {
     try {
       const firebaseUid = apiService._getFirebaseUid();
-      
+
       // [MEMORY] Frontend already formatted — use directly
       const recentHistory = (chatHistory || []).slice(-6);
 
@@ -168,17 +211,17 @@ sendMessage: async (sessionId, messageText, chatHistory = []) => {
     }
   },
 
-  
+
   updateSessionTitle: async (sessionId, newTitle) => {
     try {
       const firebaseUid = apiService._getFirebaseUid();
-      
+
       const response = await api.patch("/chat/sessions/update-title/", {
         session_id: sessionId,
         title: newTitle,
-        firebase_uid: firebaseUid,  
+        firebase_uid: firebaseUid,
       });
-      
+
       console.log("Title updated:", newTitle);
       return response.data;
     } catch (error) {
@@ -191,14 +234,14 @@ sendMessage: async (sessionId, messageText, chatHistory = []) => {
   deleteSession: async (sessionId) => {
     try {
       const firebaseUid = apiService._getFirebaseUid();
-      
+
       const response = await api.delete("/chat/sessions/delete/", {
-        data: {  
+        data: {
           session_id: sessionId,
           firebase_uid: firebaseUid,
         },
       });
-      
+
       return response.data;
     } catch (error) {
       console.error("Delete Session Error:", error.message);
@@ -206,18 +249,18 @@ sendMessage: async (sessionId, messageText, chatHistory = []) => {
     }
   },
 
- 
+
   deleteMessage: async (messageId) => {
     try {
       const firebaseUid = apiService._getFirebaseUid();
-      
+
       const response = await api.delete("/chat/messages/delete/", {
         data: {
           message_id: messageId,
           firebase_uid: firebaseUid,
         },
       });
-      
+
       return response.data;
     } catch (error) {
       console.error("Delete Message Error:", error.message);
@@ -225,7 +268,7 @@ sendMessage: async (sessionId, messageText, chatHistory = []) => {
     }
   },
 
- 
+
   healthCheck: async () => {
     try {
       const response = await api.get("/chat/health/");
