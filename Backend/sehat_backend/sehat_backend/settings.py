@@ -34,7 +34,8 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',  # Must be first
+    'sehat_backend.health_middleware.HealthCheckMiddleware',  # First: immediate /healthz and /readyz
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -99,12 +100,8 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# CORS Settings (React Native ke liye)
-CORS_ALLOW_ALL_ORIGINS = True  # Development only
-CORS_ALLOW_ALL_ORIGINS = (DJANGO_DEBUG == "False")
-CORS_ALLOWED_ORIGINS = [
-    'http://localhost:8081',
-]
+# CORS Settings (React Native & Web)
+CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 
 # REST Framework Settings
