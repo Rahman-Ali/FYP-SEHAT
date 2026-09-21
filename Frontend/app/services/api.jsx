@@ -1,7 +1,33 @@
 //D:\project\Frontend\app\services\api.jsx
 import axios from "axios";
+import { Platform } from "react-native";
+import Constants from "expo-constants";
 import { getAuth, onAuthStateChanged } from "firebase/auth";
-export const BASE_URL = process.env.EXPO_PUBLIC_API_URL || "http://localhost:8000/api";
+
+const getBaseUrl = () => {
+  if (process.env.EXPO_PUBLIC_API_URL) {
+    return process.env.EXPO_PUBLIC_API_URL;
+  }
+
+  if (Platform.OS === "web") {
+    return "http://localhost:8000/api";
+  }
+
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    Constants.manifest2?.extra?.expoGo?.debuggerHost ||
+    Constants.manifest?.debuggerHost;
+
+  if (hostUri) {
+    const hostIp = hostUri.split(":")[0];
+    return `http://${hostIp}:8000/api`;
+  }
+
+  return "http://10.185.171.104:8000/api";
+};
+
+export const BASE_URL = getBaseUrl();
+console.log("[API Service] Active BASE_URL:", BASE_URL);
 
 const api = axios.create({
   baseURL: BASE_URL,
