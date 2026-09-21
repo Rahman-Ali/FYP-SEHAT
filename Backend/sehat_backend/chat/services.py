@@ -1,12 +1,12 @@
 import os
 import json
 import logging
+import threading
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import auth, credentials
 
 from .models import ChatSession, Message
-from .rag_service import RAGService
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -67,11 +67,32 @@ def initialize_firebase_admin():
         _firebase_initialized = True
 
 
+_chat_service_instance = None
+_chat_service_lock = threading.Lock()
+
+
+def get_chat_service():
+    """Thread-safe singleton accessor for ChatService."""
+    global _chat_service_instance
+    if _chat_service_instance is None:
+        with _chat_service_lock:
+            if _chat_service_instance is None:
+                _chat_service_instance = ChatService()
+    return _chat_service_instance
+
+
 class ChatService:
     """Business logic for chat operations."""
     
     def __init__(self):
-        self.rag_service = RAGService()
+        self._rag_service = None
+
+    @property
+    def rag_service(self):
+        if self._rag_service is None:
+            from .rag_service import RAGService
+            self._rag_service = RAGService()
+        return self._rag_service
     
     def create_new_session(self, firebase_uid, title="New Chat"):
         return ChatSession.objects.create(

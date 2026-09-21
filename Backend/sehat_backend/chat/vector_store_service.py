@@ -23,17 +23,21 @@ class VectorStoreService:
         self.sparse_retriever = None
         self._all_chunks = []
         self.is_ready = False
-        
+
         self.NEO4J_URI = os.getenv(
-        "NEO4J_URI",
-        "neo4j+s://98b70f75.databases.neo4j.io"
-)
+            "NEO4J_URI",
+            "neo4j+s://98b70f75.databases.neo4j.io"
+        )
         self.NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
         self.NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
         self.NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
-        
+        # Heavy model loading and Neo4j connection are deferred to load_models() / warm_up_bm25_from_neo4j()
+
+    def load_models(self):
+        """Load HuggingFace and SentenceTransformer embedding models."""
+        if self.embeddings_model is not None and self.sbert_model is not None:
+            return
         self._initialize_models()
-        self._test_connection()
 
     def _initialize_models(self):
         try:
@@ -45,12 +49,35 @@ class VectorStoreService:
             print("Embedding models loaded successfully")
         except Exception as e:
             print(f"Embedding model load failed: {e}")
+            raise
+
+    def is_available(self, timeout: float = 5.0) -> bool:
+        """Non-raising quick connectivity check to Neo4j."""
+        if not self.NEO4J_PASSWORD:
+            return False
+        try:
+            driver = GraphDatabase.driver(
+                self.NEO4J_URI,
+                auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD),
+                connection_timeout=timeout,
+            )
+            driver.verify_connectivity()
+            driver.close()
+            return True
+        except Exception as e:
+            logger.warning(f"Neo4j is_available probe failed: {e}")
+            return False
+
+    def attach_vector_index(self):
+        """Attach to existing Neo4j vector index."""
+        self._attach_neo4j_store_if_needed()
 
     def _test_connection(self):
         try:
             driver = GraphDatabase.driver(
-            self.NEO4J_URI,
-            auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD)
+                self.NEO4J_URI,
+                auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD),
+                connection_timeout=10.0,
             )
             driver.verify_connectivity()
             driver.close()
@@ -262,8 +289,8 @@ class VectorStoreService:
             driver.close()
             return stored_hash
         except Exception as e:
-            print(f"Error reading source_hash for '{source_file}': {e}")
-            return None
+            logger.error(f"Error reading source_hash for '{source_file}': {e}")
+            raise
 
     def get_document_list(self) -> list:
     

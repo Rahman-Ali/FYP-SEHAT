@@ -15,12 +15,11 @@ from .serializers import (
     ChatSessionDetailSerializer,
     MessageSerializer
 )
-from .services import ChatService, AuthenticationService
+from .services import get_chat_service, AuthenticationService
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # Initialize Services
-chat_service = ChatService()
 auth_service = AuthenticationService()
 
 
@@ -51,56 +50,6 @@ def extract_and_verify_token(request):
         )
 
     return verified_uid, None
-
-# -------------------------------------------------------
-# DYNAMIC PDF LOADING - No hardcoded file names
-# -------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-MEDICAL_DOCS_DIR = os.path.join(BASE_DIR, 'medical_documents')
-
-print(f"RAG SYSTEM INIT")
-print(f"MEDICAL DOCS DIR: {MEDICAL_DOCS_DIR}")
-
-# Ensure the directory exists
-os.makedirs(MEDICAL_DOCS_DIR, exist_ok=True)
-
-# Get all PDF files from the directory
-pdf_files = [f for f in os.listdir(MEDICAL_DOCS_DIR) if f.endswith('.pdf')]
-
-if not pdf_files:
-    print("WARNING: No PDF files found in medical_documents directory")
-else:
-    print(f"LOADING {len(pdf_files)} BOOK(S)...")
-    
-    loaded_count = 0
-    skipped_count = 0
-    for filename in pdf_files:
-        pdf_path = os.path.join(MEDICAL_DOCS_DIR, filename)
-        # Use filename (without .pdf) as the display name
-        book_name = filename.replace('.pdf', '').replace('-', ' ').replace('_', ' ')
-        
-        try:
-            result = chat_service.rag_service.load_document(pdf_path, book_name)
-            print(f"  {book_name}: {result}")
-            if result.startswith("Skipped"):
-                skipped_count += 1
-            else:
-                loaded_count += 1
-        except Exception as e:
-            print(f"  ERROR loading '{filename}': {e}")
-
-    # If any files were skipped (hash unchanged), warm up BM25 from Neo4j text
-    # so the sparse retriever is still functional this session.
-    if skipped_count:
-        chat_service.rag_service.vector_service.warm_up_bm25_from_neo4j()
-
-    print(
-        f"INGESTION DONE: {loaded_count} re-indexed, "
-        f"{skipped_count} skipped (unchanged), "
-        f"{len(pdf_files) - loaded_count - skipped_count} errored"
-    )
-
-print(f"----------------------------------------")
 
 # ==========================================================
 # REST OF THE FILE REMAINS EXACTLY THE SAME
@@ -142,7 +91,7 @@ def create_session(request):
         return error_response
 
     title = request.data.get('title', 'New Chat')
-    session = chat_service.create_new_session(firebase_uid, title)
+    session = get_chat_service().create_new_session(firebase_uid, title)
     serializer = ChatSessionSerializer(session)
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -235,6 +184,22 @@ def process_query(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
+    # Check warm-up state before processing
+    from .warmup import get_warmup_state
+    warmup_state = get_warmup_state()
+    if warmup_state in ("idle", "loading"):
+        resp = Response(
+            {'error': 'warming_up'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        resp['Retry-After'] = '15'
+        return resp
+    elif warmup_state == "failed":
+        return Response(
+            {'error': 'knowledge_base_unavailable'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+
     # [SECURITY] Rate limit check with verified UID
     if not check_rate_limit(firebase_uid):
         return Response(
@@ -253,7 +218,7 @@ def process_query(request):
 
     try:
         # [MEMORY] Pass chat_history to service
-        user_msg, bot_msg = chat_service.process_user_query(
+        user_msg, bot_msg = get_chat_service().process_user_query(
             str(session.id), query, chat_history
         )
         return Response({
@@ -350,7 +315,7 @@ def update_session_title(request):
 def admin_list_documents(request):
     """List all documents in the knowledge base."""
     try:
-        documents = chat_service.get_documents()
+        documents = get_chat_service().get_documents()
         return Response({
             'success': True,
             'documents': documents,
@@ -394,7 +359,7 @@ def admin_add_document(request):
         )
     
     try:
-        result = chat_service.add_document(uploaded_file, filename)
+        result = get_chat_service().add_document(uploaded_file, filename)
         print(f"[ADMIN ADD] Result: {result}")
         
         if result.get('success'):
@@ -427,7 +392,7 @@ def admin_remove_document(request):
         )
     
     try:
-        result = chat_service.remove_document(filename)
+        result = get_chat_service().remove_document(filename)
         print(f"[ADMIN DELETE] Result: {result}")
         
         if result.get('success'):

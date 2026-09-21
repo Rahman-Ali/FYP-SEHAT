@@ -61,17 +61,20 @@ class RAGService:
             current_hash = _compute_file_hash(pdf_path)
 
             if not force:
-                stored_hash = self.vector_service.get_source_hash(filename)
-                if stored_hash and stored_hash == current_hash:
-                    logger.info(
-                        "[INGEST] unchanged, skipping: %s (hash=%s…)",
-                        filename, current_hash[:12],
+                try:
+                    stored_hash = self.vector_service.get_source_hash(filename)
+                    if stored_hash and stored_hash == current_hash:
+                        logger.info(
+                            "[INGEST] unchanged, skipping: %s (hash=%s…)",
+                            filename, current_hash[:12],
+                        )
+                        return f"Skipped (unchanged): '{book_name}'"
+                except Exception as hash_err:
+                    logger.error(
+                        "[INGEST] Hash read error for '%s' (status UNKNOWN, skipping to prevent data loss): %s",
+                        filename, hash_err,
                     )
-                    # File is unchanged but BM25 still needs chunks in memory
-                    # — they were not lost because startup order preserved them
-                    # from the previous add_chunks_to_store call that set
-                    # is_ready=True.  Nothing further to do.
-                    return f"Skipped (unchanged): '{book_name}'"
+                    return f"Skipped (hash-read error): '{book_name}'"
 
             logger.info("[INGEST] loading: %s (force=%s)", filename, force)
 
