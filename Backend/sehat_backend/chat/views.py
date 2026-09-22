@@ -185,8 +185,12 @@ def process_query(request):
         )
 
     # Check warm-up state before processing
-    from .warmup import get_warmup_state
+    from .warmup import get_warmup_state, start_warmup
     warmup_state = get_warmup_state()
+    if warmup_state == "idle":
+        start_warmup()
+        warmup_state = get_warmup_state()
+
     if warmup_state in ("idle", "loading"):
         resp = Response(
             {'error': 'warming_up'},
