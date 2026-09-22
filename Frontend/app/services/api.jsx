@@ -5,8 +5,13 @@ import Constants from "expo-constants";
 import { getAuth, onAuthStateChanged } from "firebase/auth";
 
 const getBaseUrl = () => {
-  if (process.env.EXPO_PUBLIC_API_URL) {
-    return process.env.EXPO_PUBLIC_API_URL;
+  const envUrl = process.env.EXPO_PUBLIC_API_URL?.trim();
+  if (envUrl) {
+    let cleanUrl = envUrl.replace(/\/+$/, "");
+    if (!cleanUrl.endsWith("/api")) {
+      cleanUrl = `${cleanUrl}/api`;
+    }
+    return cleanUrl;
   }
 
   if (Platform.OS === "web") {
@@ -23,7 +28,7 @@ const getBaseUrl = () => {
     return `http://${hostIp}:8000/api`;
   }
 
-  return "http://10.185.171.104:8000/api";
+  return "http://localhost:8000/api";
 };
 
 export const BASE_URL = getBaseUrl();
