@@ -8,6 +8,7 @@ class ChatSession(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     firebase_uid = models.CharField(max_length=255, db_index=True)
     title = models.CharField(max_length=255, blank=True, null=True)
+    session_metadata = models.JSONField(default=dict, blank=True)  # e.g. clarification_round
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
     

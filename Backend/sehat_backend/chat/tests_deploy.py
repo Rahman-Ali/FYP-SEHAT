@@ -9,6 +9,8 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 from django.test import TestCase, RequestFactory
+from langchain_core.documents import Document
+from chat.rag_service import RAGService
 
 
 # ---------------------------------------------------------------------------
@@ -210,3 +212,105 @@ class HashErrorSafetyTest(unittest.TestCase):
 
         self.assertIn("Skipped", result)
         rag.vector_service.delete_chunks_by_source.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 4. Phase 1 & 2: Citation Title & Display Title Fallback Tests
+# ---------------------------------------------------------------------------
+
+class CitationTitleFallbackTest(unittest.TestCase):
+    """Verify that _build_citations uses display_title when available and falls back cleanly."""
+
+    def test_uses_display_title_when_present(self):
+        rag = RAGService.__new__(RAGService)
+        doc = Document(
+            page_content="Dengue fever is a mosquito-borne tropical disease.",
+            metadata={
+                "source_file": "1-DENGUE-WHO-BOOK.pdf",
+                "display_title": "Dengue: Guidelines for Diagnosis, Treatment, Prevention and Control",
+                "page": 5,
+            },
+        )
+        retrieved_text, cite_block, pages_str, sources = rag._build_citations([doc])
+
+        self.assertIn("Dengue: Guidelines for Diagnosis", cite_block)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(
+            sources[0]["title"],
+            "Dengue: Guidelines for Diagnosis, Treatment, Prevention and Control",
+        )
+        self.assertEqual(sources[0]["pages"], ["5"])
+
+    def test_falls_back_to_filename_when_display_title_absent(self):
+        rag = RAGService.__new__(RAGService)
+        doc = Document(
+            page_content="Clinical guidance on influenza treatment.",
+            metadata={
+                "source_file": "/path/to/3-INFLUENZA-WHO.pdf",
+                "page": 12,
+            },
+        )
+        retrieved_text, cite_block, pages_str, sources = rag._build_citations([doc])
+
+        self.assertIn("3-INFLUENZA-WHO.pdf", cite_block)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["title"], "3-INFLUENZA-WHO.pdf")
+        self.assertEqual(sources[0]["pages"], ["12"])
+
+
+# ---------------------------------------------------------------------------
+# 5. Phase 3: Step-back Clarifying Question Tests
+# ---------------------------------------------------------------------------
+
+class ClarificationRoundTest(unittest.TestCase):
+    """Verify that clarification gate triggers when round < 5 and is bypassed at round 5."""
+
+    def test_clarification_triggers_when_under_specified_and_round_below_5(self):
+        rag = RAGService.__new__(RAGService)
+        rag.llm_service = MagicMock()
+        rag.vector_service = MagicMock()
+        rag.llm_service.sanitize_input = MagicMock(return_value={"is_emergency": False})
+        rag.llm_service.validate_query = MagicMock(return_value="valid")
+        rag.llm_service.detect_language = MagicMock(return_value="english")
+        rag.vector_service.is_ready = True
+        rag._needs_clarification = MagicMock(
+            return_value=(True, "What specific symptoms are you experiencing?")
+        )
+
+        res = rag.retrieve_context("I feel sick", chat_history=[], clarification_round=0)
+        self.assertEqual(res["status"], "clarifying")
+        self.assertEqual(res["follow_up_question"], "What specific symptoms are you experiencing?")
+
+    def test_clarification_bypassed_at_round_5(self):
+        rag = RAGService.__new__(RAGService)
+        rag.llm_service = MagicMock()
+        rag.vector_service = MagicMock()
+        rag.llm_service.sanitize_input = MagicMock(return_value={"is_emergency": False})
+        rag.llm_service.validate_query = MagicMock(return_value="valid")
+        rag.llm_service.detect_language = MagicMock(return_value="english")
+        rag.llm_service.translate_to_english = MagicMock(return_value="I feel sick")
+        rag.vector_service.is_ready = True
+        dummy_chunk = Document(page_content="Medical info", metadata={"source_file": "doc.pdf"})
+        rag.vector_service.hybrid_search = MagicMock(return_value=[dummy_chunk])
+        rag._needs_clarification = MagicMock(
+            return_value=(True, "Should not be called")
+        )
+
+        # Round 5: hard cap, must bypass clarification check
+        res = rag.retrieve_context("I feel sick", chat_history=[], clarification_round=5)
+        self.assertEqual(res["status"], "valid")
+        self.assertEqual(len(res["chunks"]), 1)
+        rag._needs_clarification.assert_not_called()
+
+    def test_generate_with_context_clarifying_branch(self):
+        rag = RAGService.__new__(RAGService)
+        context_data = {
+            "status": "clarifying",
+            "follow_up_question": "Can you describe when the fever started?",
+            "language": "english",
+        }
+        res = rag.generate_with_context("I have a fever", context_data)
+        self.assertEqual(res["response"], "Can you describe when the fever started?")
+        self.assertIsNone(res["metadata"]["triage_level"])
+        self.assertEqual(res["metadata"]["source"], "Clarification Gate")
+

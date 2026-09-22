@@ -2,6 +2,7 @@ import os
 from django.core.management.base import BaseCommand, CommandError
 from django.conf import settings
 from chat.services import get_chat_service
+from chat.document_service import get_display_title
 
 
 class Command(BaseCommand):
@@ -67,8 +68,9 @@ class Command(BaseCommand):
             book_name = filename.replace(".pdf", "").replace("-", " ").replace("_", " ")
 
             try:
+                display_title = get_display_title(filename)
                 result = rag_svc.load_document(pdf_path, book_name)
-                self.stdout.write(f"  {book_name}: {result}")
+                self.stdout.write(f"  {display_title}: {result}")
                 if result.startswith("Skipped"):
                     skipped_count += 1
                 else:

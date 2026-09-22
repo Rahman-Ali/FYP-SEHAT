@@ -208,15 +208,16 @@ The English query is sent to `VectorStoreService.hybrid_search()`:
 * **RAGAS Faithfulness Evaluation:** The system breaks the LLM's answer into individual claims and computes the cosine similarity between each claim and the retrieved context chunks using the local SBERT model.
 * **The 0.25 Safety Gate:** If the calculated faithfulness score is below `0.25`, the answer is deemed a potential hallucination. The backend discards the entire generated answer and replaces it with the safe "no-info" fallback message.
 
-### Step 10: Attaching Source Citations & Returning to App
-* If the response is valid, the system appends a structured citation block extracted from the chunk metadata:
+### Step 10: Attaching Source Citations & Returning Structured Response
+* If the response is valid, the system resolves real curated display titles (e.g. WHO/EAU titles from node/chunk metadata) and returns a structured response:
   ```
   --- Sources ---
-  8-Typhoid-Fever-WHO-BOOK.pdf: Pages 12, 14
+  WHO: Background Document on the Diagnosis, Treatment and Prevention of Typhoid Fever: Pages 12, 14
   ```
+* The response payload includes clean separation of `answer_body`, `sources` (list of title and page numbers), `triage_level`, and `disclaimer` in `metadata`, while `message_text` retains full text for backward compatibility and database search.
 * The bot message is saved to PostgreSQL along with its evaluation metrics, model name, and detected language in the `metadata` JSON column.
 * The backend returns HTTP 200 with both user and bot messages.
-* The React Native app receives the response, renders the message bubble, and saves the updated conversation locally in `AsyncStorage`.
+* The React Native app receives the response, renders the structured bubble (colored triage pill, clean body, collapsible sources, disclaimer), and saves the updated conversation locally in `AsyncStorage`.
 
 ---
 
@@ -415,24 +416,24 @@ A core pillar of trustworthy medical AI is citation: proving that an answer came
 | Ye kisi professional doctor ki salah ka mutbadil nahi hai.                    |
 |                                                                               |
 | --- Sources ---                                                               |
-| 8-Typhoid-Fever-WHO-BOOK.pdf: Pages 4, 7                                      |
+| WHO: Background Document on the Diagnosis, Treatment and Prevention of...    |
 +-------------------------------------------------------------------------------+
 ```
 
 ### How the System Builds Citations:
-1. **Metadata Preservation During Loading:** When `DocumentService` loads a PDF using `PyPDFLoader`, LangChain records the source file path and the 0-indexed page number on each chunk object.
+1. **Metadata Preservation During Loading:** When `DocumentService` loads a PDF using `PyPDFLoader`, LangChain records the source file path, the curated `display_title`, and the 0-indexed page number on each chunk object.
 2. **Citation Aggregator (`_build_citations`):**
    * After the hybrid search selects the top 5 chunks, `_build_citations()` loops through them.
-   * It extracts `source_path = doc.metadata.get("source")` and cleans it down to the filename using `os.path.basename()`.
-   * It extracts `page = doc.metadata.get("page")`, converts it to a human-readable page number, and collects them into a Python `set` grouped by book filename.
+   * It extracts `display_title` (falling back to filename if absent).
+   * It extracts `page = doc.metadata.get("page")`, converts it to a human-readable page number, and collects them into a Python `set` grouped by book.
 3. **Citation Formatting:**
-   * It constructs a clean text block:
+   * It constructs both a clean text block for plain text fallback and a structured `sources` list `[{title, filename, pages}]` for the mobile UI:
      ```text
      --- Sources ---
-     <filename.pdf>: Pages <page_1>, <page_2>
+     <Display Title>: Pages <page_1>, <page_2>
      ```
-4. **Attachment to Final Answer:**
-   * The citation block is appended directly onto the end of the text answer before returning it over the REST API. The mobile app renders the entire block cleanly inside the chat bubble.
+4. **Structured Delivery:**
+   * The citations list and clean answer body are delivered in the API response metadata, enabling the frontend to render collapsible source accordions.
 
 ---
 

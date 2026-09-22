@@ -145,18 +145,29 @@ class ChatService:
         for i, msg in enumerate(formatted_history):
             print(f"[MEMORY]   [{i}] {msg['sender']}: {msg['text'][:50]}...")
         
-        context = self.rag_service.retrieve_context(query, formatted_history)
+        clarification_round = (session.session_metadata or {}).get("clarification_round", 0)
+        context = self.rag_service.retrieve_context(
+            query, formatted_history, clarification_round=clarification_round
+        )
         response = self.rag_service.generate_with_context(query, context, formatted_history)
-        
+
+        if context.get("status") == "clarifying":
+            if not isinstance(session.session_metadata, dict):
+                session.session_metadata = {}
+            session.session_metadata["clarification_round"] = clarification_round + 1
+        else:
+            if isinstance(session.session_metadata, dict) and "clarification_round" in session.session_metadata:
+                session.session_metadata["clarification_round"] = 0
+
         bot_msg = Message.objects.create(
             session=session,
             sender='bot',
             message_text=response['response'],
             metadata=response.get('metadata', {})
         )
-        
+
         session.save()
-        
+
         return user_msg, bot_msg
         
        

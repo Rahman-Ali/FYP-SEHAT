@@ -84,7 +84,7 @@ class Command(BaseCommand):
             flag = "  [mapped]" if mapped else "  [fallback]"
             self.stdout.write(
                 f"  {source_file}\n"
-                f"    → {title}{flag}\n"
+                f"    -> {title}{flag}\n"
                 f"    nodes to update: {node_count}"
             )
 

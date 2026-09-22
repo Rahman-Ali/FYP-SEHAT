@@ -139,7 +139,7 @@ FILENAME_TO_DISPLAY_TITLE = {
     "2-DIARRHOEA-WGO-BOOK.pdf":
         "WGO Global Guidelines: Acute Diarrhea",
     "2-DIARRHOEA-WHO-BOOK.pdf":
-        "WHO: The Treatment of Diarrhoea — A Manual for Physicians",
+        "WHO: The Treatment of Diarrhoea - A Manual for Physicians",
     "3-Hepatitis-A-%20WHO-BOOK-1.pdf":
         "WHO: Hepatitis A Vaccine Position Paper",
     "4-INFLUENZA-WHO-BOOK.pdf":
@@ -153,7 +153,7 @@ FILENAME_TO_DISPLAY_TITLE = {
     "7-Skin-Allergy-Contact-Dermatitis-Book.pdf":
         "Contact Dermatitis: A Clinical Reference Guide",
     "8-Typhoid-Fever-WHO-BOOK-surveillancevaccinepreventable.pdf":
-        "WHO: Typhoid Fever — Surveillance and Vaccine Use",
+        "WHO: Typhoid Fever - Surveillance and Vaccine Use",
     "8-Typhoid-Fever-WHO-BOOK.pdf":
         "WHO: Background Document on the Diagnosis, Treatment and Prevention of Typhoid Fever",
     "9-COMMON_COLD_1.pdf":
@@ -163,7 +163,7 @@ FILENAME_TO_DISPLAY_TITLE = {
     "10-Urinary-Tract-Infection-EAU.pdf":
         "EAU Guidelines on Urological Infections",
     "10-Urinary-Tract-Infections-Core-Curriculum-2024_202.pdf":
-        "ASN: Urinary Tract Infections — Core Curriculum 2024",
+        "ASN: Urinary Tract Infections - Core Curriculum 2024",
 }
 
 

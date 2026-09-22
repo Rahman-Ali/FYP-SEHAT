@@ -192,13 +192,75 @@ Is this a capabilities question?"""
             logger.error("Capabilities detection error: %s", e)
             return False
 
+    def _needs_clarification(self, query: str, chat_history: list = None) -> tuple:
+        """Check whether a query is too vague to produce a useful answer.
+
+        Returns (needs_clarification: bool, follow_up_question: str).
+        Only fires when the query is valid but under-specified (e.g. 'I feel sick'
+        with no history).  Uses the Aux LLM with a structured prompt.
+        """
+        # Skip for queries with enough context (long queries or rich history)
+        if len(query.split()) >= 10:
+            return False, ""
+        if chat_history and len(chat_history) >= 4:
+            # Enough history already — let retrieval proceed
+            return False, ""
+
+        history_text = ""
+        if chat_history:
+            for msg in chat_history[-4:]:
+                sender = "User" if msg.get("sender") == "user" else "Assistant"
+                text = msg.get("text", msg.get("message_text", ""))
+                if text.strip():
+                    history_text += f"{sender}: {text}\n"
+
+        prompt = f"""You are a medical chatbot triage assistant.
+
+Conversation so far:
+{history_text if history_text else 'No previous conversation.'}
+
+User message: {query}
+
+Decide whether this query is too vague to give a specific, helpful medical
+answer without more information. Consider it NEEDS_CLARIFICATION if:
+- It mentions only general feelings without specifying a body part, symptom,
+  or disease (e.g. 'I feel sick', 'I am unwell', 'I have a problem')
+- AND the conversation history doesn't already clarify the topic.
+
+If it NEEDS_CLARIFICATION, reply in this exact format:
+NEEDS_CLARIFICATION: <ONE single follow-up question in the same language as the user's message>
+
+Otherwise reply ONLY: SUFFICIENT
+
+Do not explain. Output exactly one of these two formats."""
+
+        try:
+            resp = self.llm_service._call_aux_llm(prompt).strip()
+            if resp.upper().startswith("NEEDS_CLARIFICATION:"):
+                question = resp.split(":", 1)[1].strip()
+                if question:
+                    return True, question
+        except Exception as e:
+            logger.error("Clarification check error: %s", e)
+        return False, ""
+
     # ========================================================================
     # CONTEXT RETRIEVAL
     # ========================================================================
 
-    def retrieve_context(self, query: str, chat_history: list = None) -> dict:
-        """Steps 1-4 of RAG pipeline with emergency detection + query rewriting."""
-        
+    def retrieve_context(
+        self, query: str, chat_history: list = None,
+        clarification_round: int = 0
+    ) -> dict:
+        """Steps 1-4 of RAG pipeline with emergency detection + query rewriting.
+
+        Args:
+            clarification_round: Number of clarifying questions already asked
+                for this session.  If < 5 and the query is under-specified,
+                returns status='clarifying' with a follow-up question.
+                On round 5 the clarification gate is skipped and full retrieval
+                is forced regardless (hard cap).
+        """
         # Run security check first
         sanitize_result = self.llm_service.sanitize_input(query)
         if sanitize_result.get('is_emergency'):
@@ -238,6 +300,26 @@ Is this a capabilities question?"""
             base_response["status"] = "invalid_hindi"
             base_response["language"] = language
             return base_response
+
+        # ── Phase 3: Clarification gate ──────────────────────────────────────
+        # Fire only when round < 5 (hard cap: on round 5 force full retrieval)
+        if status == "valid" and clarification_round < 5:
+            needs_clarify, follow_up = self._needs_clarification(
+                rewritten_query, chat_history
+            )
+            if needs_clarify:
+                logger.info(
+                    "Clarification needed (round %d): '%s'",
+                    clarification_round + 1, follow_up
+                )
+                return {
+                    "status": "clarifying",
+                    "chunks": [],
+                    "language": language,
+                    "english_query": rewritten_query,
+                    "original_query": query,
+                    "follow_up_question": follow_up,
+                }
 
         english_query = self.llm_service.translate_to_english(rewritten_query, language)
         chunks = self.vector_service.hybrid_search(english_query)
@@ -375,6 +457,35 @@ Is this a capabilities question?"""
         # ── INITIAL DATA ──────────────────────────────────────────────────
         st = context_data.get("status", "valid")
         language = context_data.get("language", "english")
+
+        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0: CLARIFYING (Phase 3)
+        # ══════════════════════════════════════════════════════════════
+        if st == "clarifying":
+            follow_up = context_data.get("follow_up_question", "")
+            if not follow_up:
+                if language == "roman_urdu":
+                    follow_up = (
+                        "Apni takleef ke baare mein thoda aur batayein, maslan kis jagah "
+                        "dard ya kya alamaat hain taake main sahi madad kar sakoon?"
+                    )
+                else:
+                    follow_up = (
+                        "Could you tell me a bit more about your symptoms, such as "
+                        "where it hurts or when it started, so I can help you better?"
+                    )
+            return {
+                "response": follow_up,
+                "metadata": {
+                    "source": "Clarification Gate",
+                    "language": language,
+                    "ragas_metrics": {},
+                    "triage_level": None,
+                    "answer_body": follow_up,
+                    "sources": [],
+                    "disclaimer": "",
+                }
+            }
 
         # ══════════════════════════════════════════════════════════════
         # BRANCH 1: EMERGENCY
