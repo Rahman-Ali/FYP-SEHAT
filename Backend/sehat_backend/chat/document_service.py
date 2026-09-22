@@ -129,6 +129,63 @@ FILENAME_PREFIX_TO_DISEASE = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Real display titles for all 15 medical PDF books
+# Keys are exact basenames of the files in medical_documents/
+# ---------------------------------------------------------------------------
+FILENAME_TO_DISPLAY_TITLE = {
+    "1-DENGUE-WHO-BOOK.pdf":
+        "Dengue: Guidelines for Diagnosis, Treatment, Prevention and Control",
+    "2-DIARRHOEA-WGO-BOOK.pdf":
+        "WGO Global Guidelines: Acute Diarrhea",
+    "2-DIARRHOEA-WHO-BOOK.pdf":
+        "WHO: The Treatment of Diarrhoea — A Manual for Physicians",
+    "3-Hepatitis-A-%20WHO-BOOK-1.pdf":
+        "WHO: Hepatitis A Vaccine Position Paper",
+    "4-INFLUENZA-WHO-BOOK.pdf":
+        "WHO: Vaccines Against Influenza",
+    "5-Tuberculosis%20(TB)-WHO-BOOK.pdf":
+        "WHO: Global Tuberculosis Report",
+    "6-MALARIA-WHO-BOOK.pdf":
+        "WHO: Guidelines for the Treatment of Malaria",
+    "7-Skin-Allergy%20-Dermatitis-BOOK.pdf":
+        "Clinical Guide to Skin Allergy and Contact Dermatitis",
+    "7-Skin-Allergy-Contact-Dermatitis-Book.pdf":
+        "Contact Dermatitis: A Clinical Reference Guide",
+    "8-Typhoid-Fever-WHO-BOOK-surveillancevaccinepreventable.pdf":
+        "WHO: Typhoid Fever — Surveillance and Vaccine Use",
+    "8-Typhoid-Fever-WHO-BOOK.pdf":
+        "WHO: Background Document on the Diagnosis, Treatment and Prevention of Typhoid Fever",
+    "9-COMMON_COLD_1.pdf":
+        "Clinical Review: Management of the Common Cold",
+    "9-COMMON_COLD_2.pdf":
+        "Evidence-Based Guidelines for Common Cold Treatment",
+    "10-Urinary-Tract-Infection-EAU.pdf":
+        "EAU Guidelines on Urological Infections",
+    "10-Urinary-Tract-Infections-Core-Curriculum-2024_202.pdf":
+        "ASN: Urinary Tract Infections — Core Curriculum 2024",
+}
+
+
+def get_display_title(filename: str) -> str:
+    """Return the curated human-readable title for a PDF file.
+
+    Looks up the exact basename in FILENAME_TO_DISPLAY_TITLE.  If not found
+    (e.g. a user-uploaded book with a non-standard name), falls back to a
+    cleaned version of the filename (hyphens/underscores → spaces, no ext).
+    """
+    basename = os.path.basename(filename)
+    if basename in FILENAME_TO_DISPLAY_TITLE:
+        return FILENAME_TO_DISPLAY_TITLE[basename]
+    # Fallback: clean filename
+    name = os.path.splitext(basename)[0]
+    name = name.replace("-", " ").replace("_", " ").replace("%20", " ")
+    # Collapse multiple spaces
+    import re as _re
+    name = _re.sub(r" +", " ", name).strip()
+    return name
+
+
 def get_disease_from_filename(filename: str) -> str:
     """Derive disease tag from filename prefix or keywords.
 
@@ -199,10 +256,12 @@ class DocumentService:
         chunks = splitter.split_documents(docs)
 
         disease_tag = disease or get_disease_from_filename(pdf_path)
+        display_title = get_display_title(pdf_path)
 
         for chunk in chunks:
             chunk.metadata["source_file"] = os.path.basename(pdf_path)
             chunk.metadata["disease"] = disease_tag
+            chunk.metadata["display_title"] = display_title
             if source_hash:
                 chunk.metadata["source_hash"] = source_hash
 

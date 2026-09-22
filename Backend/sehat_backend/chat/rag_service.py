@@ -254,21 +254,35 @@ Is this a capabilities question?"""
     # ========================================================================
 
     def _build_citations(self, context_docs: list) -> tuple:
-        """Build retrieved text and citation block."""
+        """Build retrieved text, citation string block, and structured sources list.
+
+        Returns:
+            retrieved_text (str): numbered context blocks for the LLM prompt.
+            cite_block (str):     "--- Sources ---" string for plain-text fallback.
+            pages_str (str):      comma-separated page numbers.
+            sources (list):       structured list of {title, pages} dicts for the
+                                  structured API response (Phase 2).
+        """
         blocks = []
         pages = []
-        citations_dict = {}
+        citations_dict = {}    # book_name  -> set of page nums
+        title_map = {}         # book_name  -> display_title
 
         for i, doc in enumerate(context_docs, 1):
             blocks.append(f"[{i}] {doc.page_content.strip()}")
             page = doc.metadata.get("page", "Unknown")
-            # "source_file" is set by both live-ingestion and BM25 warm-up paths.
-            # Fall back to legacy "source" key only for older / external chunks.
+
+            # Prefer display_title stored on the chunk; fall back to filename.
             source_path = (
                 doc.metadata.get("source_file")
                 or doc.metadata.get("source", "Unknown")
             )
             book_name = os.path.basename(str(source_path))
+            display_title = (
+                doc.metadata.get("display_title")
+                or book_name  # filename fallback
+            )
+            title_map[book_name] = display_title
 
             if page != "Unknown":
                 try:
@@ -282,17 +296,32 @@ Is this a capabilities question?"""
         retrieved_text = "\n\n".join(blocks)
         pages_str = ", ".join(str(p) for p in sorted(set(pages))) if pages else "Unknown"
 
+        # Plain-text citation block (kept for backward compat / plain responses)
         cite = ""
         if citations_dict:
             cite = "\n\n--- Sources ---\n"
             for book in sorted(citations_dict):
+                title = title_map.get(book, book)
                 sp = sorted(
                     citations_dict[book],
                     key=lambda x: (isinstance(x, str), str(x))
                 )
-                cite += f"{book}: Pages {', '.join(str(p) for p in sp)}\n"
+                cite += f"{title}: Pages {', '.join(str(p) for p in sp)}\n"
 
-        return retrieved_text, cite, pages_str
+        # Structured sources list for the API response metadata
+        sources = []
+        for book in sorted(citations_dict):
+            sp = sorted(
+                citations_dict[book],
+                key=lambda x: (isinstance(x, str), str(x))
+            )
+            sources.append({
+                "title": title_map.get(book, book),
+                "filename": book,
+                "pages": [str(p) for p in sp],
+            })
+
+        return retrieved_text, cite, pages_str, sources
 
     # ========================================================================
     # MAIN GENERATION FLOW
@@ -534,7 +563,7 @@ Your response:"""
                 }
             }
 
-        retrieved_text, cite_block, pages_str = self._build_citations(context_docs)
+        retrieved_text, cite_block, pages_str, sources = self._build_citations(context_docs)
 
         # Relevance check
         try:
@@ -620,14 +649,34 @@ Your response:"""
             answer = no_info(language)
             is_negative = True
 
-        # Final response
-        final_response = answer if is_negative else answer + cite_block
+        # Final response — message_text keeps full text for DB/search compat
+        DISCLAIMER = (
+            "Ye kisi professional doctor ki salah ka mutbadil nahi hai."
+            if language == "roman_urdu"
+            else "This is not a substitute for professional medical advice."
+        )
+        if is_negative:
+            final_response = answer
+            answer_body = answer
+            final_sources = []
+        else:
+            final_response = answer + cite_block
+            # Strip disclaimer from answer_body so frontend can place it separately
+            answer_body = answer
+            for d_str in [
+                "This is not a substitute for professional medical advice.",
+                "Ye kisi professional doctor ki salah ka mutbadil nahi hai.",
+            ]:
+                answer_body = re.sub(
+                    re.escape(d_str), "", answer_body, flags=re.IGNORECASE
+                ).strip()
+            final_sources = sources
 
         # Classify triage level
         triage_level = self.llm_service.classify_triage(original_query, answer)
 
         return {
-            "response": final_response,
+            "response": final_response,          # full string (DB / plain-text)
             "metadata": {
                 "source": "Document Knowledge Base",
                 "pages": pages_str,
@@ -635,5 +684,9 @@ Your response:"""
                 "language": language,
                 "ragas_metrics": metrics,
                 "triage_level": triage_level,
+                # ── Structured fields (Phase 2) ───────────────────────────
+                "answer_body": answer_body,
+                "sources": final_sources,
+                "disclaimer": DISCLAIMER,
             }
         }
