@@ -100,27 +100,36 @@ FYP-SEHAT/
 │   ├── medical_documents/           # WHO/WGO clinical guideline PDF documents
 │   ├── sehat_backend/
 │   │   ├── manage.py                # Django management entry point
+│   │   ├── .env.example             # Documented environment template with WARP notes
 │   │   ├── sehat_backend/           # Django settings, WSGI, ASGI, URLs
-│   │   │   ├── settings.py
+│   │   │   ├── settings.py          # App settings, DB config & middleware setup
+│   │   │   ├── health_middleware.py # Non-blocking /healthz and /readyz middleware
 │   │   │   └── urls.py
 │   │   └── chat/                    # Core RAG and Chat application
 │   │       ├── document_service.py  # PDF cleaning, text splitting, disease tagging
 │   │       ├── vector_store_service.py # BM25 + Neo4j vector store & SBERT reranker
 │   │       ├── llm_service.py       # Gemini/Groq LLM chains, triage & language checks
 │   │       ├── rag_service.py       # Main RAG coordinator & evaluation gates
-│   │       ├── services.py          # Session management & business logic
+│   │       ├── services.py          # Session management & lazy service singleton
+│   │       ├── warmup.py            # Async thread model loader & BM25 index builder
 │   │       ├── models.py            # ChatSession and Message ORM models
-│   │       ├── views.py             # DRF API endpoints & ingestion runner
-│   │       └── serializers.py       # REST API serializers
+│   │       ├── views.py             # DRF API endpoints (lazy init, 503 warmup guards)
+│   │       ├── serializers.py       # REST API serializers
+│   │       ├── tests_deploy.py      # Automated deployment & lifecycle tests
+│   │       └── management/
+│   │           └── commands/
+│   │               └── ingest_documents.py # Safe CLI document ingestion runner
 │   └── requirements.txt             # Python dependencies
 ├── Frontend/
 │   ├── app/                         # Expo Router screens and navigation
 │   │   ├── screens/                 # ChatScreen, HomeScreen, AdminDashboard
-│   │   ├── services/api.jsx         # Axios API client & Firebase token attachment
+│   │   ├── services/api.jsx         # Axios API client with dynamic EXPO_PUBLIC_API_URL
 │   │   └── _layout.jsx              # Root app layout & theme
+│   ├── .env                         # Local frontend environment config
 │   ├── package.json                 # Node dependencies
 │   └── firebase.config.js           # Firebase Client SDK configuration
 ├── .gitignore                       # Git ignore rules
+├── FYP-SEHAT-ARCHITECTURE.md        # Comprehensive system architecture & audit
 └── README.md                        # Project documentation
 ```
 

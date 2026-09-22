@@ -2,7 +2,7 @@
 
 ## 1. One-Paragraph Summary
 
-**FYP-SEHAT** is a mobile health assistance application built to provide reliable medical guidance for rural communities in Pakistan. A user types a health question or symptom into a React Native mobile application in either English or Roman Urdu (Urdu words written with English letters). The request travels to a Python Django backend, which converts the query into English, searches through indexed World Health Organization (WHO) medical booklets using a hybrid search engine (combining keyword search and AI vector similarity hosted on Neo4j Aura), and feeds the retrieved facts to a Large Language Model (OpenAI GPT-4o or Groq LLaMA 3.1) to generate an easy-to-understand answer. The final response includes source citations showing the exact booklet name and page numbers, enforces medical disclaimers, evaluates answer quality with a mathematical safety gate, and stores the chat history in a PostgreSQL database linked to the user's Firebase account.
+**FYP-SEHAT** is a mobile health assistance application built to provide reliable medical guidance for rural communities in Pakistan. A user types a health question or symptom into a React Native mobile application in either English or Roman Urdu (Urdu words written with English letters). The request travels over an ngrok tunnel to a Python Django backend, which converts the query into English, searches through indexed World Health Organization (WHO) medical booklets using a hybrid search engine (combining keyword search and AI vector similarity hosted on Neo4j Aura), and feeds the retrieved facts to a Large Language Model (Google Gemini 3.1 Flash Lite with Groq LLaMA 3.1 fallback) to generate an easy-to-understand answer. The final response includes source citations showing the exact booklet name and page numbers, enforces medical disclaimers, evaluates answer quality with a mathematical safety gate, and stores the chat history in a PostgreSQL database linked to the user's Firebase account.
 
 ---
 
@@ -15,7 +15,12 @@ flowchart TD
     subgraph Client["Frontend (Mobile App - React Native / Expo)"]
         UI["User Interface (Chat Screen / Library / Home)"]
         FAuth["Firebase Client SDK (Auth & User Profiles)"]
-        AxiosClient["API Service (Axios Client)"]
+        AxiosClient["API Service (Axios Client - EXPO_PUBLIC_API_URL)"]
+    end
+
+    subgraph Tunnel["Network & Edge Layer"]
+        Ngrok["ngrok Secure Tunnel (Static Domain)
+        omission-moonshine-cinnamon.ngrok-free.dev"]
     end
 
     subgraph ExternalAuth["Identity & Profile Layer"]
@@ -24,13 +29,23 @@ flowchart TD
     end
 
     subgraph Backend["Backend Layer (Django REST Framework)"]
+        HealthMid["HealthCheckMiddleware
+        - /healthz (Immediate 200 OK)
+        - /readyz (503 until warm)"]
+
         Views["API Endpoints (views.py)
         - Rate Limiter (10 req/min)
-        - Input Length Guard (<500 chars)"]
+        - Input Length Guard (<500 chars)
+        - 503 Warming Up Gate"]
+        
+        Warmup["Background Warm-up Thread (warmup.py)
+        - Resolves Neo4j DB
+        - Loads SBERT Models
+        - Rebuilds BM25 Index"]
         
         ChatSvc["Chat Service (services.py)
         - Session Management
-        - Message Sequence Tracker"]
+        - Lazy RAG Service Singleton"]
         
         RAG["RAG Coordinator (rag_service.py)
         - Attack Sanitization
@@ -43,11 +58,7 @@ flowchart TD
         - English Translator
         - Relevance Verifier
         - Answer Generator
-        - RAGAS Metric Evaluator"]
-        
-        DocSvc["Document Service (document_service.py)
-        - PyPDFLoader
-        - Recursive Text Splitter (500 chars, 100 overlap)"]
+        - Triage Classifier"]
         
         VecSvc["Vector Store Service (vector_store_service.py)
         - BM25 Sparse Search (Rank Weight: 0.4)
@@ -55,21 +66,27 @@ flowchart TD
         - SBERT Cosine Reranking & Dynamic Thresholding"]
     end
 
+    subgraph Management["Management & Ingestion CLI"]
+        IngestCmd["CLI Command: ingest_documents.py
+        - PyPDFLoader & TextSplitter (500/100)
+        - SHA-256 Incremental Change Detection
+        - Skip-on-Hash-Error Protection"]
+    end
+
     subgraph Databases["Data & Storage Layer"]
-        Postgres[("PostgreSQL Database
+        Postgres[("PostgreSQL Database (Neon)
         - chat_sessions
         - messages (with JSON metadata)")]
         Neo4j[("Neo4j Aura Cloud DB
         - Node: MedicalDocument
-        - Properties: text, embedding, source_file, page
-        (Used as Vector Database)")]
+        - Properties: text, embedding, source_file, page")]
         DiskStorage[("Local Filesystem
         - medical_documents/*.pdf")]
     end
 
     subgraph AIProviders["External AI & Model Layer"]
-        OpenAI["OpenAI API (GPT-4o)"]
-        Groq["Groq API (LLaMA 3.1 8B Instant)"]
+        Gemini["Google Gemini 3.1 Flash Lite (Primary)"]
+        Groq["Groq API (LLaMA 3.1 8B Instant - Fallback)"]
         LocalEmbed["Local CPU Embeddings
         (sentence-transformers/all-MiniLM-L6-v2)"]
     end
@@ -79,7 +96,9 @@ flowchart TD
     FAuth <-->|"Tokens & UID"| FBaseAuth
     FAuth <-->|"User document & Role"| FStore
     UI -->|"Types question / Sends chat"| AxiosClient
-    AxiosClient -->|"POST /api/chat/query/ (with firebase_uid)"| Views
+    AxiosClient -->|"HTTPS via ngrok"| Ngrok
+    Ngrok --> HealthMid
+    HealthMid --> Views
 
     %% Backend flow
     Views --> ChatSvc
@@ -87,15 +106,16 @@ flowchart TD
     ChatSvc --> RAG
     RAG --> LLMSvc
     RAG --> VecSvc
+    Views -.->|"Monitors state"| Warmup
 
-    %% Document ingestion flow
-    DocSvc -->|"Splits PDFs"| VecSvc
-    DiskStorage -->|"Read raw PDFs"| DocSvc
+    %% Ingestion flow
+    IngestCmd -->|"Splits & Embeds PDFs"| VecSvc
+    DiskStorage -->|"Read raw PDFs"| IngestCmd
 
     %% Vector Store & AI connections
     VecSvc <-->|"Dense vector similarity search"| Neo4j
     VecSvc <-->|"Vector encoding & Reranking"| LocalEmbed
-    LLMSvc <-->|"Translation, Rewriting & Generation"| OpenAI
+    LLMSvc <-->|"Primary Generation & Triage"| Gemini
     LLMSvc -.->|"Fallback LLM"| Groq
     LLMSvc <-->|"Claim validation embeddings"| LocalEmbed
 
@@ -103,9 +123,8 @@ flowchart TD
     RAG -->|"Response + Citation Block + Metadata"| ChatSvc
     ChatSvc -->|"Saves Bot Message"| Postgres
     ChatSvc -->|"Returns JSON response"| Views
-    Views -->|"HTTP 200 OK"| AxiosClient
+    Views -->|"HTTP 200 OK via Tunnel"| AxiosClient
     AxiosClient -->|"Displays message bubble"| UI
-```
 
 ---
 
@@ -249,7 +268,12 @@ flowchart LR
 * In the backend (`Backend/medical_documents/`), **only 1 PDF file** is currently present in the repository (`8-Typhoid-Fever-WHO-BOOK.pdf`).
 
 ### 3. Text Extraction and Chunking
-* When the Django backend initializes, or when an administrator uploads a new PDF via the Admin Dashboard (`AdminDashboard.jsx`), `DocumentService.load_and_split_pdf()` is triggered.
+* Document ingestion is decoupled from server startup and executed via the dedicated management command:
+  ```bash
+  python manage.py ingest_documents
+  ```
+  *(Or targeting a specific document: `python manage.py ingest_documents --file 1-DENGUE-WHO-BOOK.pdf`)*
+* **Incremental Hashing:** The command calculates a SHA-256 hash of each PDF. If the hash matches the node hash stored in Neo4j, ingestion is safely skipped to avoid redundant embedding and writes. If hash reading fails due to a network interruption, it safely skips rather than deleting existing data.
 * **Loader:** `langchain_community.document_loaders.PyPDFLoader` reads each page of the PDF file and preserves the original PDF page number.
 * **Splitter:** `langchain_text_splitters.RecursiveCharacterTextSplitter` chunks the text:
   * `chunk_size = 500` characters.
@@ -258,15 +282,16 @@ flowchart LR
 * **Metadata Tagging:** Every chunk receives metadata attributes:
   * `source_file`: The filename of the PDF (e.g., `8-Typhoid-Fever-WHO-BOOK.pdf`).
   * `page`: The exact page number where the text appeared in the official WHO document.
+  * `disease`: Disease category tag stamped across Neo4j nodes and BM25 documents.
 
 ### 4. Vector Embedding & Database Indexing
 * Chunks pass into `VectorStoreService.add_chunks_to_store()`.
 * **Embedding Model:** `sentence-transformers/all-MiniLM-L6-v2` runs locally on the CPU to convert each 500-character text chunk into a 384-dimensional dense vector representation.
 * **Neo4j Storage:** The chunks and embeddings are pushed to the cloud-hosted Neo4j Aura database:
   * Node Label: `MedicalDocument`.
-  * Node Properties: `text`, `embedding` (384 floats), `source_file`, and `page`.
+  * Node Properties: `text`, `embedding` (384 floats), `source_file`, `page`, and `disease`.
   * Index Name: `medical_docs` (vector index for cosine distance calculation).
-* **BM25 Update:** The raw chunks are also appended to an in-memory `BM25Retriever` to support lexical keyword matching.
+* **BM25 Update & Startup Warm-Up:** At runtime, the server starts non-blocking and triggers an asynchronous background thread (`chat/warmup.py`) that loads the embedding model and restores the in-memory `BM25Retriever` index from Neo4j without re-reading or re-embedding the source PDFs.
 
 ### 5. Document Management & Deletion
 * The Admin Dashboard allows administrators to view all indexed documents and delete them.
@@ -292,8 +317,8 @@ flowchart LR
 | **Google Firebase (Auth & Firestore)** | Handles user registration, email verification, password reset, and user roles (admin vs user). | Provides ready-to-use, secure authentication with built-in email verification and mobile SDKs without writing custom JWT refresh logic on Django. | **Django Built-in Auth / SimpleJWT** (would require building email verification flows, password reset tokens, and mobile session managers from scratch). |
 | **all-MiniLM-L6-v2 (Sentence-Transformers)** | Generates 384-dimensional dense vector embeddings for text chunks and queries; re-ranks search results. | Extremely fast, lightweight (runs efficiently on standard CPU without requiring an expensive GPU), open-source, and free of API usage costs. | **OpenAI text-embedding-3-small** (incurs recurring API token costs and requires an active internet call for every chunk and query). |
 | **BM25 Retriever (LangChain Community)** | Performs keyword-based sparse search over document text chunks. | Complements vector search by catching exact medical names, drug names, and specific terminology that vector models sometimes blur. | **Elasticsearch / OpenSearch** (far too heavy and complex to run for a 10-disease university project). |
-| **OpenAI GPT-4o** | Primary Large Language Model for query translation, query rewriting, relevance verification, and final answer generation. | Highest instruction-following accuracy and superior handling of multi-lingual Roman Urdu translations and strict medical constraint compliance. | **Local Ollama / LLaMA-3-8B locally** (requires a high-end local GPU server which is impractical for student hosting). |
-| **Groq (LLaMA 3.1 8B Instant)** | Configured as the automatic fallback LLM if OpenAI keys are absent. | Offers sub-second inference speeds at near-zero latency, running modern open-weight open-source models. | **Anthropic Claude / Google Gemini** (Gemini was listed in `.env` but Groq was explicitly coded as the primary fallback in `llm_service.py`). |
+| **Google Gemini 3.1 Flash Lite** | Primary Large Language Model for query translation, query rewriting, relevance verification, and final answer generation. | Exceptional clinical instruction-following, ultra-fast response latency, and rich multi-lingual handling for Roman Urdu translations. | **OpenAI GPT-4o** (configured as alternative enterprise LLM). |
+| **Groq (LLaMA 3.1 8B Instant)** | High-speed auxiliary LLM for triage classification, input sanitization, and fallback generation. | Offers sub-second inference speeds at near-zero latency, running modern open-weight open-source models. | **Anthropic Claude / Google Gemini Pro**. |
 | **LangChain (v1.2.4)** | Glue library connecting document loaders, text splitters, vector stores, and LLM chains. | Drastically reduces boilerplate code needed to chunk PDFs, compute reciprocal rank fusion, and coordinate multi-step prompt chains. | **LlamaIndex** (similarly capable; LangChain has wider community documentation for Neo4j vector integrations). |
 
 ---
@@ -308,11 +333,11 @@ sequenceDiagram
     actor User as Rural Patient
     participant App as Mobile App
     participant BE as Django RAG
-    participant LLM as GPT-4o / Groq
+    participant LLM as Gemini 3.1 Flash / Groq
     participant VStore as Neo4j & BM25
 
     User->>App: Enters: "Mujhe 2 din se pait me shadeed dard hai" (Roman Urdu)
-    App->>BE: Sends query to backend
+    App->>BE: Sends query to backend via ngrok tunnel
     BE->>LLM: Detect Language
     LLM-->>BE: Returns: "roman_urdu"
     BE->>LLM: Translate to English for search
