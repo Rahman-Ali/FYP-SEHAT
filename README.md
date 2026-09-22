@@ -178,7 +178,16 @@ FYP-SEHAT/
    FIREBASE_SERVICE_ACCOUNT_KEY=secrets/firebase-service-account.json
    FIREBASE_PROJECT_ID=sehat-538ee
 
+   # Allowed Hosts & Database (PostgreSQL / Neon)
+   ALLOWED_HOSTS=localhost,127.0.0.1,omission-moonshine-cinnamon.ngrok-free.dev
+   DATABASE_URL=postgresql://<user>:<password>@<host>/neondb?sslmode=require&channel_binding=require
+
+   # NOTE ON CLOUDFLARE WARP:
+   # If PostgreSQL connection fails with "Permission denied" on Windows,
+   # run `warp-cli disconnect` in your terminal or configure a split-tunnel exclusion.
+
    # Ingestion Settings (optional)
+   ALLOW_INGEST=true
    FORCE_REINGEST=false
    ```
 
@@ -188,15 +197,20 @@ FYP-SEHAT/
    python manage.py migrate
    ```
 
-6. **Start the development server:**
+6. **Start the backend server:**
    ```bash
    python manage.py runserver 0.0.0.0:8000
    ```
-   *On initial startup, the server indexes medical PDFs into Neo4j and warms up the BM25 index.*
+   *Health checks (`/healthz`) are immediately active; heavy embedding models and BM25 index warm up in the background and report ready at `/readyz`.*
+
+7. **Start the ngrok tunnel (in a separate terminal):**
+   ```bash
+   ngrok http 8000 --url omission-moonshine-cinnamon.ngrok-free.dev
+   ```
 
 ---
 
-### Frontend Setup
+### Frontend Setup & Mobile Deployment
 
 1. **Navigate to the frontend directory:**
    ```bash
@@ -208,14 +222,20 @@ FYP-SEHAT/
    npm install
    ```
 
-3. **Configure Firebase:**
+3. **Configure Environment:**
+   Set `EXPO_PUBLIC_API_URL` in `Frontend/.env`:
+   ```env
+   EXPO_PUBLIC_API_URL=https://omission-moonshine-cinnamon.ngrok-free.dev/api
+   ```
+
+4. **Configure Firebase:**
    Ensure `Frontend/firebase.config.js` points to your active Firebase project credentials.
 
-4. **Start the Expo development server:**
+5. **Start Expo with clear cache:**
    ```bash
-   npx expo start
+   npx expo start -c
    ```
-   Press `a` for Android emulator, `i` for iOS simulator, or scan the QR code using the **Expo Go** app on a physical device.
+   Press `a` for Android emulator, `i` for iOS simulator, or scan the QR code using the **Expo Go** app on a physical device. All requests from mobile data or local Wi-Fi route seamlessly through the ngrok static domain.
 
 ---
 

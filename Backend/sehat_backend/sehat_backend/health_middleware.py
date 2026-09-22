@@ -6,7 +6,7 @@ class HealthCheckMiddleware:
     """Lightweight health check middleware that intercepts /healthz and /readyz.
 
     Placed first in MIDDLEWARE so it responds before SecurityMiddleware,
-    avoiding ALLOWED_HOSTS or SSL-redirect issues for Render's health prober.
+    avoiding ALLOWED_HOSTS or SSL-redirect issues for health probers / tunnels.
     """
 
     def __init__(self, get_response):
@@ -24,8 +24,11 @@ class HealthCheckMiddleware:
 
         if path == "/readyz" or path == "/readyz/":
             try:
-                from chat.warmup import get_warmup_state
+                from chat.warmup import get_warmup_state, start_warmup
                 state = get_warmup_state()
+                if state == "idle":
+                    start_warmup()
+                    state = get_warmup_state()
             except Exception:
                 state = "idle"
 

@@ -21,10 +21,10 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        # Render production guard
-        if os.getenv("RENDER") and os.getenv("ALLOW_INGEST_ON_RENDER", "false").strip().lower() not in ("true", "1", "yes"):
+        # Ingestion guard to prevent accidental ingestion against shared KB
+        if os.getenv("ALLOW_INGEST", "true").strip().lower() not in ("true", "1", "yes"):
             raise CommandError(
-                "Ingestion is strictly prohibited on Render unless ALLOW_INGEST_ON_RENDER=true is set in environment."
+                "Ingestion is disabled because ALLOW_INGEST is not true in the environment."
             )
 
         force = options["force"]
