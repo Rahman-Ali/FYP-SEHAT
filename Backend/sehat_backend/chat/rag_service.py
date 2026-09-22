@@ -196,16 +196,7 @@ Is this a capabilities question?"""
         """Check whether a query is too vague to produce a useful answer.
 
         Returns (needs_clarification: bool, follow_up_question: str).
-        Only fires when the query is valid but under-specified (e.g. 'I feel sick'
-        with no history).  Uses the Aux LLM with a structured prompt.
         """
-        # Skip for queries with enough context (long queries or rich history)
-        if len(query.split()) >= 10:
-            return False, ""
-        if chat_history and len(chat_history) >= 4:
-            # Enough history already — let retrieval proceed
-            return False, ""
-
         history_text = ""
         if chat_history:
             for msg in chat_history[-4:]:
@@ -214,30 +205,47 @@ Is this a capabilities question?"""
                 if text.strip():
                     history_text += f"{sender}: {text}\n"
 
-        prompt = f"""You are a medical chatbot triage assistant.
+        prompt = f"""You are SEHAT AI's Clinical Triage Gatekeeper.
 
-Conversation so far:
-{history_text if history_text else 'No previous conversation.'}
+Your task is to determine whether the user's medical query is specific enough to retrieve clinical guidelines, or if it is too vague and requires a "step-back" clarifying question.
 
-User message: {query}
+--- GUIDELINES ---
+A query is SUFFICIENT if it specifies:
+- At least ONE specific symptom, body part, or disease (e.g., "high fever", "loose motion", "dengue platelets", "burning urination", "headache for 3 days").
 
-Decide whether this query is too vague to give a specific, helpful medical
-answer without more information. Consider it NEEDS_CLARIFICATION if:
-- It mentions only general feelings without specifying a body part, symptom,
-  or disease (e.g. 'I feel sick', 'I am unwell', 'I have a problem')
-- AND the conversation history doesn't already clarify the topic.
+A query NEEDS_CLARIFICATION if:
+- It only expresses general malaise, anxiety, or illness without symptoms (e.g., "I feel sick", "meri tabiyat kharab hai", "help me doctor", "mujhe kuch ho raha hai", "I don't feel good").
+- It asks what to take without stating the condition (e.g., "k konsi dawai loon", "what medicine should I take?").
 
-If it NEEDS_CLARIFICATION, reply in this exact format:
-NEEDS_CLARIFICATION: <ONE single follow-up question in the same language as the user's message>
+--- EXAMPLES ---
+User: "I feel sick"
+Classification: NEEDS_CLARIFICATION: Could you describe what specific symptoms you are experiencing (e.g., fever, pain, nausea) and where it hurts?
 
-Otherwise reply ONLY: SUFFICIENT
+User: "Meri tabiyat theek nahi hai"
+Classification: NEEDS_CLARIFICATION: Apni alamaat ke baare mein thoda wazahat se batayein (maslan bukhar, sar dard, ulti ya pait dard), aur yeh takleef kab se hai?
 
-Do not explain. Output exactly one of these two formats."""
+User: "I have high fever and vomiting for 2 days"
+Classification: SUFFICIENT
+
+User: "Dengue ke alamaat kya hain?"
+Classification: SUFFICIENT
+
+--- TASK ---
+Conversation Context:
+{history_text if history_text else "No prior messages."}
+
+Current User Query: {query}
+
+Respond in EXACTLY one of these two formats:
+NEEDS_CLARIFICATION: <ONE single empathetic follow-up question in the same language as the user query>
+SUFFICIENT"""
 
         try:
             resp = self.llm_service._call_aux_llm(prompt).strip()
-            if resp.upper().startswith("NEEDS_CLARIFICATION:"):
-                question = resp.split(":", 1)[1].strip()
+            if "NEEDS_CLARIFICATION:" in resp:
+                question = resp.split("NEEDS_CLARIFICATION:", 1)[1].strip()
+                # Clean any quotes or multiple lines
+                question = question.split("\n")[0].strip().strip('"').strip("'")
                 if question:
                     return True, question
         except Exception as e:
@@ -274,18 +282,13 @@ Do not explain. Output exactly one of these two formats."""
 
         status = self.llm_service.validate_query(query)
         
-        # [NEW] Rewrite query for better retrieval
-        rewritten_query = query
-        if status == "valid" and chat_history:
-            rewritten_query = self.llm_service.rewrite_query(query, chat_history)
-
         language = self.llm_service.detect_language(query)
 
         base_response = {
             "status": status,
             "chunks": [],
             "language": language,
-            "english_query": rewritten_query,
+            "english_query": query,
             "original_query": query
         }
 
@@ -302,10 +305,10 @@ Do not explain. Output exactly one of these two formats."""
             return base_response
 
         # ── Phase 3: Clarification gate ──────────────────────────────────────
-        # Fire only when round < 5 (hard cap: on round 5 force full retrieval)
+        # Evaluates raw query before rewrite. Hard cap on round 5 forces retrieval.
         if status == "valid" and clarification_round < 5:
             needs_clarify, follow_up = self._needs_clarification(
-                rewritten_query, chat_history
+                query, chat_history
             )
             if needs_clarify:
                 logger.info(
@@ -316,10 +319,15 @@ Do not explain. Output exactly one of these two formats."""
                     "status": "clarifying",
                     "chunks": [],
                     "language": language,
-                    "english_query": rewritten_query,
+                    "english_query": query,
                     "original_query": query,
                     "follow_up_question": follow_up,
                 }
+
+        # Query rewriting runs only when the query is specific/proceeding to retrieval
+        rewritten_query = query
+        if status == "valid" and chat_history:
+            rewritten_query = self.llm_service.rewrite_query(query, chat_history)
 
         english_query = self.llm_service.translate_to_english(rewritten_query, language)
         chunks = self.vector_service.hybrid_search(english_query)
@@ -382,23 +390,26 @@ Do not explain. Output exactly one of these two formats."""
         cite = ""
         if citations_dict:
             cite = "\n\n--- Sources ---\n"
-            for book in sorted(citations_dict):
+            for idx, book in enumerate(sorted(citations_dict), 1):
                 title = title_map.get(book, book)
                 sp = sorted(
                     citations_dict[book],
                     key=lambda x: (isinstance(x, str), str(x))
                 )
-                cite += f"{title}: Pages {', '.join(str(p) for p in sp)}\n"
+                cite += f"{idx}- {title}: Pages {', '.join(str(p) for p in sp)}\n"
 
         # Structured sources list for the API response metadata
         sources = []
-        for book in sorted(citations_dict):
+        for idx, book in enumerate(sorted(citations_dict), 1):
             sp = sorted(
                 citations_dict[book],
                 key=lambda x: (isinstance(x, str), str(x))
             )
+            raw_title = title_map.get(book, book)
             sources.append({
-                "title": title_map.get(book, book),
+                "sequence": idx,
+                "title": f"{idx}- {raw_title}",
+                "clean_title": raw_title,
                 "filename": book,
                 "pages": [str(p) for p in sp],
             })

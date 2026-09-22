@@ -233,10 +233,14 @@ class CitationTitleFallbackTest(unittest.TestCase):
         )
         retrieved_text, cite_block, pages_str, sources = rag._build_citations([doc])
 
-        self.assertIn("Dengue: Guidelines for Diagnosis", cite_block)
+        self.assertIn("1- Dengue: Guidelines for Diagnosis", cite_block)
         self.assertEqual(len(sources), 1)
         self.assertEqual(
             sources[0]["title"],
+            "1- Dengue: Guidelines for Diagnosis, Treatment, Prevention and Control",
+        )
+        self.assertEqual(
+            sources[0]["clean_title"],
             "Dengue: Guidelines for Diagnosis, Treatment, Prevention and Control",
         )
         self.assertEqual(sources[0]["pages"], ["5"])
@@ -252,9 +256,10 @@ class CitationTitleFallbackTest(unittest.TestCase):
         )
         retrieved_text, cite_block, pages_str, sources = rag._build_citations([doc])
 
-        self.assertIn("3-INFLUENZA-WHO.pdf", cite_block)
+        self.assertIn("1- 3-INFLUENZA-WHO.pdf", cite_block)
         self.assertEqual(len(sources), 1)
-        self.assertEqual(sources[0]["title"], "3-INFLUENZA-WHO.pdf")
+        self.assertEqual(sources[0]["title"], "1- 3-INFLUENZA-WHO.pdf")
+        self.assertEqual(sources[0]["clean_title"], "3-INFLUENZA-WHO.pdf")
         self.assertEqual(sources[0]["pages"], ["12"])
 
 
