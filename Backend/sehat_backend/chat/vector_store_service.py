@@ -1,5 +1,6 @@
 import os
 import socket
+import logging
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_neo4j import Neo4jVector
@@ -8,6 +9,8 @@ from sentence_transformers import SentenceTransformer, util
 from neo4j import GraphDatabase
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStoreService:
@@ -20,17 +23,21 @@ class VectorStoreService:
         self.sparse_retriever = None
         self._all_chunks = []
         self.is_ready = False
-        
+
         self.NEO4J_URI = os.getenv(
-        "NEO4J_URI",
-        "neo4j+s://98b70f75.databases.neo4j.io"
-)
+            "NEO4J_URI",
+            "neo4j+s://98b70f75.databases.neo4j.io"
+        )
         self.NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
         self.NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
         self.NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
-        
+        # Heavy model loading and Neo4j connection are deferred to load_models() / warm_up_bm25_from_neo4j()
+
+    def load_models(self):
+        """Load HuggingFace and SentenceTransformer embedding models."""
+        if self.embeddings_model is not None and self.sbert_model is not None:
+            return
         self._initialize_models()
-        self._test_connection()
 
     def _initialize_models(self):
         try:
@@ -42,12 +49,35 @@ class VectorStoreService:
             print("Embedding models loaded successfully")
         except Exception as e:
             print(f"Embedding model load failed: {e}")
+            raise
+
+    def is_available(self, timeout: float = 5.0) -> bool:
+        """Non-raising quick connectivity check to Neo4j."""
+        if not self.NEO4J_PASSWORD:
+            return False
+        try:
+            driver = GraphDatabase.driver(
+                self.NEO4J_URI,
+                auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD),
+                connection_timeout=timeout,
+            )
+            driver.verify_connectivity()
+            driver.close()
+            return True
+        except Exception as e:
+            logger.warning(f"Neo4j is_available probe failed: {e}")
+            return False
+
+    def attach_vector_index(self):
+        """Attach to existing Neo4j vector index."""
+        self._attach_neo4j_store_if_needed()
 
     def _test_connection(self):
         try:
             driver = GraphDatabase.driver(
-            self.NEO4J_URI,
-            auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD)
+                self.NEO4J_URI,
+                auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD),
+                connection_timeout=10.0,
             )
             driver.verify_connectivity()
             driver.close()
@@ -55,6 +85,65 @@ class VectorStoreService:
         except Exception as e:
             print(f"Neo4j connection failed: {e}")
             raise
+
+    def warm_up_bm25_from_neo4j(self):
+        """Rebuild the in-memory BM25 index from all text stored in Neo4j.
+
+        Called after the startup ingestion loop so that files skipped by the
+        hash-check still have their text available for BM25 retrieval.
+        If _all_chunks is already populated (from files that were actually
+        re-ingested this run) this adds the skipped files' text on top.
+        """
+        try:
+            driver = GraphDatabase.driver(
+                self.NEO4J_URI,
+                auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD),
+            )
+            with driver.session(database=self.NEO4J_DATABASE) as session:
+                result = session.run(
+                    "MATCH (n:MedicalDocument) "
+                    "RETURN n.text AS text, n.source_file AS source_file, "
+                    "n.page AS page, n.disease AS disease"
+                )
+                from langchain_core.documents import Document as LC_Document
+                loaded_source_files = {
+                    c.metadata.get("source_file") for c in self._all_chunks
+                }
+                new_chunks = []
+                for record in result:
+                    sf = record["source_file"]
+                    if sf not in loaded_source_files:
+                        new_chunks.append(
+                            LC_Document(
+                                page_content=record["text"] or "",
+                                metadata={
+                                    "source_file": sf,
+                                    "page": record["page"],
+                                    "disease": record.get("disease"),
+                                },
+                            )
+                        )
+            driver.close()
+
+            if new_chunks:
+                self._all_chunks.extend(new_chunks)
+                print(
+                    f"[BM25 warm-up] loaded {len(new_chunks)} chunks from Neo4j "
+                    f"(skipped-file text)"
+                )
+
+            if self._all_chunks:
+                self.sparse_retriever = BM25Retriever.from_documents(self._all_chunks)
+                self.sparse_retriever.k = 10
+                self.is_ready = True
+                print(
+                    f"[BM25 warm-up] index ready — "
+                    f"{len(self._all_chunks)} total chunks"
+                )
+                # Attach neo4j_vector_store so vector search works this session
+                self._attach_neo4j_store_if_needed()
+        except Exception as e:
+            print(f"[BM25 warm-up] failed: {e}")
 
     def add_chunks_to_store(self, chunks):
         print(f"Adding {len(chunks)} chunks to Neo4j...")
@@ -104,6 +193,28 @@ class VectorStoreService:
         
         print(f"Total chunks in store: {len(self._all_chunks)}")
 
+    def _attach_neo4j_store_if_needed(self):
+        """Connect to the EXISTING Neo4j vector index without inserting any data.
+
+        Called after BM25 warm-up (skip-all sessions) so that vector search
+        works even when add_chunks_to_store was never invoked this run.
+        Also called lazily at the top of hybrid_search as a safety net.
+        """
+        if self.neo4j_vector_store is not None:
+            return  # already attached
+        try:
+            self.neo4j_vector_store = Neo4jVector.from_existing_index(
+                self.embeddings_model,
+                index_name="medical_docs",
+                url=self.NEO4J_URI,
+                username=self.NEO4J_USERNAME,
+                password=self.NEO4J_PASSWORD,
+                database=self.NEO4J_DATABASE,
+            )
+            print("[Neo4j] attached to existing index 'medical_docs' (no data written)")
+        except Exception as e:
+            print(f"[Neo4j] could not attach to existing index: {e}")
+
     def delete_chunks_by_source(self, source_file: str) -> int:
         """Delete all chunks from Neo4j that belong to a specific source file."""
         try:
@@ -151,10 +262,36 @@ class VectorStoreService:
                 self.sparse_retriever.k = 10
             
             return deleted_count
-            
+
         except Exception as e:
             print(f"Error deleting chunks from Neo4j: {e}")
             return 0
+
+    def get_source_hash(self, source_file: str) -> str | None:
+        """Return the SHA-256 hash stored on any existing chunk for source_file.
+
+        Returns None if no chunks exist yet or if no hash property is set.
+        """
+        try:
+            driver = GraphDatabase.driver(
+                self.NEO4J_URI,
+                auth=(self.NEO4J_USERNAME, self.NEO4J_PASSWORD),
+            )
+            with driver.session(database=self.NEO4J_DATABASE) as session:
+                result = session.run(
+                    "MATCH (n:MedicalDocument) "
+                    "WHERE n.source_file = $source "
+                    "RETURN n.source_hash AS h LIMIT 1",
+                    source=source_file,
+                )
+                record = result.single()
+                stored_hash = record["h"] if record else None
+            driver.close()
+            return stored_hash
+        except Exception as e:
+            logger.error(f"Error reading source_hash for '{source_file}': {e}")
+            raise
+
     def get_document_list(self) -> list:
     
         try:
@@ -177,13 +314,15 @@ class VectorStoreService:
                 result = session.run(
                     "MATCH (n:MedicalDocument) "
                     "RETURN DISTINCT n.source_file AS source_file, "
-                    "count(n) AS chunk_count"
+                    "count(n) AS chunk_count, "
+                    "head(collect(n.disease)) AS disease"
                 )
                 documents = []
                 for record in result:
                     documents.append({
                         "source_file": record["source_file"],
-                        "chunk_count": record["chunk_count"]
+                        "chunk_count": record["chunk_count"],
+                        "disease": record.get("disease"),
                     })
             driver.close()
             return documents
@@ -195,6 +334,10 @@ class VectorStoreService:
         if not self.is_ready:
             print("Vector store not ready")
             return []
+
+        # Lazy-attach: covers the case where warm_up ran but the attach call
+        # failed silently, or if the caller bypasses warm_up entirely.
+        self._attach_neo4j_store_if_needed()
 
         bm25_docs = []
         if self.sparse_retriever:
@@ -238,7 +381,15 @@ class VectorStoreService:
                 unique_docs.append(doc)
 
         if not self.sbert_model or not unique_docs:
-            return unique_docs[:5]
+            docs_to_return = unique_docs[:5]
+            for doc in docs_to_return:
+                if not doc.metadata.get("disease"):
+                    logger.warning(
+                        "Retrieved chunk from '%s' (page %s) lacks a 'disease' metadata tag",
+                        doc.metadata.get("source_file"),
+                        doc.metadata.get("page"),
+                    )
+            return docs_to_return
 
         q_emb = self.sbert_model.encode(english_query, convert_to_tensor=True)
         scored = []
@@ -250,12 +401,16 @@ class VectorStoreService:
         scored = sorted(scored, key=lambda x: x[0], reverse=True)
         top_score = scored[0][0] if scored else 0
 
+        if top_score < 0.48:
+            print(f"Top SBERT score {top_score:.3f} < 0.48 - no relevant content")
+            return []
+
         if top_score > 0.5:
             threshold = 0.35
         elif top_score > 0.3:
-            threshold = 0.25
+            threshold = 0.35
         else:
-            threshold = 0.20
+            threshold = 0.35
 
         if top_score < threshold:
             print(f"Top SBERT score {top_score:.3f} < {threshold} - no relevant content")
@@ -263,4 +418,11 @@ class VectorStoreService:
 
         top_chunks = [doc for score, doc in scored if score >= threshold][:5]
         print(f"Retrieved {len(top_chunks)} chunks | top score: {top_score:.3f}")
+        for chunk in top_chunks:
+            if not chunk.metadata.get("disease"):
+                logger.warning(
+                    "Retrieved chunk from '%s' (page %s) lacks a 'disease' metadata tag",
+                    chunk.metadata.get("source_file"),
+                    chunk.metadata.get("page"),
+                )
         return top_chunks

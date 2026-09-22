@@ -34,8 +34,8 @@ class MessageSerializer(serializers.ModelSerializer):
    
     def get_triage_level(self, obj):
         if obj.metadata and isinstance(obj.metadata, dict):
-            return obj.metadata.get('triage_level', 'Info')
-        return 'Info'
+            return obj.metadata.get('triage_level', 'Doctor')
+        return 'Doctor'
 
 
 class ChatSessionSerializer(serializers.ModelSerializer):

@@ -1,5 +1,6 @@
 import os
 import re
+import hashlib
 import logging
 from dotenv import load_dotenv
 from .document_service import DocumentService
@@ -9,6 +10,19 @@ from .llm_service import LLMService
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# File-hash helper
+# ---------------------------------------------------------------------------
+
+def _compute_file_hash(path: str) -> str:
+    """Return the SHA-256 hex digest of *path*'s raw bytes."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 class RAGService:
@@ -28,18 +42,66 @@ class RAGService:
     # ========================================================================
 
     def load_document(self, pdf_path: str, book_name: str) -> str:
-        """Load a PDF document into the RAG system."""
+        """Load a PDF document into the RAG system.
+
+        Skip-if-unchanged: computes SHA-256 of the file bytes and compares it
+        to the hash stored in Neo4j.  If they match (and FORCE_REINGEST is not
+        set) the file is skipped entirely — no delete, no embedding, no upload.
+
+        Set FORCE_REINGEST=true in the environment to bypass the hash check and
+        always re-ingest every file (useful after cleaning-logic changes that
+        don't alter file bytes).
+        """
+        filename = os.path.basename(pdf_path)
+        force = os.getenv("FORCE_REINGEST", "false").strip().lower() in (
+            "1", "true", "yes"
+        )
+
         try:
-            logger.info("Loading document: %s", pdf_path)
-            chunks = self.doc_service.load_and_split_pdf(pdf_path)
+            current_hash = _compute_file_hash(pdf_path)
+
+            if not force:
+                try:
+                    stored_hash = self.vector_service.get_source_hash(filename)
+                    if stored_hash and stored_hash == current_hash:
+                        logger.info(
+                            "[INGEST] unchanged, skipping: %s (hash=%s…)",
+                            filename, current_hash[:12],
+                        )
+                        return f"Skipped (unchanged): '{book_name}'"
+                except Exception as hash_err:
+                    logger.error(
+                        "[INGEST] Hash read error for '%s' (status UNKNOWN, skipping to prevent data loss): %s",
+                        filename, hash_err,
+                    )
+                    return f"Skipped (hash-read error): '{book_name}'"
+
+            logger.info("[INGEST] loading: %s (force=%s)", filename, force)
+
+            # ── Delete stale chunks first (replace, not append) ───────────────
+            deleted = self.vector_service.delete_chunks_by_source(filename)
+            if deleted:
+                logger.info(
+                    "[INGEST] replaced %d stale chunks for '%s'", deleted, filename
+                )
+
+            # Pass hash so Neo4j nodes carry source_hash as a property
+            chunks = self.doc_service.load_and_split_pdf(
+                pdf_path, source_hash=current_hash
+            )
             self.vector_service.add_chunks_to_store(chunks)
+            disease_tag = chunks[0].metadata.get("disease") if chunks else None
             logger.info(
-                "'%s': %d chunks | Total: %d chunks",
-                book_name, len(chunks), len(self.vector_service._all_chunks)
+                "[INGEST] '%s' (disease=%s): %d chunks stored | hash=%s… | Total: %d chunks",
+                book_name,
+                disease_tag,
+                len(chunks),
+                current_hash[:12],
+                len(self.vector_service._all_chunks),
             )
             return f"Loaded {len(chunks)} chunks from '{book_name}'"
         except Exception as e:
-            logger.error("Failed to load '%s': %s", book_name, e)
+            logger.error("[INGEST] failed to load '%s': %s", book_name, e)
             return f"Error: {e}"
 
     def remove_document(self, filename: str) -> dict:
@@ -89,7 +151,8 @@ class RAGService:
                 result.append({
                     "filename": filename,
                     "indexed": filename in neo4j_filenames,
-                    "chunk_count": neo4j_info["chunk_count"] if neo4j_info else 0
+                    "chunk_count": neo4j_info["chunk_count"] if neo4j_info else 0,
+                    "disease": neo4j_info.get("disease") if neo4j_info else None,
                 })
 
             return {"success": True, "documents": result, "error": None}
@@ -199,7 +262,12 @@ Is this a capabilities question?"""
         for i, doc in enumerate(context_docs, 1):
             blocks.append(f"[{i}] {doc.page_content.strip()}")
             page = doc.metadata.get("page", "Unknown")
-            source_path = doc.metadata.get("source", "Unknown")
+            # "source_file" is set by both live-ingestion and BM25 warm-up paths.
+            # Fall back to legacy "source" key only for older / external chunks.
+            source_path = (
+                doc.metadata.get("source_file")
+                or doc.metadata.get("source", "Unknown")
+            )
             book_name = os.path.basename(str(source_path))
 
             if page != "Unknown":
@@ -291,7 +359,11 @@ Is this a capabilities question?"""
                         "emergency helpline 1122 hai. Ya apne qareebi doctor se "
                         "rabta karein. Aap akele nahi hain."
                     ),
-                    "metadata": {"source": "Emergency", "ragas_metrics": {}}
+                    "metadata": {
+                        "source": "Emergency",
+                        "triage_level": "Emergency",
+                        "ragas_metrics": {},
+                    }
                 }
             return {
                 "response": (
@@ -300,7 +372,11 @@ Is this a capabilities question?"""
                     "emergency services. You are not alone — please reach out "
                     "to a doctor or loved one."
                 ),
-                "metadata": {"source": "Emergency", "ragas_metrics": {}}
+                "metadata": {
+                    "source": "Emergency",
+                    "triage_level": "Emergency",
+                    "ragas_metrics": {},
+                }
             }
 
         # ══════════════════════════════════════════════════════════════
@@ -451,7 +527,11 @@ Your response:"""
         if not context_docs:
             return {
                 "response": no_info(language),
-                "metadata": {"source": "No relevant chunks", "ragas_metrics": {}}
+                "metadata": {
+                    "source": "No relevant chunks",
+                    "triage_level": "Doctor",
+                    "ragas_metrics": {},
+                }
             }
 
         retrieved_text, cite_block, pages_str = self._build_citations(context_docs)
@@ -466,22 +546,30 @@ Your response:"""
         if not is_relevant:
             return {
                 "response": no_info(language),
-                "metadata": {"source": "Relevance check failed", "ragas_metrics": {}}
+                "metadata": {
+                    "source": "Relevance check failed",
+                    "triage_level": "Doctor",
+                    "ragas_metrics": {},
+                }
             }
 
         # Generate answer
         try:
-            answer = self.llm_service.generate_answer(
-            original_query,
-            retrieved_text,
-            language,
-            chat_history  
-        )
+            answer, model_name = self.llm_service.generate_answer(
+                original_query,
+                retrieved_text,
+                language,
+                chat_history  
+            )
         except Exception as e:
             logger.error("Answer generation error: %s", e)
             return {
                 "response": no_info(language),
-                "metadata": {"source": "LLM generation failed", "ragas_metrics": {}}
+                "metadata": {
+                    "source": "LLM generation failed",
+                    "triage_level": "Doctor",
+                    "ragas_metrics": {},
+                }
             }
 
         # Compute metrics
@@ -503,9 +591,18 @@ Your response:"""
         logger.info("RAGAS Metrics: %s", metrics)
 
         # Negative response check
+        content_only = answer
+        for d_str in [
+            "This is not a substitute for professional medical advice.",
+            "Ye kisi professional doctor ki salah ka mutbadil nahi hai.",
+        ]:
+            content_only = re.sub(re.escape(d_str), "", content_only, flags=re.IGNORECASE)
+        content_only = content_only.strip()
+
         ans_lower = answer.lower()
         is_negative = (
-            "maafi" in ans_lower
+            len(content_only) < 30
+            or "maafi" in ans_lower
             or ("sorry" in ans_lower and "could not find" in ans_lower)
             or no_info(language).lower()[:30] in ans_lower
         )
@@ -526,13 +623,17 @@ Your response:"""
         # Final response
         final_response = answer if is_negative else answer + cite_block
 
+        # Classify triage level
+        triage_level = self.llm_service.classify_triage(original_query, answer)
+
         return {
             "response": final_response,
             "metadata": {
                 "source": "Document Knowledge Base",
                 "pages": pages_str,
-                "model": "GPT-4o" if self.llm_service.OPENAI_API_KEY else "Groq Llama 3.1 8B",
+                "model": model_name,
                 "language": language,
-                "ragas_metrics": metrics
+                "ragas_metrics": metrics,
+                "triage_level": triage_level,
             }
         }

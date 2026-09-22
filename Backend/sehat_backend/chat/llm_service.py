@@ -5,10 +5,32 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 from sentence_transformers import util
+import google.generativeai as genai
 
 load_dotenv()
+if not os.getenv("GOOGLE_API_KEY"):
+    from pathlib import Path
+    _env_file = Path(__file__).resolve().parent.parent.parent.parent / ".env"
+    if _env_file.exists():
+        load_dotenv(dotenv_path=_env_file)
 
 logger = logging.getLogger(__name__)
+
+
+class _AuxLLMProxy:
+    """Proxy for self.llm that routes .invoke() calls through the auxiliary LLM chain."""
+    def __init__(self, service):
+        self._service = service
+
+    def invoke(self, prompt, **kwargs):
+        p_text = prompt if isinstance(prompt, str) else getattr(prompt, "content", str(prompt))
+        text = self._service._call_aux_llm(p_text)
+        class _Result:
+            def __init__(self, content):
+                self.content = content
+            def __str__(self):
+                return self.content
+        return _Result(text)
 
 
 class LLMService:
@@ -16,32 +38,12 @@ class LLMService:
 
     def __init__(self, use_openai=True):
         self.GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-        self.OPENAI_API_KEY = os.getenv("OPEN_AI_API_KEY")
-
-        if use_openai and self.OPENAI_API_KEY:
-            self.llm = ChatOpenAI(
-                model_name="gpt-4o",
-                openai_api_key=self.OPENAI_API_KEY,
-                temperature=0.3,
-                max_tokens=1024,
-                timeout=30,
-                max_retries=2,
-            )
-            logger.info("Using ChatGPT (GPT-4o)")
-        elif self.GROQ_API_KEY:
-            self.llm = ChatGroq(
-                model_name="llama-3.1-8b-instant",
-                groq_api_key=self.GROQ_API_KEY,
-                temperature=0.2,
-                max_tokens=1024,
-                timeout=30,
-                max_retries=2,
-            )
-            logger.info("Using Groq (Llama 3.1)")
-        else:
-            raise RuntimeError(
-                "No API key found. Set OPEN_AI_API_KEY or GROQ_API_KEY in .env file"
-            )
+        self.OPENAI_API_KEY = os.getenv("OPEN_AI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        self.llm = _AuxLLMProxy(self)
+        logger.info(
+            "Aux LLM chain initialized (order: %s)",
+            os.getenv("AUX_LLM_PROVIDER_ORDER", "groq_first")
+        )
 
     # ═══════════════════════════════════════════════════════════════
     # SECURITY: Input Sanitization
@@ -205,15 +207,7 @@ class LLMService:
 
         try:
 
-            resp = self.llm.invoke(prompt)
-
-            result = (
-
-                resp.content if hasattr(resp, "content")
-
-                else str(resp)
-
-            ).strip().upper()
+            result = self._call_aux_llm(prompt).strip().upper()
 
             word = result.split()[0] if result.split() else "UNCLEAR"
 
@@ -257,11 +251,7 @@ class LLMService:
         )
 
         try:
-            resp = self.llm.invoke(prompt)
-            result = (
-                resp.content if hasattr(resp, "content")
-                else str(resp)
-            ).strip().lower()
+            result = self._call_aux_llm(prompt).strip().lower()
 
             if "urdu" in result or "roman" in result:
                 logger.info("Language: Roman Urdu")
@@ -294,11 +284,7 @@ class LLMService:
         )
 
         try:
-            resp = self.llm.invoke(prompt)
-            translation = (
-                resp.content if hasattr(resp, "content")
-                else str(resp)
-            ).strip()
+            translation = self._call_aux_llm(prompt).strip()
 
             # Remove explanatory artifacts
             bad_starts = [
@@ -368,25 +354,315 @@ class LLMService:
         )
 
         try:
-            resp = self.llm.invoke(prompt)
-            result = (
-                resp.content if hasattr(resp, "content")
-                else str(resp)
-            ).strip().upper()
+            result = self._call_aux_llm(prompt).strip().upper()
             is_relevant = result.startswith("YES")
             logger.info("Relevance: %s", "YES" if is_relevant else "NO")
             return is_relevant
         except Exception as e:
             logger.error("Relevance check error: %s", e)
             return True
+
+    # ═══════════════════════════════════════════════════════════════
+    # TRIAGE CLASSIFICATION
+    # ═══════════════════════════════════════════════════════════════
+
+    def classify_triage(self, query: str, answer: str) -> str:
+        """Classify urgency level of user symptoms/query and generated advice.
+
+        Returns one of: 'Emergency', 'Doctor', 'Self-Care'.
+        Defaults to 'Doctor' on any error or timeout.
+        """
+        prompt = (
+            "You are a medical triage classifier for a health assistant.\n\n"
+            "Given the user's symptoms/query and the generated medical advice, classify urgency "
+            "into EXACTLY ONE category:\n"
+            "- EMERGENCY: Life-threatening conditions, severe bleeding, difficulty breathing, "
+            "chest pain, loss of consciousness, or urgent emergency care needed.\n"
+            "- DOCTOR: Persistent or moderate symptoms, infections, conditions requiring prescription "
+            "or diagnosis, warning signs, or advice recommending consulting a doctor.\n"
+            "- SELFCARE: Mild, self-limiting symptoms, hydration, rest, home remedies, "
+            "or general health information with no urgent signs.\n\n"
+            "Rules:\n"
+            "- If the medical advice contains red-flag warnings (e.g. seek doctor, emergency, "
+            "immediately, hospitalize), weight toward DOCTOR or EMERGENCY.\n"
+            "- Output ONLY ONE WORD: EMERGENCY, DOCTOR, or SELFCARE.\n\n"
+            f"User Query: {query}\n"
+            f"Medical Advice: {answer[:600]}\n\n"
+            "Classification:"
+        )
+
+        try:
+            raw = self._call_aux_llm(prompt).strip().upper()
+            word = raw.split()[0] if raw.split() else ""
+            clean_word = re.sub(r"[^A-Z]", "", word)
+
+            if "EMERGENCY" in clean_word:
+                level = "Emergency"
+            elif "SELF" in clean_word or "CARE" in clean_word:
+                level = "Self-Care"
+            elif "DOCTOR" in clean_word:
+                level = "Doctor"
+            else:
+                logger.warning("[AUX LLM] Unrecognized triage output '%s', defaulting to Doctor", raw)
+                level = "Doctor"
+
+            logger.info("[AUX LLM] Triage level: %s", level)
+            return level
+        except Exception as e:
+            logger.warning("[AUX LLM] Triage classification failed (%s), defaulting to Doctor", e)
+            return "Doctor"
         
     # ═══════════════════════════════════════════════════════════════
-    # ANSWER GENERATION
+    # AUXILIARY LLM CALL  (lang-detect · rewrite · relevance · greet)
+    # Controlled by AUX_LLM_PROVIDER_ORDER env var (groq_first|gemini_first)
     # ═══════════════════════════════════════════════════════════════
+
+    def _aux_provider_call(self, provider: str, prompt: str) -> str:
+        """Call a single provider and return raw text. Raises on any failure."""
+        if provider == "groq":
+            key = os.getenv("GROQ_API_KEY", "").strip()
+            if not key:
+                raise ValueError("GROQ_API_KEY not configured")
+            client = ChatGroq(
+                model_name="openai/gpt-oss-20b",
+                groq_api_key=key,
+                temperature=0.2,
+                max_tokens=512,
+                timeout=20,
+                max_retries=1,
+            )
+            resp = client.invoke(prompt)
+            return (resp.content if hasattr(resp, "content") else str(resp)).strip()
+
+        if provider == "gemini":
+            key = os.getenv("GOOGLE_API_KEY", "").strip().strip('"').strip("'")
+            if not key:
+                raise ValueError("GOOGLE_API_KEY not configured")
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel("gemini-3.1-flash-lite")
+            resp = model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.2, "max_output_tokens": 512},
+            )
+            text = resp.text.strip() if (resp and hasattr(resp, "text") and resp.text) else ""
+            if not text:
+                raise ValueError("Gemini returned empty response")
+            return text
+
+        raise ValueError(f"Unknown provider: {provider}")
+
+    def _call_aux_llm(self, prompt: str) -> str:
+        """
+        Shared chain for the 5 lightweight aux functions:
+          detect_language · rewrite_query · verify_relevance
+          · detect_capabilities_query · greeting/capabilities generation
+
+        Order (AUX_LLM_PROVIDER_ORDER, default groq_first):
+          groq_first   -> Groq(openai/gpt-oss-20b) -> Gemini(gemini-3.1-flash-lite) -> OpenAI
+          gemini_first -> Gemini(gemini-3.1-flash-lite) -> Groq(openai/gpt-oss-20b) -> OpenAI
+
+        Main answer generation (Gemini->Groq via _call_generation_llm) is NOT affected.
+        """
+        order = os.getenv("AUX_LLM_PROVIDER_ORDER", "groq_first").strip().lower()
+        primary, secondary = ("gemini", "groq") if order == "gemini_first" else ("groq", "gemini")
+
+        for provider in (primary, secondary):
+            try:
+                text = self._aux_provider_call(provider, prompt)
+                if text:
+                    logger.info("[AUX LLM] answered by: %s", provider)
+                    return text
+                logger.warning("[AUX LLM] %s returned empty, trying next", provider)
+            except Exception as e:
+                logger.warning("[AUX LLM] %s failed (%s), trying next", provider, e)
+
+        # 3rd-tier: OpenAI — kept to preserve existing contract, not deleted
+        openai_key = (os.getenv("OPEN_AI_API_KEY") or os.getenv("OPENAI_API_KEY") or getattr(self, "OPENAI_API_KEY", "") or "").strip()
+        if openai_key:
+            try:
+                from langchain_openai import ChatOpenAI as _OAI
+                oai = _OAI(
+                    model_name="gpt-4o",
+                    openai_api_key=openai_key,
+                    temperature=0.2,
+                    max_tokens=512,
+                    timeout=30,
+                    max_retries=1,
+                )
+                resp = oai.invoke(prompt)
+                text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+                if text:
+                    logger.info("[AUX LLM] answered by: openai (3rd-tier fallback)")
+                    return text
+            except Exception as e:
+                logger.error("[AUX LLM] openai 3rd-tier fallback failed: %s", e)
+
+        raise RuntimeError("[AUX LLM] All providers exhausted — Groq, Gemini, and OpenAI all failed")
+
+    # ═══════════════════════════════════════════════════════════════
+    # CAPABILITIES & GREETINGS (AUX LLM)
+    # ═══════════════════════════════════════════════════════════════
+
+    def detect_capabilities_query(self, query_text: str) -> bool:
+        """
+        LLM-based detection of capabilities/greeting queries.
+        """
+        prompt = f"""Determine if the user is asking about what SEHAT can do,
+what help it provides, what questions can be asked, or who/what SEHAT is.
+
+Examples: "What can you do?", "How can you help me?", "Who are you?",
+"Ap kia kar sakte ho?", "Ap meri kia madad kar sakte ho?"
+
+Output ONLY ONE WORD: YES or NO
+
+User message: {query_text}
+
+Is this a capabilities question?"""
+
+        try:
+            result = self._call_aux_llm(prompt).strip().upper()
+            is_cap = result.startswith("YES")
+            logger.info("Capabilities query: %s", "YES" if is_cap else "NO")
+            return is_cap
+        except Exception as e:
+            logger.error("Capabilities detection error: %s", e)
+            return False
+
+    def generate_greeting(self, query: str, language: str = "english") -> str:
+        """Generate dynamic greeting response in the given language."""
+        greeting_prompt = (
+            f"You are SEHAT, a friendly medical assistant.\n"
+            f"The user just greeted you. Respond warmly in {language}.\n"
+            f"Keep it brief (2-3 sentences). Mention you help with health questions.\n"
+            f"User greeting: {query}\n"
+            f"Response:"
+        )
+        try:
+            greeting_resp = self._call_aux_llm(greeting_prompt).strip()
+            if greeting_resp:
+                return greeting_resp
+        except Exception as e:
+            logger.error("Greeting generation error: %s", e)
+
+        if language == "roman_urdu":
+            return (
+                "Assalam-o-Alaikum! Main SEHAT AI hoon.\n\n"
+                "Main aapki sehat se mutaliq madad kar sakta hoon — "
+                "apni takleef ya alamaat batayein!"
+            )
+        return (
+            "Hello! I am SEHAT AI, your personal health assistant.\n\n"
+            "I can help you with understanding symptoms, medical guidance, "
+            "and emergency triage. How can I help you today?"
+        )
+
+    def generate_capabilities(self, query: str, language: str = "english") -> str:
+        """Generate dynamic capabilities response in the given language."""
+        capabilities_prompt = f"""You are SEHAT AI, a medical assistant.
+
+The user is asking about what you can do, what diseases you know about,
+or what help you provide.
+
+IMPORTANT RULES:
+- Respond in {language} language ONLY
+- If language is roman_urdu, write COMPLETELY in Roman Urdu
+- If language is english, write COMPLETELY in English
+- DO NOT mix languages
+- Keep it friendly and brief (4-6 lines)
+- Mention you help with symptoms, diseases, and medical guidance
+- You have knowledge about: Dengue Fever, Diarrhea, Hepatitis A, Influenza,
+  Tuberculosis (TB), Malaria, Skin Allergy, Typhoid Fever, Common Cold,
+  Urinary Tract Infections
+
+User asked: {query}
+
+Your response:"""
+        try:
+            cap_resp = self._call_aux_llm(capabilities_prompt).strip()
+            if cap_resp:
+                return cap_resp
+        except Exception as e:
+            logger.error("Capabilities generation error: %s", e)
+
+        if language == "roman_urdu":
+            return (
+                "Main SEHAT AI hoon! Aap mujhse bukhar, dengue, typhoid, "
+                "malaria, khansi, nazla, jild ki bemariyan, aur deegar masail "
+                "ke bare mein pooch sakte hain."
+            )
+        return (
+            "I am SEHAT AI, your personal health assistant! You can ask me about symptoms, diseases, "
+            "and medical guidance for conditions like dengue, malaria, typhoid, influenza, and diarrhea."
+        )
+
+    # ═══════════════════════════════════════════════════════════════
+    # ANSWER GENERATION (GEMINI PRIMARY -> GROQ FALLBACK)
+    # ═══════════════════════════════════════════════════════════════
+    def _call_generation_llm(self, prompt: str) -> str:
+        """
+        Generate answer using Google Gemini (gemini-3.1-flash-lite) as sole primary.
+        Falls back to Groq (llama-3.1-8b-instant) on exception, timeout, or empty response.
+        No OpenAI call anywhere in this path.
+        """
+        # 1. Primary: Google Gemini (gemini-3.1-flash-lite)
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        if google_api_key:
+            google_api_key = google_api_key.strip().strip('"').strip("'")
+
+        if google_api_key:
+            try:
+                genai.configure(api_key=google_api_key)
+                model = genai.GenerativeModel("gemini-3.1-flash-lite")
+                resp = model.generate_content(
+                    prompt,
+                    generation_config={
+                        "temperature": 0.3,
+                        "max_output_tokens": 1024,
+                    },
+                )
+                if resp and hasattr(resp, "text") and resp.text and resp.text.strip():
+                    logger.info("Generated answer using Gemini (gemini-3.1-flash-lite)")
+                    return resp.text.strip(), "gemini-3.1-flash-lite"
+                else:
+                    logger.warning("Gemini returned empty response, falling back to Groq")
+            except Exception as e:
+                logger.warning("Gemini generation failed: %s. Falling back to Groq", e)
+        else:
+            logger.warning("GOOGLE_API_KEY not configured or empty, falling back to Groq")
+
+        # 2. Fallback: Groq (LLaMA 3.1 8B)
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        if groq_api_key:
+            groq_api_key = groq_api_key.strip().strip('"').strip("'")
+
+        if groq_api_key:
+            try:
+                groq_client = ChatGroq(
+                    model_name="llama-3.1-8b-instant",
+                    groq_api_key=groq_api_key,
+                    temperature=0.2,
+                    max_tokens=1024,
+                    timeout=30,
+                    max_retries=2,
+                )
+                resp = groq_client.invoke(prompt)
+                text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+                if text:
+                    logger.info("Generated answer using Groq fallback (llama-3.1-8b-instant)")
+                    return text, "llama-3.1-8b-instant"
+                else:
+                    logger.warning("Groq fallback returned empty response")
+            except Exception as e:
+                logger.error("Groq fallback generation failed: %s", e)
+        else:
+            logger.error("GROQ_API_KEY not configured or empty")
+
+        raise RuntimeError("Both Gemini and Groq generation failed or returned empty responses.")
+
     def generate_answer(
         self, original_query: str, retrieved_text: str,
         language: str, chat_history: list = None
-    ) -> str:
+    ) -> tuple[str, str]:
         """Generate answer with security, memory, and language handling."""
 
         # Emergency check
@@ -398,20 +674,20 @@ class LLMService:
                     "soch rahe hain, to please turant madad lein. Pakistan mein "
                     "emergency helpline 1122 hai. Ya apne qareebi doctor se "
                     "rabta karein. Aap akele nahi hain."
-                )
+                ), "safety_system"
             return (
                 "Emergency: If you're thinking about self-harm or suicide, "
                 "please seek help immediately. In Pakistan, call 1122 for "
                 "emergency services. You are not alone — please reach out "
                 "to a doctor or loved one."
-            )
+            ), "safety_system"
 
         if language == "invalid_hindi":
             return (
                 "Please ask your question in English or Roman Urdu. "
                 "Hindi (Devanagari script) is not supported.\n\n"
                 "Baraye meharbani apna sawaal English ya Roman Urdu mein poochein."
-            )
+            ), "rule_system"
 
         # Language-specific rules with STRONG language enforcement
         if language == "roman_urdu":
@@ -442,13 +718,10 @@ class LLMService:
                 "knowledge base. Please consult a doctor."
             )
 
-        # Format chat history (with length limit)
         # Format chat history with proper context
-                # Format chat history with proper context
         history_context = ""
         if chat_history and len(chat_history) > 0:
             history_parts = []
-            
             for msg in chat_history[-6:]:  # Last 6 messages
                 sender = msg.get("sender", "user")
                 text = msg.get("text", msg.get("message_text", ""))
@@ -491,11 +764,7 @@ class LLMService:
         )
 
         try:
-            resp = self.llm.invoke(prompt)
-            answer = (
-                resp.content if hasattr(resp, "content")
-                else str(resp)
-            ).strip()
+            answer, model_name = self._call_generation_llm(prompt)
             answer = answer.replace("**", "").replace("##", "").replace("__", "")
 
             # Handle contradictory content
@@ -519,7 +788,7 @@ class LLMService:
                     logger.warning(
                         "Language mismatch: English expected but got Urdu markers"
                     )
-                    return no_info_msg
+                    return no_info_msg, model_name
 
             # [NEW] Urdu purity check for Roman Urdu responses
             if language == "roman_urdu":
@@ -547,13 +816,10 @@ class LLMService:
                         "Pure Roman Urdu version:"
                     )
                     try:
-                        retry_resp = self.llm.invoke(retry_prompt)
-                        retry_answer = (
-                            retry_resp.content if hasattr(retry_resp, "content")
-                            else str(retry_resp)
-                        ).strip()
+                        retry_answer, retry_model = self._call_generation_llm(retry_prompt)
                         if retry_answer and len(retry_answer) > 20:
                             answer = retry_answer
+                            model_name = retry_model
                             # Add disclaimer in Roman Urdu
                             urdu_disclaimer = (
                                 "Ye kisi professional doctor ki salah ka mutbadil nahi hai."
@@ -563,10 +829,10 @@ class LLMService:
                     except Exception as e:
                         logger.error("Urdu retry failed: %s", e)
 
-            return answer
+            return answer, model_name
         except Exception as e:
             logger.error("Generation error: %s", e)
-            return no_info_msg
+            return no_info_msg, "unknown"
    # ═══════════════════════════════════════════════════════════════
     # RAGAS METRICS
     # ═══════════════════════════════════════════════════════════════
@@ -685,14 +951,13 @@ Examples:
 Rewritten Question:"""
 
         try:
-            resp = self.llm.invoke(prompt)
-            rewritten = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+            rewritten = self._call_aux_llm(prompt).strip()
             
             # Remove any quotes, explanations
             rewritten = rewritten.strip('"').strip("'").strip()
             
             if rewritten and len(rewritten) > 5 and rewritten != query:
-                logger.info(f"Query Rewritten: '{query}' → '{rewritten}'")
+                logger.info("Query Rewritten: '%s' -> '%s'", query, rewritten)
                 return rewritten
             
             return query

@@ -1,12 +1,98 @@
+import os
+import json
+import logging
+import threading
+from dotenv import load_dotenv
+import firebase_admin
+from firebase_admin import auth, credentials
+
 from .models import ChatSession, Message
-from .rag_service import RAGService
+
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+_firebase_initialized = False
+
+
+def initialize_firebase_admin():
+    """Confirm firebase_admin is initialized once at startup using env configuration."""
+    global _firebase_initialized
+    if _firebase_initialized or firebase_admin._apps:
+        _firebase_initialized = True
+        return
+
+    cred = None
+    cred_json_env = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    if cred_json_env:
+        try:
+            cred_dict = json.loads(cred_json_env)
+            cred = credentials.Certificate(cred_dict)
+            logger.info("Firebase Admin initialized with FIREBASE_SERVICE_ACCOUNT_JSON env var")
+        except Exception as e:
+            logger.error("Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: %s", e)
+
+    if not cred:
+        cred_val = (
+            os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
+            or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            or os.getenv("FIREBASE_CREDENTIALS_PATH")
+        )
+        if cred_val:
+            cred_val = cred_val.strip().strip('"').strip("'")
+            if os.path.isfile(cred_val):
+                try:
+                    cred = credentials.Certificate(cred_val)
+                    logger.info("Firebase Admin initialized with certificate from %s", cred_val)
+                except Exception as e:
+                    logger.error("Failed to load Firebase credentials from %s: %s", cred_val, e)
+            elif cred_val.startswith("{") and cred_val.endswith("}"):
+                try:
+                    cred_dict = json.loads(cred_val)
+                    cred = credentials.Certificate(cred_dict)
+                    logger.info("Firebase Admin initialized with JSON certificate from env")
+                except Exception as e:
+                    logger.error("Failed to parse Firebase certificate JSON: %s", e)
+
+    project_id = os.getenv("FIREBASE_PROJECT_ID", "sehat-538ee")
+
+    try:
+        if cred:
+            firebase_admin.initialize_app(cred)
+        else:
+            firebase_admin.initialize_app(options={"projectId": project_id})
+            logger.info("Firebase Admin initialized with project ID: %s", project_id)
+        _firebase_initialized = True
+    except Exception as e:
+        logger.warning("Firebase Admin initialization: %s", e)
+        _firebase_initialized = True
+
+
+_chat_service_instance = None
+_chat_service_lock = threading.Lock()
+
+
+def get_chat_service():
+    """Thread-safe singleton accessor for ChatService."""
+    global _chat_service_instance
+    if _chat_service_instance is None:
+        with _chat_service_lock:
+            if _chat_service_instance is None:
+                _chat_service_instance = ChatService()
+    return _chat_service_instance
 
 
 class ChatService:
     """Business logic for chat operations."""
     
     def __init__(self):
-        self.rag_service = RAGService()
+        self._rag_service = None
+
+    @property
+    def rag_service(self):
+        if self._rag_service is None:
+            from .rag_service import RAGService
+            self._rag_service = RAGService()
+        return self._rag_service
     
     def create_new_session(self, firebase_uid, title="New Chat"):
         return ChatSession.objects.create(
@@ -146,9 +232,40 @@ class ChatService:
 
 class AuthenticationService:
     """Firebase authentication integration."""
-    
-    def verify_firebase_token(self, token):
-        pass
-    
+
+    def verify_firebase_token(self, token: str):
+        """
+        Verify Firebase ID token sent from the client using firebase_admin SDK.
+        Returns: verified uid (str) on success, or None on missing/invalid/expired token.
+        """
+        if not token or not isinstance(token, str) or not token.strip():
+            logger.warning("Firebase token missing or empty")
+            return None
+
+        clean_token = token.strip()
+        if clean_token.lower().startswith("bearer "):
+            clean_token = clean_token[7:].strip()
+
+        # Ensure Firebase Admin is initialized
+        initialize_firebase_admin()
+
+        try:
+            decoded_token = auth.verify_id_token(clean_token)
+            uid = decoded_token.get("uid")
+            if uid:
+                logger.info("Successfully verified Firebase ID token for UID: %s", uid)
+                return uid
+            logger.warning("Firebase ID token verification returned no uid in payload")
+            return None
+        except auth.ExpiredIdTokenError:
+            logger.warning("Firebase ID token has expired")
+            return None
+        except auth.InvalidIdTokenError as e:
+            logger.warning("Invalid Firebase ID token: %s", e)
+            return None
+        except Exception as e:
+            logger.error("Firebase ID token verification failed: %s", e)
+            return None
+
     def validate_user(self, firebase_uid):
         return bool(firebase_uid)
