@@ -32,7 +32,8 @@ export default function ChatbotScreen() {
   const [showHistory, setShowHistory] = useState(false);
   const [currentChatTitle, setCurrentChatTitle] = useState("New Chat");
   const [userUid, setUserUid] = useState(null);
-  const [isOnline, setIsOnline] = useState(true); // Tracks real server connectivity
+  const [isOnline, setIsOnline] = useState(true);
+  const [expandedSources, setExpandedSources] = useState({}); // track per-message source expansion
 
   // Track if current session is "empty" (only welcome msg or no msgs)
   const isCurrentSessionEmpty = useRef(true);
@@ -252,10 +253,15 @@ const handleSend = async () => {
     }
 
     const botText = response.botMessage?.message_text || response.response || "I've received your message.";
-    const botCondition = response.botMessage?.metadata?.condition || null;
-    const botTriage = response.botMessage?.metadata?.triage_level || null;
+    const botMeta = response.botMessage?.metadata || {};
+    const botCondition = botMeta.condition || null;
+    const botTriage = botMeta.triage_level || null;
+    // Phase 2 structured fields — fall back gracefully for old messages
+    const botAnswerBody = botMeta.answer_body || botText;
+    const botSources = Array.isArray(botMeta.sources) ? botMeta.sources : [];
+    const botDisclaimer = botMeta.disclaimer || null;
 
-    const botMessage = createMessage(botText, true, botCondition, botTriage);
+    const botMessage = createMessage(botAnswerBody, true, botCondition, botTriage, botSources, botDisclaimer);
     const finalMessages = [...updatedMessages, botMessage];
     setMessages(finalMessages);
     await saveMessagesLocally(activeSessionId, finalMessages);
@@ -303,12 +309,14 @@ const toggleHistory = () => {
   });
 };
 
-  const createMessage = (text, isBot, condition = null, triage = null) => ({
+  const createMessage = (text, isBot, condition = null, triage = null, sources = [], disclaimer = null) => ({
     id: Date.now() + Math.random(),
     text,
     isBot,
     condition,
     triage,
+    sources,      // [{title, filename, pages:[]}]
+    disclaimer,   // plain string or null
     time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
   });
 
@@ -428,55 +436,117 @@ const toggleHistory = () => {
                 </View>
               )}
 
-              {messages.map((message) => (
-                <View
-                  key={message.id}
-                  style={[styles.messageWrapper, message.isBot ? styles.botWrapper : styles.userWrapper]}
-                >
-                  <View style={[
-                    styles.messageBubble,
-                    message.isBot ? styles.botBubble : styles.userBubble,
-                    message.triage === "Emergency" && styles.emergencyBubble,
-                    message.triage === "Monitor" && styles.monitorBubble,
-                  ]}>
-                    <Text style={[
-                      styles.messageText,
-                      message.isBot ? styles.botText : styles.userText,
-                      message.triage === "Emergency" && styles.emergencyText,
+              {messages.map((message) => {
+                const msgKey = message.id;
+                const sourcesOpen = !!expandedSources[msgKey];
+                const hasSources = message.isBot && Array.isArray(message.sources) && message.sources.length > 0;
+
+                // Triage badge config
+                const triageBadge = message.isBot && message.triage
+                  ? {
+                      Emergency: { bg: "#FFEBEE", border: "#EF9A9A", text: "#C62828", icon: "⚠️" },
+                      Doctor:    { bg: "#FFF3E0", border: "#FFCC80", text: "#E65100", icon: "👨‍⚕️" },
+                      "Self-Care": { bg: "#E8F5E9", border: "#A5D6A7", text: "#2E7D32", icon: "🏠" },
+                    }[message.triage] || null
+                  : null;
+
+                return (
+                  <View
+                    key={msgKey}
+                    style={[styles.messageWrapper, message.isBot ? styles.botWrapper : styles.userWrapper]}
+                  >
+                    <View style={[
+                      styles.messageBubble,
+                      message.isBot ? styles.botBubble : styles.userBubble,
+                      message.triage === "Emergency" && styles.emergencyBubble,
+                      message.triage === "Monitor" && styles.monitorBubble,
                     ]}>
-                      {message.text}
-                    </Text>
-                    {message.condition && (
-                      <View style={styles.medicalInfo}>
-                        <View style={styles.conditionTag}>
-                          <MaterialCommunityIcons name="medical-bag" size={14} color="#00BCD4" />
-                          <Text style={styles.conditionText}>{message.condition}</Text>
+
+                      {/* ── Triage badge (always shown when triage is set) ── */}
+                      {triageBadge && (
+                        <View style={[styles.triageBadge, { backgroundColor: triageBadge.bg, borderColor: triageBadge.border }]}>
+                          <Text style={[styles.triageBadgeText, { color: triageBadge.text }]}>
+                            {triageBadge.icon} {message.triage}
+                          </Text>
                         </View>
-                        {message.triage && (
-                          <View style={[
-                            styles.triageTag,
-                            message.triage === "Emergency" && styles.triageEmergency,
-                            message.triage === "Monitor" && styles.triageMonitor,
-                            message.triage === "Self-Care" && styles.triageSelfCare,
-                          ]}>
-                            <Text style={[
-                              styles.triageText,
-                              message.triage === "Emergency" && { color: "#D32F2F" },
-                              message.triage === "Monitor" && { color: "#F57C00" },
-                              message.triage === "Self-Care" && { color: "#388E3C" },
-                            ]}>
-                              {message.triage}
-                            </Text>
+                      )}
+
+                      {/* ── Answer body ── */}
+                      <Text style={[
+                        styles.messageText,
+                        message.isBot ? styles.botText : styles.userText,
+                        message.triage === "Emergency" && styles.emergencyText,
+                      ]}>
+                        {message.text}
+                      </Text>
+
+                      {/* ── Legacy condition tag (for history messages) ── */}
+                      {message.condition && !triageBadge && (
+                        <View style={styles.medicalInfo}>
+                          <View style={styles.conditionTag}>
+                            <MaterialCommunityIcons name="medical-bag" size={14} color="#00BCD4" />
+                            <Text style={styles.conditionText}>{message.condition}</Text>
                           </View>
-                        )}
-                      </View>
-                    )}
-                    <Text style={[styles.messageTime, message.isBot ? styles.botTime : styles.userTime]}>
-                      {message.time}
-                    </Text>
+                        </View>
+                      )}
+
+                      {/* ── Collapsible Sources ── */}
+                      {hasSources && (
+                        <View style={styles.sourcesContainer}>
+                          <TouchableOpacity
+                            style={styles.sourcesToggle}
+                            onPress={() =>
+                              setExpandedSources(prev => ({
+                                ...prev,
+                                [msgKey]: !prev[msgKey],
+                              }))
+                            }
+                            activeOpacity={0.7}
+                          >
+                            <MaterialCommunityIcons
+                              name={sourcesOpen ? "book-open-variant" : "book-outline"}
+                              size={13}
+                              color="#546E7A"
+                            />
+                            <Text style={styles.sourcesToggleText}>
+                              {sourcesOpen ? "Hide sources" : `Sources (${message.sources.length})`}
+                            </Text>
+                            <MaterialCommunityIcons
+                              name={sourcesOpen ? "chevron-up" : "chevron-down"}
+                              size={13}
+                              color="#546E7A"
+                            />
+                          </TouchableOpacity>
+                          {sourcesOpen && (
+                            <View style={styles.sourcesList}>
+                              {message.sources.map((src, si) => (
+                                <View key={si} style={styles.sourceItem}>
+                                  <MaterialCommunityIcons name="file-document-outline" size={12} color="#0D47A1" />
+                                  <Text style={styles.sourceItemText}>
+                                    {src.title}
+                                    {src.pages && src.pages.length > 0
+                                      ? `  ·  pp. ${src.pages.join(", ")}`
+                                      : ""}
+                                  </Text>
+                                </View>
+                              ))}
+                            </View>
+                          )}
+                        </View>
+                      )}
+
+                      {/* ── Disclaimer ── */}
+                      {message.isBot && message.disclaimer && (
+                        <Text style={styles.bubbleDisclaimer}>{message.disclaimer}</Text>
+                      )}
+
+                      <Text style={[styles.messageTime, message.isBot ? styles.botTime : styles.userTime]}>
+                        {message.time}
+                      </Text>
+                    </View>
                   </View>
-                </View>
-              ))}
+                );
+              })}
 
               {isSending && (
                 <View style={styles.botWrapper}>
@@ -616,6 +686,8 @@ const styles = StyleSheet.create({
   messageTime: { fontSize: 11, marginTop: 6 },
   botTime: { color: "rgba(0,0,0,0.4)" },
   userTime: { color: "rgba(255,255,255,0.7)" },
+
+  // Legacy condition / triage tags (kept for history messages)
   medicalInfo: {
     flexDirection: "row", alignItems: "center", marginTop: 10,
     paddingTop: 10, borderTopWidth: 1, borderTopColor: "rgba(0,0,0,0.08)", gap: 8, flexWrap: "wrap",
@@ -631,9 +703,51 @@ const styles = StyleSheet.create({
   triageMonitor: { backgroundColor: "rgba(255,193,7,0.1)" },
   triageSelfCare: { backgroundColor: "rgba(76,175,80,0.1)" },
   triageText: { fontSize: 12, fontWeight: "600" },
+
+  // Phase 2: Triage badge (always shown when triage is set)
+  triageBadge: {
+    flexDirection: "row", alignItems: "center",
+    alignSelf: "flex-start",
+    paddingHorizontal: 10, paddingVertical: 4,
+    borderRadius: 20, borderWidth: 1,
+    marginBottom: 10,
+  },
+  triageBadgeText: { fontSize: 12, fontWeight: "700", letterSpacing: 0.3 },
+
+  // Phase 2: Collapsible Sources
+  sourcesContainer: {
+    marginTop: 12,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(0,0,0,0.08)",
+  },
+  sourcesToggle: {
+    flexDirection: "row", alignItems: "center", gap: 5,
+  },
+  sourcesToggleText: {
+    fontSize: 12, color: "#546E7A", fontWeight: "600", flex: 1,
+  },
+  sourcesList: { marginTop: 8, gap: 6 },
+  sourceItem: {
+    flexDirection: "row", alignItems: "flex-start", gap: 6,
+    backgroundColor: "rgba(13,71,161,0.05)",
+    borderRadius: 8, padding: 8,
+  },
+  sourceItemText: {
+    fontSize: 12, color: "#1E293B", flex: 1, lineHeight: 17,
+  },
+
+  // Phase 2: Disclaimer inside bubble
+  bubbleDisclaimer: {
+    fontSize: 11, color: "#90A4AE",
+    marginTop: 10,
+    fontStyle: "italic",
+    lineHeight: 16,
+  },
+
   thinkingContainer: { flexDirection: "row", alignItems: "center" },
 
-  // FIX 3: Input bar — completely rebuilt
+  // Input bar
   inputBar: {
     backgroundColor: "#FFF",
     borderTopWidth: 1,
@@ -659,7 +773,6 @@ const styles = StyleSheet.create({
     color: "#1E293B",
     borderWidth: 1,
     borderColor: "#E2E8F0",
-    // No icons inside — clean field
   },
   sendBtn: {
     width: 44,
@@ -673,7 +786,6 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.25,
     shadowRadius: 3,
-    // Aligned with bottom of input
     marginBottom: 0,
   },
   sendBtnDisabled: { backgroundColor: "#CBD5E1", elevation: 0 },
