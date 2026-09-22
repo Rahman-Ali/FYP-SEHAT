@@ -31,11 +31,10 @@ class MessageSerializer(serializers.ModelSerializer):
             return obj.metadata.get('possible_condition', None)
         return None
 
-   
     def get_triage_level(self, obj):
         if obj.metadata and isinstance(obj.metadata, dict):
-            return obj.metadata.get('triage_level', 'Doctor')
-        return 'Doctor'
+            return obj.metadata.get('triage_level', None)  # None = not a clinical response
+        return None
 
 
 class ChatSessionSerializer(serializers.ModelSerializer):

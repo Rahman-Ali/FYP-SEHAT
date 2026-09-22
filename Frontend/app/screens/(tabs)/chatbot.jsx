@@ -21,6 +21,116 @@ import {
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import apiService from "../../services/api";
 
+// Case-insensitive, resilient triage badge resolver
+const getTriageBadgeConfig = (triageStr) => {
+  if (!triageStr) return null;
+  const s = String(triageStr).toLowerCase().trim();
+  if (s.includes("emerg")) {
+    return { label: "Emergency", bg: "#FFEBEE", border: "#EF9A9A", text: "#C62828", icon: "alert-circle" };
+  }
+  if (s.includes("self") || s.includes("care") || s.includes("home")) {
+    return { label: "Self-Care", bg: "#E8F5E9", border: "#A5D6A7", text: "#2E7D32", icon: "home-heart" };
+  }
+  if (s.includes("doc") || s.includes("monitor") || s.includes("consult") || s.includes("clinic")) {
+    return { label: "Consult Doctor", bg: "#FFF3E0", border: "#FFCC80", text: "#E65100", icon: "doctor" };
+  }
+  return { label: triageStr, bg: "#E3F2FD", border: "#90CAF9", text: "#1565C0", icon: "information" };
+};
+
+// Formatted medical text renderer supporting bold, italics, section headers, and bullet lists
+const FormattedMedicalText = ({ text, isBot, isEmergency, styles }) => {
+  if (!text) return null;
+  if (!isBot) {
+    return <Text style={styles.userText}>{text}</Text>;
+  }
+
+  const renderInlineFormatted = (rawLine, keyPrefix) => {
+    const parts = rawLine.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
+    return parts.map((part, i) => {
+      if (part.startsWith("**") && part.endsWith("**")) {
+        return (
+          <Text key={`${keyPrefix}-${i}`} style={styles.boldInlineText}>
+            {part.slice(2, -2)}
+          </Text>
+        );
+      }
+      if (part.startsWith("*") && part.endsWith("*")) {
+        return (
+          <Text key={`${keyPrefix}-${i}`} style={styles.italicInlineText}>
+            {part.slice(1, -1)}
+          </Text>
+        );
+      }
+      return <Text key={`${keyPrefix}-${i}`}>{part}</Text>;
+    });
+  };
+
+  const lines = text.split("\n");
+
+  return (
+    <View style={styles.formattedTextContainer}>
+      {lines.map((line, idx) => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          return <View key={idx} style={styles.paragraphSpacer} />;
+        }
+
+        // Section header (e.g. **Header:** or ## Header)
+        const headerMatch = trimmed.match(/^(\*\*([^*]+)\*\*|##\s*(.+)):?$/);
+        if (headerMatch) {
+          const headerTitle = (headerMatch[2] || headerMatch[3] || trimmed).replace(/:$/, "");
+          return (
+            <View key={idx} style={styles.sectionHeaderWrapper}>
+              <Text style={styles.sectionHeaderText}>{headerTitle}:</Text>
+            </View>
+          );
+        }
+
+        // Bullet point (e.g. • or - or *)
+        const bulletMatch = trimmed.match(/^[-*•]\s+(.*)$/);
+        if (bulletMatch) {
+          return (
+            <View key={idx} style={styles.bulletRow}>
+              <Text style={styles.bulletDot}>•</Text>
+              <Text style={[styles.messageText, styles.botText, isEmergency && styles.emergencyText, styles.bulletContent]}>
+                {renderInlineFormatted(bulletMatch[1], `b-${idx}`)}
+              </Text>
+            </View>
+          );
+        }
+
+        // Numbered list item (e.g. 1. or 1-)
+        const numberedMatch = trimmed.match(/^(\d+)[\.-]\s+(.*)$/);
+        if (numberedMatch) {
+          return (
+            <View key={idx} style={styles.bulletRow}>
+              <Text style={styles.numberPrefix}>{numberedMatch[1]}.</Text>
+              <Text style={[styles.messageText, styles.botText, isEmergency && styles.emergencyText, styles.bulletContent]}>
+                {renderInlineFormatted(numberedMatch[2], `n-${idx}`)}
+              </Text>
+            </View>
+          );
+        }
+
+        // Standard text paragraph
+        return (
+          <Text
+            key={idx}
+            style={[
+              styles.messageText,
+              styles.botText,
+              isEmergency && styles.emergencyText,
+              styles.paragraphLine,
+            ]}
+          >
+            {renderInlineFormatted(trimmed, `p-${idx}`)}
+          </Text>
+        );
+      })}
+    </View>
+  );
+};
+
 export default function ChatbotScreen() {
   const insets = useSafeAreaInsets();
   const [messages, setMessages] = useState([]);
@@ -127,16 +237,23 @@ const loadAllChatSessions = async (uid) => {
       const sorted = serverMessages.sort(
         (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
       );
-      const formatted = sorted.map((msg, index) => ({
-        id: msg.id || index,
-        text: msg.message_text,
-        isBot: msg.sender === "bot",
-        time: msg.timestamp
-          ? new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-          : "Recent",
-        condition: msg.possible_condition,
-        triage: msg.triage_level,
-      }));
+      const formatted = sorted.map((msg, index) => {
+        const meta = msg.metadata || {};
+        const sources = Array.isArray(meta.sources) ? meta.sources : [];
+        const rawTriage = msg.triage_level || meta.triage_level || (sources.length > 0 ? "Doctor" : null);
+        return {
+          id: msg.id || index,
+          text: meta.answer_body || msg.message_text,
+          isBot: msg.sender === "bot",
+          time: msg.timestamp
+            ? new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+            : "Recent",
+          condition: msg.possible_condition || meta.condition || null,
+          triage: rawTriage,
+          sources: sources,
+          disclaimer: meta.disclaimer || null,
+        };
+      });
       setMessages(formatted);
       // Loaded chat has real messages — not empty
       isCurrentSessionEmpty.current = false;
@@ -255,10 +372,10 @@ const handleSend = async () => {
     const botText = response.botMessage?.message_text || response.response || "I've received your message.";
     const botMeta = response.botMessage?.metadata || {};
     const botCondition = botMeta.condition || null;
-    const botTriage = botMeta.triage_level || null;
-    // Phase 2 structured fields — fall back gracefully for old messages
-    const botAnswerBody = botMeta.answer_body || botText;
     const botSources = Array.isArray(botMeta.sources) ? botMeta.sources : [];
+    // Resilient triage extraction: ensure medical answers with sources always get a triage badge
+    const botTriage = botMeta.triage_level || response.botMessage?.triage_level || (botSources.length > 0 ? "Doctor" : null);
+    const botAnswerBody = botMeta.answer_body || botText;
     const botDisclaimer = botMeta.disclaimer || null;
 
     const botMessage = createMessage(botAnswerBody, true, botCondition, botTriage, botSources, botDisclaimer);
@@ -440,14 +557,9 @@ const toggleHistory = () => {
                 const msgKey = message.id;
                 const sourcesOpen = !!expandedSources[msgKey];
                 const hasSources = message.isBot && Array.isArray(message.sources) && message.sources.length > 0;
-
-                // Triage badge config
-                const triageBadge = message.isBot && message.triage
-                  ? {
-                      Emergency: { bg: "#FFEBEE", border: "#EF9A9A", text: "#C62828", icon: "⚠️" },
-                      Doctor:    { bg: "#FFF3E0", border: "#FFCC80", text: "#E65100", icon: "👨‍⚕️" },
-                      "Self-Care": { bg: "#E8F5E9", border: "#A5D6A7", text: "#2E7D32", icon: "🏠" },
-                    }[message.triage] || null
+                // Resilient triage badge resolution
+                const triageBadge = message.isBot
+                  ? getTriageBadgeConfig(message.triage || (hasSources ? "Doctor" : null))
                   : null;
 
                 return (
@@ -462,23 +574,23 @@ const toggleHistory = () => {
                       message.triage === "Monitor" && styles.monitorBubble,
                     ]}>
 
-                      {/* ── Triage badge (always shown when triage is set) ── */}
+                      {/* ── Triage badge (prominently shown when triage is available) ── */}
                       {triageBadge && (
                         <View style={[styles.triageBadge, { backgroundColor: triageBadge.bg, borderColor: triageBadge.border }]}>
+                          <MaterialCommunityIcons name={triageBadge.icon} size={14} color={triageBadge.text} style={{ marginRight: 5 }} />
                           <Text style={[styles.triageBadgeText, { color: triageBadge.text }]}>
-                            {triageBadge.icon} {message.triage}
+                            {triageBadge.label}
                           </Text>
                         </View>
                       )}
 
-                      {/* ── Answer body ── */}
-                      <Text style={[
-                        styles.messageText,
-                        message.isBot ? styles.botText : styles.userText,
-                        message.triage === "Emergency" && styles.emergencyText,
-                      ]}>
-                        {message.text}
-                      </Text>
+                      {/* ── Formatted Answer body with bold, italic, and bullet points ── */}
+                      <FormattedMedicalText
+                        text={message.text}
+                        isBot={message.isBot}
+                        isEmergency={triageBadge?.label === "Emergency"}
+                        styles={styles}
+                      />
 
                       {/* ── Legacy condition tag (for history messages) ── */}
                       {message.condition && !triageBadge && (
@@ -490,7 +602,7 @@ const toggleHistory = () => {
                         </View>
                       )}
 
-                      {/* ── Collapsible Sources ── */}
+                      {/* ── Collapsible Sequenced Sources ── */}
                       {hasSources && (
                         <View style={styles.sourcesContainer}>
                           <TouchableOpacity
@@ -504,32 +616,41 @@ const toggleHistory = () => {
                             activeOpacity={0.7}
                           >
                             <MaterialCommunityIcons
-                              name={sourcesOpen ? "book-open-variant" : "book-outline"}
-                              size={13}
-                              color="#546E7A"
+                              name={sourcesOpen ? "book-open-page-variant" : "book-outline"}
+                              size={14}
+                              color="#0D47A1"
                             />
                             <Text style={styles.sourcesToggleText}>
-                              {sourcesOpen ? "Hide sources" : `Sources (${message.sources.length})`}
+                              {sourcesOpen ? "Hide Sources" : `Medical Sources (${message.sources.length})`}
                             </Text>
                             <MaterialCommunityIcons
                               name={sourcesOpen ? "chevron-up" : "chevron-down"}
-                              size={13}
+                              size={15}
                               color="#546E7A"
                             />
                           </TouchableOpacity>
                           {sourcesOpen && (
                             <View style={styles.sourcesList}>
-                              {message.sources.map((src, si) => (
-                                <View key={si} style={styles.sourceItem}>
-                                  <MaterialCommunityIcons name="file-document-outline" size={12} color="#0D47A1" />
-                                  <Text style={styles.sourceItemText}>
-                                    {src.title}
-                                    {src.pages && src.pages.length > 0
-                                      ? `  ·  pp. ${src.pages.join(", ")}`
-                                      : ""}
-                                  </Text>
-                                </View>
-                              ))}
+                              {message.sources.map((src, si) => {
+                                const seqNum = src.sequence || si + 1;
+                                const titleStr = src.title || `${seqNum}- ${src.clean_title || src.filename}`;
+                                const displayTitle = titleStr.match(/^\d+-\s*/) ? titleStr : `${seqNum}- ${titleStr}`;
+                                return (
+                                  <View key={si} style={styles.sourceItem}>
+                                    <MaterialCommunityIcons name="file-document-outline" size={14} color="#0D47A1" style={{ marginTop: 2 }} />
+                                    <View style={{ flex: 1 }}>
+                                      <Text style={styles.sourceItemTitle}>
+                                        {displayTitle}
+                                      </Text>
+                                      {src.pages && src.pages.length > 0 && (
+                                        <Text style={styles.sourceItemPages}>
+                                          Pages: {src.pages.join(", ")}
+                                        </Text>
+                                      )}
+                                    </View>
+                                  </View>
+                                );
+                              })}
                             </View>
                           )}
                         </View>
@@ -708,11 +829,24 @@ const styles = StyleSheet.create({
   triageBadge: {
     flexDirection: "row", alignItems: "center",
     alignSelf: "flex-start",
-    paddingHorizontal: 10, paddingVertical: 4,
-    borderRadius: 20, borderWidth: 1,
+    paddingHorizontal: 12, paddingVertical: 5,
+    borderRadius: 20, borderWidth: 1.5,
     marginBottom: 10,
   },
   triageBadgeText: { fontSize: 12, fontWeight: "700", letterSpacing: 0.3 },
+
+  // Markdown and formatted typography
+  formattedTextContainer: { width: "100%" },
+  paragraphSpacer: { height: 8 },
+  paragraphLine: { marginBottom: 5 },
+  sectionHeaderWrapper: { marginTop: 10, marginBottom: 5 },
+  sectionHeaderText: { fontSize: 15, fontWeight: "700", color: "#0F172A", letterSpacing: 0.2 },
+  bulletRow: { flexDirection: "row", alignItems: "flex-start", marginTop: 4, marginBottom: 4, paddingLeft: 2 },
+  bulletDot: { fontSize: 16, color: "#00BCD4", marginRight: 8, lineHeight: 22, fontWeight: "700" },
+  numberPrefix: { fontSize: 14, color: "#00BCD4", marginRight: 6, lineHeight: 22, fontWeight: "700" },
+  bulletContent: { flex: 1 },
+  boldInlineText: { fontWeight: "700", color: "#0F172A" },
+  italicInlineText: { fontStyle: "italic", color: "#475569" },
 
   // Phase 2: Collapsible Sources
   sourcesContainer: {
@@ -722,19 +856,24 @@ const styles = StyleSheet.create({
     borderTopColor: "rgba(0,0,0,0.08)",
   },
   sourcesToggle: {
-    flexDirection: "row", alignItems: "center", gap: 5,
+    flexDirection: "row", alignItems: "center", gap: 6,
+    paddingVertical: 4,
   },
   sourcesToggleText: {
-    fontSize: 12, color: "#546E7A", fontWeight: "600", flex: 1,
+    fontSize: 12, color: "#0D47A1", fontWeight: "700", flex: 1,
   },
   sourcesList: { marginTop: 8, gap: 6 },
   sourceItem: {
-    flexDirection: "row", alignItems: "flex-start", gap: 6,
+    flexDirection: "row", alignItems: "flex-start", gap: 8,
     backgroundColor: "rgba(13,71,161,0.05)",
     borderRadius: 8, padding: 8,
+    borderLeftWidth: 3, borderLeftColor: "#0D47A1",
   },
-  sourceItemText: {
-    fontSize: 12, color: "#1E293B", flex: 1, lineHeight: 17,
+  sourceItemTitle: {
+    fontSize: 12, fontWeight: "600", color: "#1E293B", lineHeight: 18,
+  },
+  sourceItemPages: {
+    fontSize: 11, color: "#64748B", marginTop: 2, fontWeight: "500",
   },
 
   // Phase 2: Disclaimer inside bubble
