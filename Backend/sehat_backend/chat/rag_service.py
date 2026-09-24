@@ -232,6 +232,7 @@ Is this a capabilities question?"""
         Step-back clarification checks patient_context first — never re-asks a fact
         already present there.
         Returns (needs_clarification: bool, follow_up_question: str).
+        """
         # [BUG1 FIX] Cheap pre-check: if patient_context already has medical facts
         # (symptoms, duration, condition), the LLM CANNOT legitimately ask for more
         # basic info on a follow-up like "Explain in Urdu" or "What should I take?".
