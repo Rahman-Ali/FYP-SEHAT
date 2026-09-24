@@ -192,37 +192,70 @@ Is this a capabilities question?"""
             logger.error("Capabilities detection error: %s", e)
             return False
 
-    def _needs_clarification(self, query: str, chat_history: list = None) -> tuple:
+    def _needs_clarification(
+        self, query: str, chat_history: list = None,
+        rolling_summary: str = None, patient_context: dict = None
+    ) -> tuple:
         """Check whether a query is too vague to produce a useful answer.
 
+        Step-back clarification checks patient_context first — never re-asks a fact
+        already present there.
         Returns (needs_clarification: bool, follow_up_question: str).
         """
+        # Format known patient context
+        known_facts_text = ""
+        if patient_context and isinstance(patient_context, dict):
+            fact_items = [f"{k}: {v}" for k, v in patient_context.items() if v]
+            if fact_items:
+                known_facts_text = "Known Patient Context:\n" + "\n".join(f"- {item}" for item in fact_items)
+
         history_text = ""
         if chat_history:
-            for msg in chat_history[-4:]:
+            for msg in chat_history[-16:]:
                 sender = "User" if msg.get("sender") == "user" else "Assistant"
                 text = msg.get("text", msg.get("message_text", ""))
                 if text.strip():
                     history_text += f"{sender}: {text}\n"
+
+        summary_text = ""
+        if rolling_summary and rolling_summary.strip():
+            summary_text = f"Rolling Summary of Earlier Turns:\n{rolling_summary.strip()}"
+
+        context_blocks = []
+        if known_facts_text:
+            context_blocks.append(known_facts_text)
+        if summary_text:
+            context_blocks.append(summary_text)
+        if history_text:
+            context_blocks.append(f"Recent Conversation:\n{history_text}")
+
+        full_context = "\n\n".join(context_blocks) if context_blocks else "No prior messages."
 
         prompt = f"""You are SEHAT AI's Clinical Triage Gatekeeper.
 
 Your task is to determine whether the user's medical query is specific enough to retrieve clinical guidelines, or if it is too vague and requires a "step-back" clarifying question.
 
 --- GUIDELINES ---
-A query is SUFFICIENT if it specifies:
-- At least ONE specific symptom, body part, or disease (e.g., "high fever", "loose motion", "dengue platelets", "burning urination", "headache for 3 days").
+1. CHECK KNOWN PATIENT CONTEXT FIRST:
+   - NEVER re-ask a fact (e.g., age, symptoms, duration, condition) that is ALREADY present in Known Patient Context or prior conversation.
+   - If the user query is a follow-up (e.g., "what medicine should I take?", "what to do?", "is it dangerous?") and the underlying condition or symptoms are ALREADY in Known Patient Context, the query is SUFFICIENT.
+   - If asking a clarifying question, ask ONLY for missing details not already known.
 
-A query NEEDS_CLARIFICATION if:
-- It only expresses general malaise, anxiety, or illness without symptoms (e.g., "I feel sick", "meri tabiyat kharab hai", "help me doctor", "mujhe kuch ho raha hai", "I don't feel good").
-- It asks what to take without stating the condition (e.g., "k konsi dawai loon", "what medicine should I take?").
+2. A query is SUFFICIENT if:
+   - It specifies at least ONE specific symptom, body part, or disease (e.g., "high fever", "loose motion", "dengue platelets", "burning urination", "headache for 3 days"), OR
+   - The Known Patient Context / Conversation Context already establishes the symptom or disease being addressed.
+
+3. A query NEEDS_CLARIFICATION if:
+   - It only expresses general malaise, anxiety, or illness without symptoms (e.g., "I feel sick", "meri tabiyat kharab hai", "help me doctor", "mujhe kuch ho raha hai", "I don't feel good"), AND no symptoms are known from context.
+   - It asks what to take without stating the condition AND no condition/symptom is present in Known Patient Context.
 
 --- EXAMPLES ---
-User: "I feel sick"
+User: "I feel sick" (No known symptoms in context)
 Classification: NEEDS_CLARIFICATION: Could you describe what specific symptoms you are experiencing (e.g., fever, pain, nausea) and where it hurts?
 
-User: "Meri tabiyat theek nahi hai"
-Classification: NEEDS_CLARIFICATION: Apni alamaat ke baare mein thoda wazahat se batayein (maslan bukhar, sar dard, ulti ya pait dard), aur yeh takleef kab se hai?
+Context: Known Patient Context: - symptoms: severe headache
+User: "What medicine should I take?"
+Classification: SUFFICIENT
 
 User: "I have high fever and vomiting for 2 days"
 Classification: SUFFICIENT
@@ -231,8 +264,8 @@ User: "Dengue ke alamaat kya hain?"
 Classification: SUFFICIENT
 
 --- TASK ---
-Conversation Context:
-{history_text if history_text else "No prior messages."}
+Conversation & Patient Context:
+{full_context}
 
 Current User Query: {query}
 
@@ -442,7 +475,8 @@ SUFFICIENT"""
     # ========================================================================
 
     def generate_with_context(
-        self, query: str, context_data: dict, chat_history: list = None
+        self, query: str, context_data: dict, chat_history: list = None,
+        rolling_summary: str = None, patient_context: dict = None
     ) -> dict:
         """Steps 5-6 of RAG pipeline with full response handling."""
 
@@ -731,7 +765,9 @@ Your response:"""
                 original_query,
                 retrieved_text,
                 language,
-                chat_history  
+                chat_history,
+                rolling_summary=rolling_summary,
+                patient_context=patient_context
             )
         except Exception as e:
             logger.error("Answer generation error: %s", e)

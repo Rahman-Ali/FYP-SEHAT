@@ -694,7 +694,8 @@ Your response:"""
 
     def generate_answer(
         self, original_query: str, retrieved_text: str,
-        language: str, chat_history: list = None
+        language: str, chat_history: list = None,
+        rolling_summary: str = None, patient_context: dict = None
     ) -> tuple[str, str]:
         """Generate answer with security, memory, and language handling."""
 
@@ -751,26 +752,30 @@ Your response:"""
                 "knowledge base. Please consult a doctor."
             )
 
-        # Format chat history with proper context
-        history_context = ""
+        # Build comprehensive memory block: rolling_summary + patient_context + last turns in full
+        memory_sections = []
+        if patient_context and isinstance(patient_context, dict):
+            fact_lines = [f"- {k}: {v}" for k, v in patient_context.items() if v]
+            if fact_lines:
+                memory_sections.append("KNOWN PATIENT FACTS:\n" + "\n".join(fact_lines))
+
+        if rolling_summary and rolling_summary.strip():
+            memory_sections.append(f"PRIOR CONVERSATION SUMMARY:\n{rolling_summary.strip()}")
+
         if chat_history and len(chat_history) > 0:
             history_parts = []
-            for msg in chat_history[-6:]:  # Last 6 messages
+            for msg in chat_history[-16:]:  # Last turns
                 sender = msg.get("sender", "user")
                 text = msg.get("text", msg.get("message_text", ""))
-                
                 if not text or not text.strip():
                     continue
-                
                 prefix = "User" if sender == "user" else "SEHAT"
                 history_parts.append(f"{prefix}: {text}")
-            
             if history_parts:
-                history_context = "Recent conversation:\n" + "\n".join(history_parts)
-                print(f"[MEMORY] History in prompt: {len(history_parts)} messages")
+                memory_sections.append("Recent conversation:\n" + "\n".join(history_parts))
 
-        # Precompute history block to avoid backslashes inside f-string expressions in Python <3.12
-        context_block = f"CONVERSATION CONTEXT:\n{history_context}\n\n" if history_context else ""
+        combined_memory = "\n\n".join(memory_sections)
+        context_block = f"CONVERSATION CONTEXT:\n{combined_memory}\n\n" if combined_memory else ""
 
         # ── Structured generation prompt (user-approved template) ────────────
         prompt = (

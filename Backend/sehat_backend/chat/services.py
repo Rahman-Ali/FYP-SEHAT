@@ -181,6 +181,10 @@ class ChatService:
             from .rag_service import RAGService
             self._rag_service = RAGService()
         return self._rag_service
+
+    @property
+    def llm_service(self):
+        return self.rag_service.llm_service
     
     def create_new_session(self, firebase_uid, title="New Chat"):
         return ChatSession.objects.create(
@@ -195,6 +199,34 @@ class ChatService:
         session = ChatSession.objects.get(id=session_id)
         messages = session.messages.all().order_by('timestamp')[offset:offset + limit]
         return messages
+
+    def trigger_rolling_summarization_if_needed(self, session, turns=None) -> bool:
+        """
+        FULL_TURN_WINDOW = 8 turn-pairs kept in full.
+        When total turns exceed summarized_up_to_turn + FULL_TURN_WINDOW:
+        call Groq once with (existing rolling_summary + newly-overflowing turns)
+        to produce an updated summary — merge, don't restart from scratch.
+        Update summarized_up_to_turn.
+        Does NOT run on every request, only when newly exceeded.
+        """
+        if turns is None:
+            prior_messages = list(
+                Message.objects.filter(session=session).order_by('sequence_number', 'timestamp')
+            )
+            turns = extract_turn_pairs(prior_messages)
+
+        total_turns = len(turns)
+        if total_turns > session.summarized_up_to_turn + FULL_TURN_WINDOW:
+            overflow_end = total_turns - FULL_TURN_WINDOW
+            overflow_turns = turns[session.summarized_up_to_turn:overflow_end]
+            if overflow_turns:
+                session.rolling_summary = self.llm_service.summarize_turns_with_groq(
+                    session.rolling_summary, overflow_turns
+                )
+                session.summarized_up_to_turn = overflow_end
+                session.save(update_fields=['rolling_summary', 'summarized_up_to_turn', 'updated_at'])
+                return True
+        return False
     
     # backend/chat/services.py
 
@@ -208,16 +240,16 @@ class ChatService:
             Message.objects.filter(session=session).order_by('sequence_number', 'timestamp')
         )
         turns = extract_turn_pairs(prior_messages)
-        
-        authoritative_history = []
-        for msg in prior_messages:
-            authoritative_history.append({
-                "sender": msg.sender,
-                "text": msg.message_text
-            })
-        
-        formatted_history = authoritative_history[-16:] if authoritative_history else []
         logger.info("[MEMORY] Backend-authoritative history: %d prior messages (%d turns)", len(prior_messages), len(turns))
+
+        # [MEMORY] Phase 4: Rolling summarization (Groq, rare trigger on window overflow)
+        self.trigger_rolling_summarization_if_needed(session, turns)
+
+        # [MEMORY] Phase 5: Last FULL_TURN_WINDOW turns kept in full
+        recent_turns = turns[-FULL_TURN_WINDOW:] if turns else []
+        recent_history = []
+        for turn in recent_turns:
+            recent_history.extend(turn["messages"])
         
         user_msg = Message.objects.create(
             session=session,
@@ -227,7 +259,7 @@ class ChatService:
         
         clarification_round = (session.session_metadata or {}).get("clarification_round", 0)
         context = self.rag_service.retrieve_context(
-            query, formatted_history,
+            query, recent_history,
             clarification_round=clarification_round,
             rolling_summary=session.rolling_summary,
             patient_context=session.patient_context
@@ -240,7 +272,13 @@ class ChatService:
             if changed:
                 session.patient_context = updated_ctx
                 session.save(update_fields=['patient_context', 'updated_at'])
-        response = self.rag_service.generate_with_context(query, context, formatted_history)
+
+        # Phase 5: Wire rolling_summary and patient_context into final generation
+        response = self.rag_service.generate_with_context(
+            query, context, recent_history,
+            rolling_summary=session.rolling_summary,
+            patient_context=session.patient_context
+        )
 
         if context.get("status") == "clarifying":
             if not isinstance(session.session_metadata, dict):
