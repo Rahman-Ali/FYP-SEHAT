@@ -81,6 +81,55 @@ def get_chat_service():
     return _chat_service_instance
 
 
+FULL_TURN_WINDOW = 8
+
+
+def extract_turn_pairs(messages):
+    """
+    Groups an ordered sequence of Message objects or dicts into turn-pairs.
+    Each turn is:
+    {
+        "turn_index": int,
+        "user": str,
+        "bot": str,
+        "messages": list of dicts [{'sender': ..., 'text': ...}]
+    }
+    """
+    turns = []
+    current_turn = None
+    for msg in messages:
+        sender = msg.sender if hasattr(msg, 'sender') else msg.get('sender', 'user')
+        text = msg.message_text if hasattr(msg, 'message_text') else msg.get('text', msg.get('message_text', ''))
+        
+        if sender == 'user':
+            if current_turn is not None:
+                turns.append(current_turn)
+            current_turn = {
+                "turn_index": len(turns) + 1,
+                "user": text,
+                "bot": "",
+                "messages": [{"sender": "user", "text": text}]
+            }
+        elif sender == 'bot':
+            if current_turn is None:
+                current_turn = {
+                    "turn_index": len(turns) + 1,
+                    "user": "",
+                    "bot": text,
+                    "messages": [{"sender": "bot", "text": text}]
+                }
+            else:
+                current_turn["bot"] = text
+                current_turn["messages"].append({"sender": "bot", "text": text})
+            turns.append(current_turn)
+            current_turn = None
+            
+    if current_turn is not None:
+        turns.append(current_turn)
+        
+    return turns
+
+
 class ChatService:
     """Business logic for chat operations."""
     
@@ -111,39 +160,31 @@ class ChatService:
     # backend/chat/services.py
 
     def process_user_query(self, session_id, query, chat_history=None):
-        """Process user query through RAG pipeline with memory support."""
+        """Process user query through RAG pipeline with backend-authoritative memory."""
         session = ChatSession.objects.get(id=session_id)
+        
+        # [MEMORY] Phase 2: Backend is authoritative source of truth.
+        # Ignore client-supplied chat_history; fetch full ordered messages from Postgres for this session.
+        prior_messages = list(
+            Message.objects.filter(session=session).order_by('sequence_number', 'timestamp')
+        )
+        turns = extract_turn_pairs(prior_messages)
+        
+        authoritative_history = []
+        for msg in prior_messages:
+            authoritative_history.append({
+                "sender": msg.sender,
+                "text": msg.message_text
+            })
+        
+        formatted_history = authoritative_history[-16:] if authoritative_history else []
+        logger.info("[MEMORY] Backend-authoritative history: %d prior messages (%d turns)", len(prior_messages), len(turns))
         
         user_msg = Message.objects.create(
             session=session,
             sender='user',
             message_text=query
         )
-        
-        # [MEMORY] Use frontend history if provided, else fetch from DB
-        if not chat_history:
-            previous_messages = Message.objects.filter(
-                session=session
-            ).order_by('-timestamp')[:10]
-            
-            chat_history = []
-            for msg in reversed(list(previous_messages)):
-                chat_history.append({
-                    "sender": msg.sender,
-                    "text": msg.message_text
-                })
-        
-        # Ensure correct format
-        formatted_history = []
-        for msg in (chat_history or [])[-6:]:
-            formatted_history.append({
-                "sender": msg.get("sender", "user"),
-                "text": msg.get("text", msg.get("message_text", ""))
-            })
-        
-        print(f"[MEMORY] History messages: {len(formatted_history)}")
-        for i, msg in enumerate(formatted_history):
-            print(f"[MEMORY]   [{i}] {msg['sender']}: {msg['text'][:50]}...")
         
         clarification_round = (session.session_metadata or {}).get("clarification_round", 0)
         context = self.rag_service.retrieve_context(
