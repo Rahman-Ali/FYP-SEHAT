@@ -829,8 +829,42 @@ Your response:"""
                     )
                     return no_info_msg, model_name
 
-            # [NEW] Urdu purity check for Roman Urdu responses
+            # [BUG2 FIX] Urdu purity check for Roman Urdu responses
+            # Step 1 (HARD GATE): Detect native Arabic-script Urdu (Unicode \u0600-\u06FF).
+            # This MUST run first — a native-script answer has 0 English indicators, so the
+            # old count-based check never fired. Regex is cheap, no LLM call.
             if language == "roman_urdu":
+                arabic_script_count = sum(
+                    1 for ch in answer if '\u0600' <= ch <= '\u06FF'
+                )
+                if arabic_script_count > 3:
+                    logger.warning(
+                        "[BUG2] Native Arabic-script Urdu detected (%d chars, U+0600-U+06FF) — "
+                        "forcing Roman Urdu re-generation.",
+                        arabic_script_count
+                    )
+                    retry_prompt = (
+                        "You are a translator. The following text contains Urdu written in Arabic script.\n"
+                        "Convert it COMPLETELY to Roman Urdu (Urdu written using ONLY Latin/English alphabet letters).\n"
+                        "Rules:\n"
+                        "- Use ONLY Latin letters (a-z). ZERO Arabic/Urdu script characters.\n"
+                        "- Write ALL Urdu words phonetically in English letters.\n"
+                        "- Do NOT switch to English sentences — write in Roman Urdu throughout.\n\n"
+                        f"Text to convert:\n{answer}\n\n"
+                        "Roman Urdu version:"
+                    )
+                    try:
+                        retry_answer, retry_model = self._call_generation_llm(retry_prompt)
+                        if retry_answer and len(retry_answer) > 20:
+                            answer = retry_answer.strip()
+                            model_name = retry_model
+                            urdu_disclaimer = "Ye kisi professional doctor ki salah ka mutbadil nahi hai."
+                            if urdu_disclaimer not in answer:
+                                answer = answer + "\n\n" + urdu_disclaimer
+                    except Exception as e:
+                        logger.error("[BUG2] Arabic-script retry failed: %s", e)
+
+                # Step 2: English-language leakage check (original logic, unchanged)
                 english_indicators = [
                     " the ", " is ", " are ", " was ", " were ", " have ", " has ",
                     " this ", " that ", " with ", " from ", " they ", " them ",
@@ -840,7 +874,7 @@ Your response:"""
                 ]
                 answer_lower = " " + answer.lower() + " "
                 english_count = sum(1 for w in english_indicators if w in answer_lower)
-                
+
                 if english_count > 3:
                     logger.warning(
                         "Urdu purity check failed: %d English indicators found", english_count

@@ -192,6 +192,37 @@ Is this a capabilities question?"""
             logger.error("Capabilities detection error: %s", e)
             return False
 
+    def _is_meta_history_query(self, query: str) -> bool:
+        """Cheap regex check: returns True when the user is asking about their
+        own conversation history (e.g. 'what did I ask first/last?').
+        No LLM call — pure pattern match.
+        """
+        import re as _re
+        patterns = [
+            # "what did I ask first/last?"
+            r"\bwhat\s+did\s+i\s+(ask|say|send|type|write)\b",
+            # "what was my first/last question?"
+            r"\bwhat\s+was\s+(my|the)\s+(first|last|previous|earlier)\b",
+            # "first/last question I asked"
+            r"\b(first|last|previous|earlier)\s+(question|query|message|thing)\s+i\s+(asked|said|sent|typed)\b",
+            # "what have I asked/said"
+            r"\bwhat\s+have\s+i\s+(asked|said|mentioned)\b",
+            # Urdu Roman patterns
+            r"\b(pehle|pahle|pehli|pehla)\s+sawaal\b",
+            r"\bmain\s+ne\s+pehle\s+kya\s+(pucha|kaha|likha)\b",
+            r"\bkya\s+(pucha|likha|kaha)\s+tha\s+(main\s+ne|maine|mene)\b",
+            r"\b(mera|meri|mere)\s+(pehla|pehli|pehle|aakhri|akhri)\s+sawaal\b",
+            r"\bconversation\s+history\b",
+            r"\bwhat\s+topics?\s+(did|have)\s+i\b",
+            # generic: "my first question"
+            r"\bmy\s+(first|last)\s+(question|message|query)\b",
+        ]
+        q_lower = query.lower().strip()
+        for pat in patterns:
+            if _re.search(pat, q_lower):
+                return True
+        return False
+
     def _needs_clarification(
         self, query: str, chat_history: list = None,
         rolling_summary: str = None, patient_context: dict = None
@@ -201,7 +232,20 @@ Is this a capabilities question?"""
         Step-back clarification checks patient_context first — never re-asks a fact
         already present there.
         Returns (needs_clarification: bool, follow_up_question: str).
-        """
+        # [BUG1 FIX] Cheap pre-check: if patient_context already has medical facts
+        # (symptoms, duration, condition), the LLM CANNOT legitimately ask for more
+        # basic info on a follow-up like "Explain in Urdu" or "What should I take?".
+        # Return SUFFICIENT immediately — no LLM call needed.
+        KEY_MEDICAL_FACTS = {"symptoms", "duration", "condition", "disease", "diagnosis"}
+        if patient_context and isinstance(patient_context, dict):
+            has_key_facts = bool(KEY_MEDICAL_FACTS & {k.lower() for k in patient_context.keys()})
+            if has_key_facts:
+                logger.info(
+                    "[BUG1] _needs_clarification: patient_context has key medical facts %s — "
+                    "returning SUFFICIENT without LLM call.",
+                    {k for k in patient_context.keys() if k.lower() in KEY_MEDICAL_FACTS}
+                )
+                return False, ""
         # Format known patient context
         known_facts_text = ""
         if patient_context and isinstance(patient_context, dict):
@@ -336,17 +380,79 @@ SUFFICIENT"""
         if status in ("invalid", "unclear", "greeting"):
             return base_response
 
-        if not self.vector_service.is_ready:
-            logger.warning("Vector store not ready")
-            return base_response
-
         if language == "invalid_hindi":
             base_response["status"] = "invalid_hindi"
             base_response["language"] = language
             return base_response
 
+        # ── [BUG1 FIX] Meta-history intercept ───────────────────────────────
+        # MUST be before capabilities-query short-circuit (capabilities detector
+        # fires on short queries like "what did I ask first?") and before the
+        # vector-store-not-ready early exit (meta-query doesn't need the VS).
+        if self._is_meta_history_query(query):
+            user_turns = [
+                m for m in (chat_history or []) if m.get("sender") == "user"
+            ]
+            if user_turns:
+                first_q = user_turns[0].get("text", user_turns[0].get("message_text", ""))
+                last_q = user_turns[-1].get("text", user_turns[-1].get("message_text", ""))
+                q_lower = query.lower()
+                if "first" in q_lower or "pehle" in q_lower or "pahle" in q_lower:
+                    meta_answer = (
+                        f"Your first question in this conversation was: \"{first_q}\""
+                    )
+                elif "last" in q_lower or "aakhri" in q_lower or "akhri" in q_lower:
+                    meta_answer = (
+                        f"Your most recent question (before this one) was: \"{last_q}\""
+                    )
+                else:
+                    questions_list = "\n".join(
+                        f"{i+1}. {m.get('text', m.get('message_text',''))}"
+                        for i, m in enumerate(user_turns)
+                    )
+                    meta_answer = (
+                        f"Here are the questions you have asked in this conversation:\n"
+                        f"{questions_list}"
+                    )
+            else:
+                meta_answer = (
+                    "I don't have access to any previous questions in this conversation yet."
+                )
+            logger.info("[BUG1] Meta-history query intercepted — answering from real DB history.")
+            base_response.update({
+                "status": "meta_history",
+                "meta_answer": meta_answer,
+                "extracted_facts": {},
+                "new_facts": {}
+            })
+            return base_response
+
+        # ── [BUG3 FIX] Run fact extraction BEFORE vector store check ────────
+        # rewrite_query is an LLM call that: (a) rewrites query, (b) extracts new
+        # patient facts. It does NOT need the vector store. Previously this ran
+        # AFTER the vector-not-ready early-exit, so patient_context was NEVER
+        # populated during the warmup window. Moved here so facts are always saved.
+        # Also now runs before clarification gate so facts stated in clarifying
+        # replies accumulate (fixes the "second clarifying question" sub-bug).
+        rewritten_query = query
+        extracted_facts = {}
+        if status == "valid":
+            rewritten_result = self.llm_service.rewrite_query(
+                query, chat_history, patient_context=patient_context
+            )
+            if isinstance(rewritten_result, tuple):
+                rewritten_query, extracted_facts = rewritten_result
+            else:
+                rewritten_query = rewritten_result
+        logger.info(
+            "[BUG3] Fact extraction completed before vector-store check: %s",
+            extracted_facts
+        )
+        base_response["extracted_facts"] = extracted_facts
+        base_response["new_facts"] = extracted_facts
+
         # ── Phase 3: Clarification gate ──────────────────────────────────────
-        # Evaluates raw query before rewrite. Hard cap on round 5 forces retrieval.
+        # Hard cap on round 5 forces retrieval regardless of vagueness.
         if status == "valid" and clarification_round < 5:
             needs_clarify, follow_up = self._needs_clarification(
                 query, chat_history,
@@ -365,21 +471,15 @@ SUFFICIENT"""
                     "english_query": query,
                     "original_query": query,
                     "follow_up_question": follow_up,
-                    "extracted_facts": {},
-                    "new_facts": {}
+                    # extracted_facts are preserved so process_user_query can
+                    # persist facts stated in THIS clarifying turn.
+                    "extracted_facts": extracted_facts,
+                    "new_facts": extracted_facts
                 }
 
-        # Merged query rewriting and patient fact extraction (Phase 3: single LLM call)
-        rewritten_query = query
-        extracted_facts = {}
-        if status == "valid":
-            rewritten_result = self.llm_service.rewrite_query(
-                query, chat_history, patient_context=patient_context
-            )
-            if isinstance(rewritten_result, tuple):
-                rewritten_query, extracted_facts = rewritten_result
-            else:
-                rewritten_query = rewritten_result
+        if not self.vector_service.is_ready:
+            logger.warning("Vector store not ready")
+            return base_response
 
         english_query = self.llm_service.translate_to_english(rewritten_query, language)
         chunks = self.vector_service.hybrid_search(english_query)
@@ -393,6 +493,9 @@ SUFFICIENT"""
         })
 
         return base_response
+
+
+
     # ========================================================================
     # CITATION BUILDER
     # ========================================================================
@@ -552,6 +655,25 @@ SUFFICIENT"""
                     "disclaimer": "",
                 }
             }
+
+        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0b: META_HISTORY — answer from real DB history (Bug 1 fix)
+        # ══════════════════════════════════════════════════════════════
+        if st == "meta_history":
+            meta_answer = context_data.get("meta_answer", "I can't retrieve that from our conversation history.")
+            return {
+                "response": meta_answer,
+                "metadata": {
+                    "source": "Meta-History (DB)",
+                    "language": language,
+                    "ragas_metrics": {},
+                    "triage_level": None,
+                    "answer_body": meta_answer,
+                    "sources": [],
+                    "disclaimer": "",
+                }
+            }
+
 
         # ══════════════════════════════════════════════════════════════
         # BRANCH 1: EMERGENCY
