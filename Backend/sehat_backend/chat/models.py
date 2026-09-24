@@ -9,6 +9,9 @@ class ChatSession(models.Model):
     firebase_uid = models.CharField(max_length=255, db_index=True)
     title = models.CharField(max_length=255, blank=True, null=True)
     session_metadata = models.JSONField(default=dict, blank=True)  # e.g. clarification_round
+    rolling_summary = models.TextField(null=True, blank=True)
+    patient_context = models.JSONField(default=dict, blank=True)
+    summarized_up_to_turn = models.IntegerField(default=0)
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
     
