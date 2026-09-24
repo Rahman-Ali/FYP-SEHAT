@@ -413,7 +413,7 @@ class ContextualMemoryTests(TestCase):
         """
         Verify rolling summarization trigger:
         - <= 8 turns: 0 summarization calls
-        - 9 turns: triggers once, summarizes turn 1 using Groq (llama-3.1-8b-instant)
+        - 9 turns: triggers once, summarizes turn 1 using Groq (openai/gpt-oss-20b)
         - 10 turns: triggers once, updates existing summary
         - 15 turns test conversation verifies updates not resets
         """
@@ -540,4 +540,142 @@ class ContextualMemoryTests(TestCase):
         self.assertIsNone(self.session.rolling_summary)
         self.assertEqual(self.session.patient_context, {})
         self.assertEqual(self.session.summarized_up_to_turn, 0)
+
+
+class GeneralConversationalReasoningTests(unittest.TestCase):
+    """Verify general conversational reasoning for new variations without hardcoded phrase matching."""
+
+    def setUp(self):
+        from chat.rag_service import RAGService
+        from chat.llm_service import LLMService, DOCTOR_INTAKE_INSTRUCTION
+        self.rag = RAGService.__new__(RAGService)
+        self.rag.llm_service = LLMService(use_openai=False)
+        self.rag.vector_service = MagicMock()
+        self.rag.vector_service.is_ready = True
+        self.rag.vector_service.hybrid_search = MagicMock(return_value=[])
+
+    def test_doctor_intake_framing_reused(self):
+        """Verify DOCTOR_INTAKE_INSTRUCTION is defined and framed as a doctor intake."""
+        from chat.llm_service import DOCTOR_INTAKE_INSTRUCTION
+        self.assertIn("You are conducting a medical intake like a doctor", DOCTOR_INTAKE_INSTRUCTION)
+        self.assertIn("patient_context already gathered", DOCTOR_INTAKE_INSTRUCTION)
+        self.assertIn("5 clarification rounds", DOCTOR_INTAKE_INSTRUCTION)
+
+    def test_new_phrasing_kal_se_bukhar_hai(self):
+        """Test 'kal se bukhar hai' (new symptom, Roman Urdu) triggers clarification for missing details."""
+        mock_classification = {
+            "intent": "new_symptom_info",
+            "rewritten_query": "Mujhe kal se bukhar hai, iske liye kya karna chahiye?",
+            "new_facts": {"symptoms": ["bukhar"], "duration": "kal se"},
+            "missing_for_diagnosis": ["severity", "associated_symptoms"],
+            "follow_up_question": "Bukhar kitna tez hai aur kya sar dard ya thand lag rahi hai?",
+            "target_language": "roman_urdu"
+        }
+        with patch.object(self.rag.llm_service, "classify_and_rewrite_query", return_value=mock_classification), \
+             patch.object(self.rag.llm_service, "sanitize_input", return_value={"is_emergency": False}), \
+             patch.object(self.rag.llm_service, "validate_query", return_value="valid"), \
+             patch.object(self.rag.llm_service, "detect_language", return_value="roman_urdu"):
+            res = self.rag.retrieve_context("kal se bukhar hai", chat_history=[], clarification_round=0)
+            self.assertEqual(res["status"], "clarifying")
+            self.assertIn("Bukhar kitna tez hai", res["follow_up_question"])
+            self.assertEqual(res["extracted_facts"]["duration"], "kal se")
+
+    def test_new_phrasing_did_you_forget_what_i_told_you(self):
+        """Test 'did you forget what I told you' (meta, new phrasing) answers from real DB history without fabrication."""
+        mock_classification = {
+            "intent": "meta_query",
+            "rewritten_query": "did you forget what I told you",
+            "new_facts": {},
+            "missing_for_diagnosis": [],
+            "follow_up_question": "",
+            "target_language": "english"
+        }
+        chat_history = [
+            {"sender": "user", "text": "I have a cough and mild fever."},
+            {"sender": "bot", "text": "How long have you had the fever?"},
+        ]
+        patient_context = {"symptoms": "cough and mild fever"}
+        with patch.object(self.rag.llm_service, "classify_and_rewrite_query", return_value=mock_classification), \
+             patch.object(self.rag.llm_service, "sanitize_input", return_value={"is_emergency": False}), \
+             patch.object(self.rag.llm_service, "validate_query", return_value="valid"), \
+             patch.object(self.rag.llm_service, "detect_language", return_value="english"):
+            res = self.rag.retrieve_context("did you forget what I told you", chat_history=chat_history, patient_context=patient_context)
+            self.assertEqual(res["status"], "meta_history")
+            self.assertIn("cough and mild fever", res["meta_answer"])
+            self.assertIn("remember", res["meta_answer"].lower())
+
+            # Verify generate_with_context returns DB source
+            ans = self.rag.generate_with_context("did you forget what I told you", res, chat_history)
+            self.assertEqual(ans["metadata"]["source"], "Meta-History (DB)")
+
+    def test_new_phrasing_say_that_in_urdu(self):
+        """Test 'say that in Urdu' (translation, new phrasing) routes to translation and re-renders last bot message."""
+        mock_classification = {
+            "intent": "translation_request",
+            "rewritten_query": "say that in Urdu",
+            "new_facts": {},
+            "missing_for_diagnosis": [],
+            "follow_up_question": "",
+            "target_language": "roman_urdu"
+        }
+        chat_history = [
+            {"sender": "user", "text": "What to do for cough?"},
+            {"sender": "bot", "text": "Stay hydrated and drink warm liquids."},
+        ]
+        with patch.object(self.rag.llm_service, "classify_and_rewrite_query", return_value=mock_classification), \
+             patch.object(self.rag.llm_service, "sanitize_input", return_value={"is_emergency": False}), \
+             patch.object(self.rag.llm_service, "validate_query", return_value="valid"), \
+             patch.object(self.rag.llm_service, "detect_language", return_value="english"):
+            res = self.rag.retrieve_context("say that in Urdu", chat_history=chat_history)
+            self.assertEqual(res["status"], "translation_request")
+            self.assertEqual(res["target_language"], "roman_urdu")
+
+            # Verify generate_with_context translates with Roman Urdu Latin letters
+            with patch.object(self.rag.llm_service, "translate_response", return_value="Paani ziyada piyein aur garam mashroobat istemal karein."):
+                ans = self.rag.generate_with_context("say that in Urdu", res, chat_history)
+                self.assertEqual(ans["metadata"]["source"], "Translation")
+                self.assertIn("Paani ziyada piyein", ans["response"])
+
+    def test_new_phrasing_rash_spreading_intake(self):
+        """Test 'I have a rash and it's spreading' extracts facts and triggers intake follow-up."""
+        mock_classification = {
+            "intent": "new_symptom_info",
+            "rewritten_query": "What should I do for a spreading skin rash?",
+            "new_facts": {"symptoms": ["rash"], "severity": "spreading"},
+            "missing_for_diagnosis": ["duration", "location", "itching"],
+            "follow_up_question": "Where is the rash located, how long has it been present, and is it itchy?",
+            "target_language": "english"
+        }
+        with patch.object(self.rag.llm_service, "classify_and_rewrite_query", return_value=mock_classification), \
+             patch.object(self.rag.llm_service, "sanitize_input", return_value={"is_emergency": False}), \
+             patch.object(self.rag.llm_service, "validate_query", return_value="valid"), \
+             patch.object(self.rag.llm_service, "detect_language", return_value="english"):
+            res = self.rag.retrieve_context("I have a rash and it's spreading", chat_history=[], clarification_round=0)
+            self.assertEqual(res["status"], "clarifying")
+            self.assertIn("Where is the rash located", res["follow_up_question"])
+            self.assertEqual(res["extracted_facts"]["severity"], "spreading")
+
+    def test_clarification_round_caps_at_5_with_intake(self):
+        """Verify that at clarification_round == 5, retrieval proceeds even if missing_for_diagnosis is non-empty."""
+        mock_classification = {
+            "intent": "new_symptom_info",
+            "rewritten_query": "General advice for unresolved symptoms",
+            "new_facts": {},
+            "missing_for_diagnosis": ["duration"],
+            "follow_up_question": "How long have you had this?",
+            "target_language": "english"
+        }
+        dummy_chunk = Document(page_content="Medical info for cough", metadata={"source_file": "doc.pdf"})
+        self.rag.vector_service.hybrid_search = MagicMock(return_value=[dummy_chunk])
+
+        with patch.object(self.rag.llm_service, "classify_and_rewrite_query", return_value=mock_classification), \
+             patch.object(self.rag.llm_service, "sanitize_input", return_value={"is_emergency": False}), \
+             patch.object(self.rag.llm_service, "validate_query", return_value="valid"), \
+             patch.object(self.rag.llm_service, "detect_language", return_value="english"), \
+             patch.object(self.rag.llm_service, "translate_to_english", return_value="Medical query"):
+            # Round 5: hard cap must bypass clarification
+            res = self.rag.retrieve_context("Still feeling unwell", chat_history=[], clarification_round=5)
+            self.assertEqual(res["status"], "valid")
+            self.assertEqual(len(res["chunks"]), 1)
+
 

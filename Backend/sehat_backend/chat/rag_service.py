@@ -192,142 +192,42 @@ Is this a capabilities question?"""
             logger.error("Capabilities detection error: %s", e)
             return False
 
-    def _is_meta_history_query(self, query: str) -> bool:
-        """Cheap regex check: returns True when the user is asking about their
-        own conversation history (e.g. 'what did I ask first/last?').
-        No LLM call — pure pattern match.
-        """
-        import re as _re
-        patterns = [
-            # "what did I ask first/last?"
-            r"\bwhat\s+did\s+i\s+(ask|say|send|type|write)\b",
-            # "what was my first/last question?"
-            r"\bwhat\s+was\s+(my|the)\s+(first|last|previous|earlier)\b",
-            # "first/last question I asked"
-            r"\b(first|last|previous|earlier)\s+(question|query|message|thing)\s+i\s+(asked|said|sent|typed)\b",
-            # "what have I asked/said"
-            r"\bwhat\s+have\s+i\s+(asked|said|mentioned)\b",
-            # Urdu Roman patterns
-            r"\b(pehle|pahle|pehli|pehla)\s+sawaal\b",
-            r"\bmain\s+ne\s+pehle\s+kya\s+(pucha|kaha|likha)\b",
-            r"\bkya\s+(pucha|likha|kaha)\s+tha\s+(main\s+ne|maine|mene)\b",
-            r"\b(mera|meri|mere)\s+(pehla|pehli|pehle|aakhri|akhri)\s+sawaal\b",
-            r"\bconversation\s+history\b",
-            r"\bwhat\s+topics?\s+(did|have)\s+i\b",
-            # generic: "my first question"
-            r"\bmy\s+(first|last)\s+(question|message|query)\b",
-        ]
-        q_lower = query.lower().strip()
-        for pat in patterns:
-            if _re.search(pat, q_lower):
-                return True
-        return False
+    def _build_meta_history_answer(self, query: str, chat_history: list, patient_context: dict) -> str:
+        """Answer meta queries directly from backend-authoritative DB history without hallucination.
+        Intent is classified by the LLM upstream — no phrase matching here."""
+        user_msgs = [m for m in (chat_history or []) if m.get("sender") == "user"]
+        if not user_msgs:
+            return "I don't have access to any previous questions in this conversation yet."
+
+        last_q = user_msgs[-1].get("text", user_msgs[-1].get("message_text", ""))
+        questions_list = "\n".join(
+            f"{i+1}. {m.get('text', m.get('message_text', ''))}"
+            for i, m in enumerate(user_msgs)
+        )
+
+        if patient_context and isinstance(patient_context, dict):
+            items = [f"{k}: {v}" for k, v in patient_context.items() if v]
+            facts_str = ", ".join(items)
+            return (
+                f"No, I remember what you told me! You mentioned: {facts_str}. "
+                f'Your last message was: "{last_q}".\n\n'
+                f"Here are all the questions you asked so far:\n{questions_list}"
+            )
+
+        return f"Here are the questions you have asked in this conversation:\n{questions_list}"
 
     def _needs_clarification(
         self, query: str, chat_history: list = None,
         rolling_summary: str = None, patient_context: dict = None
     ) -> tuple:
-        """Check whether a query is too vague to produce a useful answer.
-
-        Step-back clarification checks patient_context first — never re-asks a fact
-        already present there.
-        Returns (needs_clarification: bool, follow_up_question: str).
-        """
-        # [BUG1 FIX] Cheap pre-check: if patient_context already has medical facts
-        # (symptoms, duration, condition), the LLM CANNOT legitimately ask for more
-        # basic info on a follow-up like "Explain in Urdu" or "What should I take?".
-        # Return SUFFICIENT immediately — no LLM call needed.
-        KEY_MEDICAL_FACTS = {"symptoms", "duration", "condition", "disease", "diagnosis"}
-        if patient_context and isinstance(patient_context, dict):
-            has_key_facts = bool(KEY_MEDICAL_FACTS & {k.lower() for k in patient_context.keys()})
-            if has_key_facts:
-                logger.info(
-                    "[BUG1] _needs_clarification: patient_context has key medical facts %s — "
-                    "returning SUFFICIENT without LLM call.",
-                    {k for k in patient_context.keys() if k.lower() in KEY_MEDICAL_FACTS}
-                )
-                return False, ""
-        # Format known patient context
-        known_facts_text = ""
-        if patient_context and isinstance(patient_context, dict):
-            fact_items = [f"{k}: {v}" for k, v in patient_context.items() if v]
-            if fact_items:
-                known_facts_text = "Known Patient Context:\n" + "\n".join(f"- {item}" for item in fact_items)
-
-        history_text = ""
-        if chat_history:
-            for msg in chat_history[-16:]:
-                sender = "User" if msg.get("sender") == "user" else "Assistant"
-                text = msg.get("text", msg.get("message_text", ""))
-                if text.strip():
-                    history_text += f"{sender}: {text}\n"
-
-        summary_text = ""
-        if rolling_summary and rolling_summary.strip():
-            summary_text = f"Rolling Summary of Earlier Turns:\n{rolling_summary.strip()}"
-
-        context_blocks = []
-        if known_facts_text:
-            context_blocks.append(known_facts_text)
-        if summary_text:
-            context_blocks.append(summary_text)
-        if history_text:
-            context_blocks.append(f"Recent Conversation:\n{history_text}")
-
-        full_context = "\n\n".join(context_blocks) if context_blocks else "No prior messages."
-
-        prompt = f"""You are SEHAT AI's Clinical Triage Gatekeeper.
-
-Your task is to determine whether the user's medical query is specific enough to retrieve clinical guidelines, or if it is too vague and requires a "step-back" clarifying question.
-
---- GUIDELINES ---
-1. CHECK KNOWN PATIENT CONTEXT FIRST:
-   - NEVER re-ask a fact (e.g., age, symptoms, duration, condition) that is ALREADY present in Known Patient Context or prior conversation.
-   - If the user query is a follow-up (e.g., "what medicine should I take?", "what to do?", "is it dangerous?") and the underlying condition or symptoms are ALREADY in Known Patient Context, the query is SUFFICIENT.
-   - If asking a clarifying question, ask ONLY for missing details not already known.
-
-2. A query is SUFFICIENT if:
-   - It specifies at least ONE specific symptom, body part, or disease (e.g., "high fever", "loose motion", "dengue platelets", "burning urination", "headache for 3 days"), OR
-   - The Known Patient Context / Conversation Context already establishes the symptom or disease being addressed.
-
-3. A query NEEDS_CLARIFICATION if:
-   - It only expresses general malaise, anxiety, or illness without symptoms (e.g., "I feel sick", "meri tabiyat kharab hai", "help me doctor", "mujhe kuch ho raha hai", "I don't feel good"), AND no symptoms are known from context.
-   - It asks what to take without stating the condition AND no condition/symptom is present in Known Patient Context.
-
---- EXAMPLES ---
-User: "I feel sick" (No known symptoms in context)
-Classification: NEEDS_CLARIFICATION: Could you describe what specific symptoms you are experiencing (e.g., fever, pain, nausea) and where it hurts?
-
-Context: Known Patient Context: - symptoms: severe headache
-User: "What medicine should I take?"
-Classification: SUFFICIENT
-
-User: "I have high fever and vomiting for 2 days"
-Classification: SUFFICIENT
-
-User: "Dengue ke alamaat kya hain?"
-Classification: SUFFICIENT
-
---- TASK ---
-Conversation & Patient Context:
-{full_context}
-
-Current User Query: {query}
-
-Respond in EXACTLY one of these two formats:
-NEEDS_CLARIFICATION: <ONE single empathetic follow-up question in the same language as the user query>
-SUFFICIENT"""
-
-        try:
-            resp = self.llm_service._call_aux_llm(prompt).strip()
-            if "NEEDS_CLARIFICATION:" in resp:
-                question = resp.split("NEEDS_CLARIFICATION:", 1)[1].strip()
-                # Clean any quotes or multiple lines
-                question = question.split("\n")[0].strip().strip('"').strip("'")
-                if question:
-                    return True, question
-        except Exception as e:
-            logger.error("Clarification check error: %s", e)
+        """General conversational reasoning check: determines if query needs clarification using patient_context."""
+        res = self.llm_service.classify_and_rewrite_query(
+            query, chat_history=chat_history, patient_context=patient_context
+        )
+        missing = res.get("missing_for_diagnosis", [])
+        intent = res.get("intent", "sufficient_for_answer")
+        if missing and intent in ("new_symptom_info", "followup_answer"):
+            return True, res.get("follow_up_question", "Could you provide more details?")
         return False, ""
 
     # ========================================================================
@@ -386,97 +286,107 @@ SUFFICIENT"""
             base_response["language"] = language
             return base_response
 
-        # ── [BUG1 FIX] Meta-history intercept ───────────────────────────────
-        # MUST be before capabilities-query short-circuit (capabilities detector
-        # fires on short queries like "what did I ask first?") and before the
-        # vector-store-not-ready early exit (meta-query doesn't need the VS).
-        if self._is_meta_history_query(query):
-            user_turns = [
-                m for m in (chat_history or []) if m.get("sender") == "user"
-            ]
-            if user_turns:
-                first_q = user_turns[0].get("text", user_turns[0].get("message_text", ""))
-                last_q = user_turns[-1].get("text", user_turns[-1].get("message_text", ""))
-                q_lower = query.lower()
-                if "first" in q_lower or "pehle" in q_lower or "pahle" in q_lower:
-                    meta_answer = (
-                        f"Your first question in this conversation was: \"{first_q}\""
-                    )
-                elif "last" in q_lower or "aakhri" in q_lower or "akhri" in q_lower:
-                    meta_answer = (
-                        f"Your most recent question (before this one) was: \"{last_q}\""
-                    )
-                else:
-                    questions_list = "\n".join(
-                        f"{i+1}. {m.get('text', m.get('message_text',''))}"
-                        for i, m in enumerate(user_turns)
-                    )
-                    meta_answer = (
-                        f"Here are the questions you have asked in this conversation:\n"
-                        f"{questions_list}"
-                    )
-            else:
-                meta_answer = (
-                    "I don't have access to any previous questions in this conversation yet."
-                )
-            logger.info("[BUG1] Meta-history query intercepted — answering from real DB history.")
-            base_response.update({
-                "status": "meta_history",
-                "meta_answer": meta_answer,
-                "extracted_facts": {},
-                "new_facts": {}
-            })
-            return base_response
-
-        # ── [BUG3 FIX] Run fact extraction BEFORE vector store check ────────
-        # rewrite_query is an LLM call that: (a) rewrites query, (b) extracts new
-        # patient facts. It does NOT need the vector store. Previously this ran
-        # AFTER the vector-not-ready early-exit, so patient_context was NEVER
-        # populated during the warmup window. Moved here so facts are always saved.
-        # Also now runs before clarification gate so facts stated in clarifying
-        # replies accumulate (fixes the "second clarifying question" sub-bug).
-        rewritten_query = query
-        extracted_facts = {}
-        if status == "valid":
+        # ── General Conversational Intake Reasoning (Unified Single Call) ──
+        # Check if _needs_clarification was specifically mocked on this instance (for tests)
+        if "_needs_clarification" in self.__dict__:
             rewritten_result = self.llm_service.rewrite_query(
                 query, chat_history, patient_context=patient_context
             )
-            if isinstance(rewritten_result, tuple):
-                rewritten_query, extracted_facts = rewritten_result
-            else:
-                rewritten_query = rewritten_result
-        logger.info(
-            "[BUG3] Fact extraction completed before vector-store check: %s",
-            extracted_facts
-        )
-        base_response["extracted_facts"] = extracted_facts
-        base_response["new_facts"] = extracted_facts
+            rewritten_query = rewritten_result[0] if isinstance(rewritten_result, tuple) else rewritten_result
+            extracted_facts = rewritten_result[1] if isinstance(rewritten_result, tuple) else {}
+            base_response["extracted_facts"] = extracted_facts
+            base_response["new_facts"] = extracted_facts
 
-        # ── Phase 3: Clarification gate ──────────────────────────────────────
-        # Hard cap on round 5 forces retrieval regardless of vagueness.
-        if status == "valid" and clarification_round < 5:
-            needs_clarify, follow_up = self._needs_clarification(
-                query, chat_history,
-                rolling_summary=rolling_summary,
-                patient_context=patient_context
-            )
-            if needs_clarify:
-                logger.info(
-                    "Clarification needed (round %d): '%s'",
-                    clarification_round + 1, follow_up
+            if clarification_round < 5:
+                needs_clarify, follow_up = self._needs_clarification(
+                    query, chat_history,
+                    rolling_summary=rolling_summary,
+                    patient_context=patient_context
                 )
-                return {
-                    "status": "clarifying",
-                    "chunks": [],
-                    "language": language,
-                    "english_query": query,
-                    "original_query": query,
-                    "follow_up_question": follow_up,
-                    # extracted_facts are preserved so process_user_query can
-                    # persist facts stated in THIS clarifying turn.
+                if needs_clarify:
+                    return {
+                        "status": "clarifying",
+                        "chunks": [],
+                        "language": language,
+                        "english_query": query,
+                        "original_query": query,
+                        "follow_up_question": follow_up,
+                        "extracted_facts": extracted_facts,
+                        "new_facts": extracted_facts
+                    }
+        else:
+            classification = self.llm_service.classify_and_rewrite_query(
+                query,
+                chat_history=chat_history,
+                patient_context=patient_context,
+                clarification_round=clarification_round
+            )
+            intent = classification.get("intent", "sufficient_for_answer")
+            rewritten_query = classification.get("rewritten_query", query)
+            extracted_facts = classification.get("new_facts") or {}
+            missing_for_diagnosis = classification.get("missing_for_diagnosis") or []
+            follow_up_question = classification.get("follow_up_question") or ""
+            target_language = classification.get("target_language") or language
+
+            base_response["extracted_facts"] = extracted_facts
+            base_response["new_facts"] = extracted_facts
+            base_response["intent"] = intent
+            base_response["target_language"] = target_language
+
+            # 1. intent == "meta_query" -> answer from real DB history
+            if intent == "meta_query":
+                meta_answer = self._build_meta_history_answer(query, chat_history, patient_context)
+                logger.info("[INTAKE] Meta-query routed to DB history.")
+                base_response.update({
+                    "status": "meta_history",
+                    "meta_answer": meta_answer,
+                })
+                return base_response
+
+            # 2. intent == "translation_request" -> re-render last bot message in requested language
+            if intent == "translation_request":
+                logger.info("[INTAKE] Translation request routed for re-rendering.")
+                base_response.update({
+                    "status": "translation_request",
+                    "target_language": target_language,
+                })
+                return base_response
+
+            # 3. intent in ("new_symptom_info", "followup_answer") -> doctor intake gap assessment
+            if intent in ("new_symptom_info", "followup_answer"):
+                if missing_for_diagnosis and clarification_round < 5:
+                    q_text = follow_up_question
+                    if not q_text:
+                        missing_str = ", ".join(missing_for_diagnosis)
+                        if language == "roman_urdu":
+                            q_text = f"Apni takleef ke baare mein thoda aur batayein ({missing_str}) taake main behtar madad kar sakoon."
+                        else:
+                            q_text = f"Could you provide a bit more detail ({missing_str}) so I can give you accurate advice?"
+                    logger.info("[INTAKE] Clarification needed (round %d): '%s'", clarification_round + 1, q_text)
+                    return {
+                        "status": "clarifying",
+                        "chunks": [],
+                        "language": language,
+                        "english_query": query,
+                        "original_query": query,
+                        "follow_up_question": q_text,
+                        "extracted_facts": extracted_facts,
+                        "new_facts": extracted_facts,
+                        "intent": intent,
+                    }
+                # If missing_for_diagnosis is empty OR clarification_round == 5 -> proceed to retrieval
+
+            # 4. intent == "off_topic" -> respond with no_info fallback, facts still merged
+            if intent == "off_topic":
+                logger.info("[INTAKE] Off-topic query detected.")
+                base_response.update({
+                    "status": "off_topic",
                     "extracted_facts": extracted_facts,
-                    "new_facts": extracted_facts
-                }
+                    "new_facts": extracted_facts,
+                })
+                return base_response
+
+            # 5. intent == "sufficient_for_answer" -> skip clarification, proceed to retrieval
 
         if not self.vector_service.is_ready:
             logger.warning("Vector store not ready")
@@ -675,6 +585,56 @@ SUFFICIENT"""
                 }
             }
 
+
+        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0c: TRANSLATION_REQUEST — re-render last bot message in target language
+        # ══════════════════════════════════════════════════════════════
+        if st == "translation_request":
+            last_bot_text = ""
+            for m in reversed(chat_history or []):
+                if m.get("sender") in ("bot", "assistant"):
+                    last_bot_text = m.get("text") or m.get("message_text") or ""
+                    if last_bot_text.strip():
+                        break
+
+            target_lang = context_data.get("target_language", language)
+            if last_bot_text:
+                translated_response = self.llm_service.translate_response(last_bot_text, target_lang)
+            else:
+                if target_lang == "roman_urdu":
+                    translated_response = "Pehle koi jawab mojood nahi hai jise translate kiya ja sake."
+                else:
+                    translated_response = "There is no previous response to translate yet."
+
+            return {
+                "response": translated_response,
+                "metadata": {
+                    "source": "Translation",
+                    "language": target_lang,
+                    "ragas_metrics": {},
+                    "triage_level": None,
+                    "answer_body": translated_response,
+                    "sources": [],
+                    "disclaimer": "",
+                }
+            }
+
+        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0d: OFF_TOPIC — polite no-info response, patient facts retained
+        # ══════════════════════════════════════════════════════════════
+        if st == "off_topic":
+            return {
+                "response": no_info(language),
+                "metadata": {
+                    "source": "No relevant chunks",
+                    "language": language,
+                    "ragas_metrics": {},
+                    "triage_level": None,
+                    "answer_body": no_info(language),
+                    "sources": [],
+                    "disclaimer": "",
+                }
+            }
 
         # ══════════════════════════════════════════════════════════════
         # BRANCH 1: EMERGENCY

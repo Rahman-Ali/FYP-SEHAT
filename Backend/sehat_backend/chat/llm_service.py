@@ -34,6 +34,18 @@ class _AuxLLMProxy:
         return _Result(text)
 
 
+DOCTOR_INTAKE_INSTRUCTION = (
+    "You are conducting a medical intake like a doctor. "
+    "Before answering, identify what clinical information is still missing "
+    "(duration, severity, associated symptoms, relevant history) using "
+    "patient_context already gathered — never ask about something already "
+    "stated. Ask at most one combined follow-up question per turn, in natural "
+    "conversational language, not a checklist. After 5 clarification rounds "
+    "total in this session, answer with best available information regardless "
+    "of remaining gaps, noting the limitation."
+)
+
+
 class LLMService:
     """Manages all LLM interactions with security protections."""
 
@@ -460,7 +472,7 @@ class LLMService:
                 model_name="openai/gpt-oss-20b",
                 groq_api_key=key,
                 temperature=0.2,
-                max_tokens=512,
+                max_tokens=1024,
                 timeout=20,
                 max_retries=1,
             )
@@ -475,7 +487,7 @@ class LLMService:
             model = genai.GenerativeModel("gemini-3.1-flash-lite")
             resp = model.generate_content(
                 prompt,
-                generation_config={"temperature": 0.2, "max_output_tokens": 512},
+                generation_config={"temperature": 0.2, "max_output_tokens": 1024},
             )
             text = resp.text.strip() if (resp and hasattr(resp, "text") and resp.text) else ""
             if not text:
@@ -668,10 +680,11 @@ Your response:"""
         if groq_api_key:
             groq_api_key = groq_api_key.strip().strip('"').strip("'")
 
+        groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
         if groq_api_key:
             try:
                 groq_client = ChatGroq(
-                    model_name="llama-3.1-8b-instant",
+                    model_name=groq_model,
                     groq_api_key=groq_api_key,
                     temperature=0.2,
                     max_tokens=1024,
@@ -681,8 +694,8 @@ Your response:"""
                 resp = groq_client.invoke(prompt)
                 text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
                 if text:
-                    logger.info("Generated answer using Groq fallback (llama-3.1-8b-instant)")
-                    return text, "llama-3.1-8b-instant"
+                    logger.info("Generated answer using Groq fallback (%s)", groq_model)
+                    return text, groq_model
                 else:
                     logger.warning("Groq fallback returned empty response")
             except Exception as e:
@@ -782,6 +795,7 @@ Your response:"""
             f"You are SEHAT, an expert AI medical assistant providing healthcare guidance "
             f"based on official WHO/EAU medical guidelines.\n\n"
             f"CRITICAL LANGUAGE RULE:\n{lang_rule}\n\n"
+            f"CLINICAL INTAKE DIRECTIVE:\n{DOCTOR_INTAKE_INSTRUCTION}\n\n"
             f"{context_block}"
             f"MEDICAL INFORMATION (GROUND TRUTH):\n{retrieved_text}\n\n"
             f"USER QUERY:\n{original_query}\n\n"
@@ -1022,27 +1036,40 @@ Rewritten Question:"""
             logger.error("Plain query rewrite error: %s", e)
             return query
 
-    def rewrite_query(
-        self, query: str, chat_history: list = None, patient_context: dict = None
-    ) -> tuple[str, dict]:
+    def classify_and_rewrite_query(
+        self, query: str, chat_history: list = None, patient_context: dict = None, clarification_round: int = 0
+    ) -> dict:
         """
-        Merged query rewriting AND structured patient fact extraction in a SINGLE LLM call.
-        Extends query-rewriting LLM prompt to return:
-        {"rewritten_query": "...", "new_facts": {"age": "34", ...}}
-        
+        Unified single-call doctor intake reasoning, intent classification, query rewriting,
+        patient fact extraction, and diagnostic gap tracking.
         Returns:
-            (rewritten_query: str, new_facts: dict)
+            {
+                "intent": "new_symptom_info | followup_answer | meta_query | translation_request | off_topic | sufficient_for_answer",
+                "rewritten_query": str,
+                "new_facts": dict,
+                "missing_for_diagnosis": list,
+                "follow_up_question": str,
+                "target_language": str
+            }
         """
-        # Cheap pre-filter: skip fact extraction LLM work if greeting, <4 words, or pure ack
+        default_res = {
+            "intent": "sufficient_for_answer",
+            "rewritten_query": query,
+            "new_facts": {},
+            "missing_for_diagnosis": [],
+            "follow_up_question": "",
+            "target_language": "english"
+        }
+
+        # Cheap pre-filter for initial greetings/acknowledgments without history (saves LLM call)
         if self.should_skip_fact_extraction(query):
-            logger.info(
-                "[MEMORY] Pre-filter matched for query '%s' — skipping fact extraction LLM call (zero extra call).",
-                query
-            )
-            # Skip straight to plain rewrite behavior with new_facts={}
             if not chat_history or len(chat_history) == 0:
-                return query, {}
-            return self._plain_rewrite_query(query, chat_history), {}
+                logger.info(
+                    "[INTAKE] Pre-filter matched for query '%s' without history — returning default off_topic intent (zero LLM call).",
+                    query
+                )
+                default_res["intent"] = "off_topic"
+                return default_res
 
         # Format history for context
         history_text = ""
@@ -1053,26 +1080,51 @@ Rewritten Question:"""
                 if text.strip():
                     history_text += f"{sender}: {text}\n"
 
-        prompt = f"""You are an expert clinical conversation analyzer and query rewriter for SEHAT AI.
+        prompt = f"""{DOCTOR_INTAKE_INSTRUCTION}
 
-Perform TWO tasks in a single JSON response:
-1. REWRITTEN QUERY:
+You are an expert clinical conversation analyzer and query rewriter for SEHAT AI.
+Analyze the user's message in the context of the conversation history and existing patient context.
+
+Perform the following clinical tasks in a SINGLE JSON response:
+
+1. INTENT: Classify the user message into EXACTLY ONE category:
+   - "meta_query": The user is asking about previous conversation history, questions they asked earlier, what the assistant remembers, or recalling past statements (e.g. "what did I ask first?", "did you forget what I told you", "what were my symptoms again?", "remind me what we discussed").
+   - "translation_request": The user wants the previous assistant response translated, explained, or repeated in another language or script (e.g. "say that in Urdu", "explain in Urdu please", "iska urdu mein bta do", "translate to English").
+   - "new_symptom_info": The user is reporting a new medical symptom, complaint, or condition (e.g. "kal se bukhar hai", "I have a rash and it's spreading", "cough").
+   - "followup_answer": The user is responding to a previous question from the assistant or providing additional details (duration, severity, temperature, test results).
+   - "sufficient_for_answer": The user has provided enough medical details (such as symptoms, duration, and context) to proceed directly to clinical guidance without needing clarification, or is asking a clear self-contained medical question.
+   - "off_topic": The user is asking about something completely unrelated to health or medical questions.
+
+2. REWRITTEN QUERY:
    - Convert the user's message into a complete, standalone question using conversation history for context.
-   - If the query uses pronouns (it, this, that, iska, iski, etc.), replace them with the actual disease/symptom from history.
-   - If the query is already complete and standalone, return it as-is.
-   - Keep the rewritten question in the SAME LANGUAGE as the user query.
-   - Output ONLY the query text without conversational filler.
+   - If pronouns or relative terms are used, resolve them with the actual disease/symptom from history.
+   - If already standalone, or if a meta/translation request, keep it concise.
+   - Keep in the SAME LANGUAGE as the user query.
 
-2. NEW FACTS EXTRACTION:
-   - Extract ONLY medical and demographic facts newly stated by the user in THIS message (e.g., age, gender, symptoms, duration, preexisting conditions, medications taken, allergies).
-   - EXPLICIT RULE: Do NOT repeat or re-extract facts already present in Existing Patient Context.
-   - EXPLICIT RULE: NEVER invent, extrapolate, or guess facts. Only extract what the user explicitly stated. Omit rather than guess.
-   - If no new facts are stated in this message, return an empty object {{}} for new_facts.
-   - Use clean, standard lowercase keys (e.g. "age", "gender", "symptoms", "duration", "medications", "conditions").
+3. NEW FACTS EXTRACTION:
+   - Extract ONLY medical and demographic facts newly stated by the user in THIS message (e.g., symptoms, duration, severity, temperature, location, medications, age, gender).
+   - Do NOT repeat or re-extract facts already present in Known Patient Context.
+   - NEVER invent or guess facts. Only extract what the user explicitly stated.
+   - If no new facts, return {{}}.
+
+4. MISSING FOR DIAGNOSIS (Doctor Intake):
+   - What clinical details are still needed to provide safe guidance (e.g., ["duration", "severity", "associated_symptoms", "location"])?
+   - If Known Patient Context combined with new facts already has adequate basic info (e.g. symptom + duration, or clear specific query), OR if clarification round is 5 or more, return [].
+   - For "meta_query", "translation_request", "off_topic", or "sufficient_for_answer", ALWAYS return [].
+
+5. FOLLOW-UP QUESTION:
+   - If missing_for_diagnosis is NOT empty and clarification round < 5:
+     Provide ONE empathetic, natural conversational follow-up question asking for the missing details in the SAME LANGUAGE/SCRIPT as the user's message (e.g., Roman Urdu if user writes in Roman Urdu/Urdu, English if in English).
+   - If missing_for_diagnosis is empty or clarification round >= 5, return "".
+
+6. TARGET LANGUAGE:
+   - If translation_request, return the requested language ("roman_urdu" or "english"). Otherwise, the language of the user query ("roman_urdu" or "english").
 
 --- CONTEXT ---
-Existing Patient Context:
+Known Patient Context:
 {json.dumps(patient_context, indent=2) if patient_context else "None"}
+
+Clarification Round Count: {clarification_round} (Hard cap at 5)
 
 Conversation History:
 {history_text if history_text else "No prior messages."}
@@ -1080,16 +1132,19 @@ Conversation History:
 Current User Message: {query}
 
 --- OUTPUT FORMAT ---
-Respond ONLY with a valid JSON object matching this schema (no markdown formatting, no code fences, no extra text):
+Respond ONLY with a valid JSON object matching this schema (no markdown fences, no explanation):
 {{
+  "intent": "new_symptom_info | followup_answer | meta_query | translation_request | off_topic | sufficient_for_answer",
   "rewritten_query": "<rewritten standalone query>",
-  "new_facts": {{}}
+  "new_facts": {{}},
+  "missing_for_diagnosis": [],
+  "follow_up_question": "",
+  "target_language": "roman_urdu | english"
 }}"""
 
         try:
             raw_resp = self._call_aux_llm(prompt).strip()
-            
-            # Clean markdown code fences if present
+
             cleaned = raw_resp
             if "```" in cleaned:
                 matches = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
@@ -1097,21 +1152,102 @@ Respond ONLY with a valid JSON object matching this schema (no markdown formatti
                     cleaned = matches[0].strip()
 
             data = json.loads(cleaned)
-            rewritten_query = data.get("rewritten_query", query).strip()
+            intent = data.get("intent", "sufficient_for_answer")
+            rewritten_query = data.get("rewritten_query", query).strip() or query
             new_facts = data.get("new_facts")
             if not isinstance(new_facts, dict) or new_facts is None:
                 new_facts = {}
+            missing_for_diagnosis = data.get("missing_for_diagnosis")
+            if not isinstance(missing_for_diagnosis, list) or missing_for_diagnosis is None:
+                missing_for_diagnosis = []
+            follow_up_question = data.get("follow_up_question", "").strip()
+            target_language = data.get("target_language", "english").strip().lower()
 
-            if rewritten_query and len(rewritten_query) > 5 and rewritten_query != query:
-                logger.info("Query Rewritten: '%s' -> '%s'", query, rewritten_query)
-            if new_facts:
-                logger.info("[MEMORY] Extracted new facts from query: %s", new_facts)
+            logger.info(
+                "[INTAKE] Intent: %s, missing: %s, facts: %s",
+                intent, missing_for_diagnosis, new_facts
+            )
 
-            return (rewritten_query or query), new_facts
+            return {
+                "intent": intent,
+                "rewritten_query": rewritten_query,
+                "new_facts": new_facts,
+                "missing_for_diagnosis": missing_for_diagnosis,
+                "follow_up_question": follow_up_question,
+                "target_language": target_language
+            }
 
         except Exception as e:
-            logger.warning("[MEMORY] Merged rewrite/fact extraction error (%s), falling back to raw query: %s", e, raw_resp if 'raw_resp' in locals() else '')
-            return query, {}
+            logger.warning("[INTAKE] Error in classify_and_rewrite_query (%s), falling back to raw query: %s", e, raw_resp if 'raw_resp' in locals() else '')
+            return default_res
+
+    def rewrite_query(
+        self, query: str, chat_history: list = None, patient_context: dict = None
+    ) -> tuple[str, dict]:
+        """
+        Backwards-compatible wrapper calling classify_and_rewrite_query.
+        Returns:
+            (rewritten_query: str, new_facts: dict)
+        """
+        res = self.classify_and_rewrite_query(query, chat_history=chat_history, patient_context=patient_context)
+        return res.get("rewritten_query", query), res.get("new_facts", {})
+
+    def translate_response(self, text: str, target_language: str) -> str:
+        """Translate previous bot message into target_language (roman_urdu or english).
+        Applies Roman-Urdu purity check (Arabic-script detector) to guarantee Latin letters.
+        """
+        if not text or not text.strip():
+            return "No previous response to translate."
+
+        lang = (target_language or "roman_urdu").lower()
+        if "urdu" in lang or "roman" in lang:
+            prompt = (
+                "You are an expert translator for SEHAT AI.\n"
+                "Translate the following medical advice into Roman Urdu (Urdu written using ONLY the Latin/English alphabet).\n"
+                "STRICT RULES:\n"
+                "- Write ALL Urdu words phonetically in English letters (a-z). ZERO Arabic or Urdu script characters.\n"
+                "- Do NOT switch to English sentences — write in natural Roman Urdu throughout.\n"
+                "- Preserve all medical facts, structure, and warnings accurately.\n\n"
+                f"Text to translate:\n{text}\n\n"
+                "Roman Urdu translation:"
+            )
+            target_lang_code = "roman_urdu"
+        else:
+            prompt = (
+                "You are an expert translator for SEHAT AI.\n"
+                "Translate the following medical advice into clear, professional English.\n"
+                "Preserve all medical facts, structure, and warnings accurately.\n\n"
+                f"Text to translate:\n{text}\n\n"
+                "English translation:"
+            )
+            target_lang_code = "english"
+
+        try:
+            translated, _ = self._call_generation_llm(prompt)
+            translated = translated.strip()
+
+            # Roman Urdu purity gate
+            if target_lang_code == "roman_urdu":
+                arabic_script_count = sum(1 for ch in translated if '\u0600' <= ch <= '\u06FF')
+                if arabic_script_count > 3:
+                    logger.warning("[TRANSLATION] Arabic script detected in Roman Urdu (%d chars), converting.", arabic_script_count)
+                    retry_prompt = (
+                        "Convert the following text completely to Roman Urdu using ONLY Latin/English alphabet letters (a-z).\n"
+                        "ZERO Arabic script characters allowed:\n\n"
+                        f"{translated}\n\nRoman Urdu version:"
+                    )
+                    retry_text, _ = self._call_generation_llm(retry_prompt)
+                    if retry_text and len(retry_text.strip()) > 20:
+                        translated = retry_text.strip()
+
+                disclaimer = "Ye kisi professional doctor ki salah ka mutbadil nahi hai."
+                if disclaimer not in translated:
+                    translated = translated + "\n\n" + disclaimer
+
+            return translated
+        except Exception as e:
+            logger.error("translate_response error: %s", e)
+            return text
 
     def summarize_turns_with_groq(self, existing_summary: str, overflowing_turns: list) -> str:
         """
@@ -1153,7 +1289,7 @@ Updated Summary:"""
             logger.warning("[SUMMARIZATION] GROQ_API_KEY not configured, keeping existing summary")
             return existing_summary or ""
 
-        model_name = os.getenv("GROQ_SUMMARIZATION_MODEL", "llama-3.1-8b-instant")
+        model_name = os.getenv("GROQ_SUMMARIZATION_MODEL", "openai/gpt-oss-20b")
         logger.info(
             "[SUMMARIZATION] Triggered rolling summarization for %d turns using Groq (%s)",
             len(overflowing_turns), model_name

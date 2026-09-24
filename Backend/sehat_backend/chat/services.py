@@ -280,11 +280,12 @@ class ChatService:
             patient_context=session.patient_context
         )
 
-        if context.get("status") == "clarifying":
+        status_type = context.get("status")
+        if status_type == "clarifying":
             if not isinstance(session.session_metadata, dict):
                 session.session_metadata = {}
             session.session_metadata["clarification_round"] = clarification_round + 1
-        else:
+        elif status_type in ("valid", "sufficient_for_answer", "meta_history", "off_topic"):
             if isinstance(session.session_metadata, dict) and "clarification_round" in session.session_metadata:
                 session.session_metadata["clarification_round"] = 0
 
