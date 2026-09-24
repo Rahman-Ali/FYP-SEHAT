@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import hashlib
 import logging
 from dotenv import load_dotenv
@@ -264,9 +265,17 @@ Is this a capabilities question?"""
                 "new_facts": {}
             }
 
+        stage_timings = {}
+
+        t0 = time.time()
         status = self.llm_service.validate_query(query)
+        stage_timings["validate_query_ms"] = round((time.time() - t0) * 1000, 2)
+        logger.info("[STAGE TIMING] validate_query: %.2f ms", stage_timings["validate_query_ms"])
         
+        t0 = time.time()
         language = self.llm_service.detect_language(query)
+        stage_timings["detect_language_ms"] = round((time.time() - t0) * 1000, 2)
+        logger.info("[STAGE TIMING] detect_language: %.2f ms", stage_timings["detect_language_ms"])
 
         base_response = {
             "status": status,
@@ -275,7 +284,8 @@ Is this a capabilities question?"""
             "english_query": query,
             "original_query": query,
             "extracted_facts": {},
-            "new_facts": {}
+            "new_facts": {},
+            "stage_timings": stage_timings,
         }
 
         if status in ("invalid", "unclear", "greeting"):
@@ -289,9 +299,11 @@ Is this a capabilities question?"""
         # ── General Conversational Intake Reasoning (Unified Single Call) ──
         # Check if _needs_clarification was specifically mocked on this instance (for tests)
         if "_needs_clarification" in self.__dict__:
+            t0 = time.time()
             rewritten_result = self.llm_service.rewrite_query(
                 query, chat_history, patient_context=patient_context
             )
+            stage_timings["rewrite_query_ms"] = round((time.time() - t0) * 1000, 2)
             rewritten_query = rewritten_result[0] if isinstance(rewritten_result, tuple) else rewritten_result
             extracted_facts = rewritten_result[1] if isinstance(rewritten_result, tuple) else {}
             base_response["extracted_facts"] = extracted_facts
@@ -312,15 +324,20 @@ Is this a capabilities question?"""
                         "original_query": query,
                         "follow_up_question": follow_up,
                         "extracted_facts": extracted_facts,
-                        "new_facts": extracted_facts
+                        "new_facts": extracted_facts,
+                        "stage_timings": stage_timings,
                     }
         else:
+            t0 = time.time()
             classification = self.llm_service.classify_and_rewrite_query(
                 query,
                 chat_history=chat_history,
                 patient_context=patient_context,
                 clarification_round=clarification_round
             )
+            stage_timings["classify_and_rewrite_ms"] = round((time.time() - t0) * 1000, 2)
+            logger.info("[STAGE TIMING] classify_and_rewrite: %.2f ms", stage_timings["classify_and_rewrite_ms"])
+
             intent = classification.get("intent", "sufficient_for_answer")
             rewritten_query = classification.get("rewritten_query", query)
             extracted_facts = classification.get("new_facts") or {}
@@ -392,15 +409,23 @@ Is this a capabilities question?"""
             logger.warning("Vector store not ready")
             return base_response
 
+        t0 = time.time()
         english_query = self.llm_service.translate_to_english(rewritten_query, language)
+        stage_timings["translate_query_ms"] = round((time.time() - t0) * 1000, 2)
+        logger.info("[STAGE TIMING] translate_query: %.2f ms", stage_timings["translate_query_ms"])
+
+        t0 = time.time()
         chunks = self.vector_service.hybrid_search(english_query)
+        stage_timings["hybrid_search_ms"] = round((time.time() - t0) * 1000, 2)
+        logger.info("[STAGE TIMING] hybrid_search: %.2f ms", stage_timings["hybrid_search_ms"])
 
         base_response.update({
             "chunks": chunks,
             "language": language,
             "english_query": english_query,
             "extracted_facts": extracted_facts,
-            "new_facts": extracted_facts
+            "new_facts": extracted_facts,
+            "stage_timings": stage_timings,
         })
 
         return base_response
@@ -825,12 +850,17 @@ Your response:"""
 
         retrieved_text, cite_block, pages_str, sources = self._build_citations(context_docs)
 
+        stage_timings = dict(context_data.get("stage_timings") or {})
+
         # Relevance check
+        t0 = time.time()
         try:
             is_relevant = self.llm_service.verify_relevance(english_query, retrieved_text, chat_history)
         except Exception as e:
             logger.error("Relevance check error: %s", e)
             is_relevant = True
+        stage_timings["verify_relevance_ms"] = round((time.time() - t0) * 1000, 2)
+        logger.info("[STAGE TIMING] verify_relevance: %.2f ms", stage_timings["verify_relevance_ms"])
 
         if not is_relevant:
             return {
@@ -839,10 +869,12 @@ Your response:"""
                     "source": "Relevance check failed",
                     "triage_level": "Doctor",
                     "ragas_metrics": {},
+                    "stage_timings": stage_timings,
                 }
             }
 
         # Generate answer
+        t0 = time.time()
         try:
             answer, model_name = self.llm_service.generate_answer(
                 original_query,
@@ -854,16 +886,21 @@ Your response:"""
             )
         except Exception as e:
             logger.error("Answer generation error: %s", e)
+            stage_timings["generate_answer_ms"] = round((time.time() - t0) * 1000, 2)
             return {
                 "response": no_info(language),
                 "metadata": {
                     "source": "LLM generation failed",
                     "triage_level": "Doctor",
                     "ragas_metrics": {},
+                    "stage_timings": stage_timings,
                 }
             }
+        stage_timings["generate_answer_ms"] = round((time.time() - t0) * 1000, 2)
+        logger.info("[STAGE TIMING] generate_answer: %.2f ms", stage_timings["generate_answer_ms"])
 
         # Compute metrics
+        t0 = time.time()
         eval_answer = (
             self.llm_service.translate_to_english(answer, "roman_urdu")
             if language == "roman_urdu"
@@ -878,6 +915,8 @@ Your response:"""
         except Exception as e:
             logger.error("RAGAS metrics error: %s", e)
             metrics = {"faithfulness": 1.0}
+        stage_timings["ragas_eval_ms"] = round((time.time() - t0) * 1000, 2)
+        logger.info("[STAGE TIMING] ragas_eval: %.2f ms", stage_timings["ragas_eval_ms"])
 
         logger.info("RAGAS Metrics: %s", metrics)
 
@@ -935,7 +974,10 @@ Your response:"""
             final_sources = sources
 
         # Classify triage level
+        t0 = time.time()
         triage_level = self.llm_service.classify_triage(original_query, answer)
+        stage_timings["classify_triage_ms"] = round((time.time() - t0) * 1000, 2)
+        logger.info("[STAGE TIMING] classify_triage: %.2f ms", stage_timings["classify_triage_ms"])
 
         return {
             "response": final_response,          # full string (DB / plain-text)
@@ -946,6 +988,7 @@ Your response:"""
                 "language": language,
                 "ragas_metrics": metrics,
                 "triage_level": triage_level,
+                "stage_timings": stage_timings,
                 # ── Structured fields (Phase 2) ───────────────────────────
                 "answer_body": answer_body,
                 "sources": final_sources,

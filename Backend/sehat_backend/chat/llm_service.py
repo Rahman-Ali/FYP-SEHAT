@@ -1092,7 +1092,14 @@ Perform the following clinical tasks in a SINGLE JSON response:
    - "translation_request": The user wants the previous assistant response translated, explained, or repeated in another language or script (e.g. "say that in Urdu", "explain in Urdu please", "iska urdu mein bta do", "translate to English").
    - "new_symptom_info": The user is reporting a new medical symptom, complaint, or condition (e.g. "kal se bukhar hai", "I have a rash and it's spreading", "cough").
    - "followup_answer": The user is responding to a previous question from the assistant or providing additional details (duration, severity, temperature, test results).
-   - "sufficient_for_answer": The user has provided enough medical details (such as symptoms, duration, and context) to proceed directly to clinical guidance without needing clarification, or is asking a clear self-contained medical question.
+   - "sufficient_for_answer": The user has provided enough medical details to proceed to clinical guidance. Use this when:
+     (a) The message contains a symptom PLUS duration/timing PLUS at least one more descriptor (severity, associated symptom, location, temperature). Example: "I have fever for 3 days with headache" = sufficient (fever + 3 days + headache).
+     (b) The message contains 3 or more distinct clinical facts (symptoms, duration, severity, location, medications, etc.).
+     (c) The patient context already contains symptom+duration and the user is asking for treatment/advice/medicines.
+     (d) The user is asking a clear self-contained medical question (e.g. 'what is dengue?', 'how to treat typhoid?').
+     MINIMUM BASELINE: symptom + duration ALONE (without any other detail) is NOT yet sufficient — ask for severity or associated symptoms. But symptom + duration + ANY one more detail IS sufficient.
+     Counter-examples that are NOT sufficient_for_answer: "I have a fever" (no duration), "kal se bukhar hai" (symptom + duration only — need one more detail).
+     Examples that ARE sufficient_for_answer: "I have fever for 3 days with headache", "3 din se bohat tez bukhar hai aur jism mein dard hai", "I have had diarrhea and vomiting since yesterday".
    - "off_topic": The user is asking about something completely unrelated to health or medical questions.
 
 2. REWRITTEN QUERY:
@@ -1167,6 +1174,45 @@ Respond ONLY with a valid JSON object matching this schema (no markdown fences, 
                 "[INTAKE] Intent: %s, missing: %s, facts: %s",
                 intent, missing_for_diagnosis, new_facts
             )
+
+            # ── Programmatic baseline check (defense-in-depth, no extra LLM call) ──
+            # If LLM still wants clarification but combined facts already cover 3 clinical
+            # dimensions (primary symptom + timing + one additional descriptor), promote to answer.
+            if intent in ("new_symptom_info", "followup_answer") and missing_for_diagnosis and clarification_round < 5:
+                combined = {**(patient_context or {}), **(new_facts or {})}
+                combined_keys = " ".join(k.lower() for k in combined)
+                combined_vals = " ".join(str(v).lower() for v in combined.values())
+                combined_text = combined_keys + " " + combined_vals
+
+                # Timing dimension keywords (in key names)
+                timing_kws = ["duration", "since", "day", "week", "hour", "onset", "start", "arse", "din", "ghante", "long"]
+                # Extra-descriptor dimension keywords (in key names)
+                extra_kws  = ["severity", "headache", "nausea", "cough", "vomit", "chills", "diarr",
+                               "pain", "ache", "rash", "temperature", "location", "body", "chest",
+                               "dard", "bukhar", "khansi", "ulti", "dast", "jism", "sar", "pet"]
+
+                has_timing = any(t in combined_text for t in timing_kws)
+                has_extra  = any(e in combined_text for e in extra_kws)
+
+                if has_timing and has_extra:
+                    logger.info(
+                        "[INTAKE] Baseline check: combined facts cover timing+extra — promoting '%s' -> 'sufficient_for_answer'",
+                        intent
+                    )
+                    intent = "sufficient_for_answer"
+                    missing_for_diagnosis = []
+                    follow_up_question = ""
+
+            # ── Hard cap: if clarification_round >= 5, force answer regardless of intent ──
+            if clarification_round >= 5 and intent not in ("meta_query", "translation_request", "off_topic"):
+                if intent != "sufficient_for_answer":
+                    logger.info(
+                        "[INTAKE] Hard cap reached (round=%d): overriding intent '%s' -> 'sufficient_for_answer'",
+                        clarification_round, intent
+                    )
+                    intent = "sufficient_for_answer"
+                missing_for_diagnosis = []
+                follow_up_question = ""
 
             return {
                 "intent": intent,

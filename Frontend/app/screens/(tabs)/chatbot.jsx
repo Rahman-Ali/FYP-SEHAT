@@ -386,7 +386,7 @@ const handleSend = async () => {
   } catch (error) {
     console.error("Send Error:", error);
     isCurrentSessionEmpty.current = true;
-    const errorMsg = createMessage("Connection Error. Please try again.", true, "Error", "Emergency");
+    const errorMsg = createMessage("Connection Error. Please try again.", true, "Error", null);
     setMessages([...updatedMessages, errorMsg]);
   } finally {
     setIsSending(false);

@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import logging
 import threading
 from dotenv import load_dotenv
@@ -232,6 +233,7 @@ class ChatService:
 
     def process_user_query(self, session_id, query, chat_history=None):
         """Process user query through RAG pipeline with backend-authoritative memory."""
+        t_req_start = time.time()
         session = ChatSession.objects.get(id=session_id)
         
         # [MEMORY] Phase 2: Backend is authoritative source of truth.
@@ -251,11 +253,13 @@ class ChatService:
         for turn in recent_turns:
             recent_history.extend(turn["messages"])
         
+        t_db_0 = time.time()
         user_msg = Message.objects.create(
             session=session,
             sender='user',
             message_text=query
         )
+        t_user_create_ms = (time.time() - t_db_0) * 1000
         
         clarification_round = (session.session_metadata or {}).get("clarification_round", 0)
         context = self.rag_service.retrieve_context(
@@ -289,14 +293,43 @@ class ChatService:
             if isinstance(session.session_metadata, dict) and "clarification_round" in session.session_metadata:
                 session.session_metadata["clarification_round"] = 0
 
+        t_db_1 = time.time()
+        bot_meta = dict(response.get('metadata', {}))
+        stage_timings = dict(bot_meta.get("stage_timings", {}))
+
         bot_msg = Message.objects.create(
             session=session,
             sender='bot',
             message_text=response['response'],
-            metadata=response.get('metadata', {})
+            metadata=bot_meta
         )
-
         session.save()
+
+        t_db_writes_ms = round(t_user_create_ms + (time.time() - t_db_1) * 1000, 2)
+        total_wall_clock_ms = round((time.time() - t_req_start) * 1000, 2)
+        stage_timings["db_writes_ms"] = t_db_writes_ms
+        stage_timings["total_wall_clock_ms"] = total_wall_clock_ms
+        bot_meta["stage_timings"] = stage_timings
+        bot_msg.metadata = bot_meta
+        bot_msg.save(update_fields=['metadata'])
+
+        logger.info(
+            "[TIMING SUMMARY] total=%.2f ms | "
+            "validate=%.2f ms | detect_lang=%.2f ms | classify_and_rewrite=%.2f ms | "
+            "translate=%.2f ms | search=%.2f ms | verify_relevance=%.2f ms | "
+            "generate_answer=%.2f ms | ragas_eval=%.2f ms | classify_triage=%.2f ms | db_writes=%.2f ms",
+            total_wall_clock_ms,
+            stage_timings.get("validate_query_ms", 0),
+            stage_timings.get("detect_language_ms", 0),
+            stage_timings.get("classify_and_rewrite_ms", 0),
+            stage_timings.get("translate_query_ms", 0),
+            stage_timings.get("hybrid_search_ms", 0),
+            stage_timings.get("verify_relevance_ms", 0),
+            stage_timings.get("generate_answer_ms", 0),
+            stage_timings.get("ragas_eval_ms", 0),
+            stage_timings.get("classify_triage_ms", 0),
+            t_db_writes_ms
+        )
 
         return user_msg, bot_msg
         

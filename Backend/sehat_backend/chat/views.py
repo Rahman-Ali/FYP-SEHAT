@@ -230,9 +230,21 @@ def process_query(request):
             'bot_message': MessageSerializer(bot_msg).data
         })
     except Exception as e:
-        print(f"Error processing query: {e}")
+        import logging
+        logging.getLogger(__name__).error("Error processing query: %s", e, exc_info=True)
         return Response(
-            {'error': str(e)},
+            {
+                'error': 'internal_server_error',
+                'message': 'Failed to process query. Please try again.',
+                'details': str(e),
+                'bot_message': {
+                    'message_text': 'A connection or server error occurred. Please try again.',
+                    'metadata': {
+                        'source': 'Error',
+                        'triage_level': None
+                    }
+                }
+            },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
