@@ -319,3 +319,225 @@ class ClarificationRoundTest(unittest.TestCase):
         self.assertIsNone(res["metadata"]["triage_level"])
         self.assertEqual(res["metadata"]["source"], "Clarification Gate")
 
+
+# ---------------------------------------------------------------------------
+# 6. Contextual Memory & Token Budget Tests
+# ---------------------------------------------------------------------------
+
+class ContextualMemoryTests(TestCase):
+    """
+    Tests for:
+    - Merged rewrite + fact extraction (single LLM call, token budget)
+    - Pre-filter skipping fact extraction for greetings and short acks
+    - Structured patient facts extraction and contradiction handling
+    - Rolling summarization trigger (8-turn window, Groq model, updates not resets)
+    - Step-back clarification checking patient_context first
+    - Backend authoritative history ignoring client-supplied history
+    - Backward-compatible session defaults
+    """
+
+    def setUp(self):
+        from chat.services import ChatService
+        self.service = ChatService()
+        self.session = self.service.create_new_session("test-user-123", title="Test Session")
+
+    def test_merge_not_add_llm_call_count(self):
+        """Verify that query rewrite + fact extraction run in EXACTLY 1 LLM call, not 2."""
+        from chat.llm_service import LLMService
+        llm = LLMService()
+
+        # Mock the auxiliary LLM call to return JSON with rewritten_query and new_facts
+        call_count = [0]
+        def mock_aux_call(prompt):
+            call_count[0] += 1
+            return json.dumps({
+                "rewritten_query": "What are the complications of high fever?",
+                "new_facts": {"age": "34", "symptom": "fever"}
+            })
+
+        with patch.object(llm, "_call_aux_llm", side_effect=mock_aux_call):
+            rewritten, facts = llm.rewrite_query(
+                "What are its complications?",
+                chat_history=[{"sender": "user", "text": "I am 34 years old with fever"}],
+                patient_context={}
+            )
+            # Must be exactly 1 call (merged), NOT 2 calls!
+            self.assertEqual(call_count[0], 1)
+            self.assertEqual(rewritten, "What are the complications of high fever?")
+            self.assertEqual(facts, {"age": "34", "symptom": "fever"})
+
+    def test_pre_filter_skips_fact_extraction(self):
+        """Verify pre-filter skips LLM fact extraction for greetings, short acks, and <4 words."""
+        from chat.llm_service import LLMService
+        llm = LLMService()
+
+        test_cases = [
+            "hello",
+            "salam",
+            "ok",
+            "thanks",
+            "yes",
+            "theek hai",
+            "thank you",
+        ]
+        for q in test_cases:
+            self.assertTrue(
+                llm.should_skip_fact_extraction(q),
+                f"Query '{q}' should have triggered pre-filter skip"
+            )
+
+        # For filtered messages without history, rewrite_query must make ZERO LLM calls
+        with patch.object(llm, "_call_aux_llm") as mock_aux:
+            rewritten, facts = llm.rewrite_query("hello")
+            mock_aux.assert_not_called()
+            self.assertEqual(rewritten, "hello")
+            self.assertEqual(facts, {})
+
+    def test_fact_contradiction_handling(self):
+        """Verify new facts merge and contradiction updates rather than duplicates."""
+        from chat.services import merge_patient_facts
+        ctx = {"age": "34", "gender": "male"}
+
+        # Non-contradictory update
+        ctx, changed = merge_patient_facts(ctx, {"symptom": "fever"})
+        self.assertTrue(changed)
+        self.assertEqual(ctx["symptom"], "fever")
+        self.assertEqual(ctx["age"], "34")
+
+        # Contradiction: age updated from 34 to 35
+        ctx, changed = merge_patient_facts(ctx, {"age": "35"})
+        self.assertTrue(changed)
+        self.assertEqual(ctx["age"], "35")  # Updated, not duplicated
+
+    def test_summarization_trigger_and_model(self):
+        """
+        Verify rolling summarization trigger:
+        - <= 8 turns: 0 summarization calls
+        - 9 turns: triggers once, summarizes turn 1 using Groq (llama-3.1-8b-instant)
+        - 10 turns: triggers once, updates existing summary
+        - 15 turns test conversation verifies updates not resets
+        """
+        from chat.services import extract_turn_pairs, ChatService
+        from chat.models import Message
+
+        service = ChatService()
+        session = self.session
+
+        # Create 8 turns (16 messages) in DB
+        for i in range(1, 9):
+            Message.objects.create(session=session, sender="user", message_text=f"Turn {i} question", sequence_number=2*i-1)
+            Message.objects.create(session=session, sender="bot", message_text=f"Turn {i} answer", sequence_number=2*i)
+
+        groq_calls = []
+        def mock_groq_summary(existing_summary, overflowing_turns):
+            groq_calls.append({
+                "existing": existing_summary,
+                "turns_count": len(overflowing_turns),
+                "turns": overflowing_turns
+            })
+            return f"{existing_summary or ''} [Summary of {len(overflowing_turns)} turns]".strip()
+
+        with patch.object(service.llm_service, "summarize_turns_with_groq", side_effect=mock_groq_summary):
+            # Check at 8 turns: should NOT trigger
+            triggered = service.trigger_rolling_summarization_if_needed(session)
+            self.assertFalse(triggered)
+            self.assertEqual(len(groq_calls), 0)
+            self.assertEqual(session.summarized_up_to_turn, 0)
+
+            # Add turn 9 (now 9 turns exist in DB)
+            Message.objects.create(session=session, sender="user", message_text="Turn 9 question", sequence_number=17)
+            Message.objects.create(session=session, sender="bot", message_text="Turn 9 answer", sequence_number=18)
+
+            # Check at 9 turns: triggers for turn 1
+            triggered = service.trigger_rolling_summarization_if_needed(session)
+            self.assertTrue(triggered)
+            self.assertEqual(len(groq_calls), 1)
+            self.assertEqual(groq_calls[0]["turns_count"], 1)
+            self.assertEqual(session.summarized_up_to_turn, 1)
+            self.assertIn("Summary of 1 turns", session.rolling_summary)
+
+            # Add turn 10: triggers for turn 2, merges into existing summary (not reset)
+            Message.objects.create(session=session, sender="user", message_text="Turn 10 question", sequence_number=19)
+            Message.objects.create(session=session, sender="bot", message_text="Turn 10 answer", sequence_number=20)
+            triggered = service.trigger_rolling_summarization_if_needed(session)
+            self.assertTrue(triggered)
+            self.assertEqual(len(groq_calls), 2)
+            self.assertEqual(session.summarized_up_to_turn, 2)
+            # Verify previous summary was passed in to merge, not restarted
+            self.assertTrue(len(groq_calls[1]["existing"]) > 0)
+
+            # Complete up to 15 turns
+            for i in range(11, 16):
+                Message.objects.create(session=session, sender="user", message_text=f"Turn {i} question", sequence_number=2*i-1)
+                Message.objects.create(session=session, sender="bot", message_text=f"Turn {i} answer", sequence_number=2*i)
+                service.trigger_rolling_summarization_if_needed(session)
+
+            self.assertEqual(session.summarized_up_to_turn, 7)  # 15 - 8 = 7 turns summarized
+            self.assertEqual(len(groq_calls), 7)
+
+    def test_step_back_clarification_respects_patient_context(self):
+        """Verify clarification gate does not re-ask a fact already in patient_context."""
+        rag = self.service.rag_service
+
+        # Mock LLM check to ensure prompt receives patient_context
+        prompt_received = []
+        def mock_aux_call(prompt):
+            prompt_received.append(prompt)
+            return "SUFFICIENT"
+
+        with patch.object(rag.llm_service, "_call_aux_llm", side_effect=mock_aux_call):
+            needs_clarify, follow_up = rag._needs_clarification(
+                "What medicine should I take?",
+                chat_history=[],
+                patient_context={"symptoms": "high fever", "age": "34"}
+            )
+            self.assertFalse(needs_clarify)
+            self.assertIn("Known Patient Context:", prompt_received[0])
+            self.assertIn("high fever", prompt_received[0])
+            self.assertIn("34", prompt_received[0])
+
+    def test_backend_authoritative_history_ignores_frontend(self):
+        """Verify backend ignores client-provided chat_history and relies on DB history."""
+        from chat.models import Message
+        session = self.session
+
+        # Seed real message in DB
+        Message.objects.create(session=session, sender="user", message_text="I was diagnosed with dengue yesterday.")
+        Message.objects.create(session=session, sender="bot", message_text="Please stay hydrated and monitor platelet counts.")
+
+        # Client sends a bogus/empty chat_history
+        bogus_history = [{"sender": "user", "text": "Something completely fake"}]
+
+        # Mock retrieve_context and generate_with_context to verify what history is received
+        history_passed_to_rag = []
+        def mock_retrieve(query, chat_history=None, **kwargs):
+            history_passed_to_rag.append(chat_history)
+            return {
+                "status": "valid",
+                "chunks": [],
+                "language": "english",
+                "english_query": query,
+                "original_query": query,
+                "extracted_facts": {},
+            }
+
+        with patch.object(self.service.rag_service, "retrieve_context", side_effect=mock_retrieve), \
+             patch.object(self.service.rag_service, "generate_with_context", return_value={"response": "Take rest.", "metadata": {}}):
+            self.service.process_user_query(
+                session.id,
+                "What was my diagnosis?",
+                chat_history=bogus_history
+            )
+
+            # RAG must receive DB history, NOT bogus_history!
+            self.assertTrue(len(history_passed_to_rag) > 0)
+            received = history_passed_to_rag[0]
+            self.assertTrue(any("dengue" in msg.get("text", "") for msg in received))
+            self.assertFalse(any("Something completely fake" in msg.get("text", "") for msg in received))
+
+    def test_backward_compatible_session_defaults(self):
+        """Verify pre-migration session defaults operate cleanly without errors."""
+        self.assertIsNone(self.session.rolling_summary)
+        self.assertEqual(self.session.patient_context, {})
+        self.assertEqual(self.session.summarized_up_to_turn, 0)
+
