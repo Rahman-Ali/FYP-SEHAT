@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -86,6 +87,38 @@ class LLMService:
         r'^salamualaikum[!.,;:?\s]*$',
         r'^(aoa)[!.,;:?\s]*$',
     ]
+
+    ACK_PATTERNS = [
+        r'^(ok|okay|k|thanks|thank you|thx|ty|shukriya|yes|no|yeah|nah|yep|nope|haan|ha|nahi|nahin|ji|ji haan|ji nahi|theek|theek hai|thik hai|sahi|got it|understood|accha|acha)[!.,;:?\s]*$',
+    ]
+
+    def should_skip_fact_extraction(self, query: str) -> bool:
+        """
+        Cheap pre-filter rule before LLM fact extraction:
+        Skip if:
+        1. Greeting (reusing GREETING_PATTERNS regex)
+        2. Under ~4 words (len(words) < 4)
+        3. Pure acknowledgment ('ok', 'thanks', 'yes', 'no', etc.)
+        """
+        q = (query or "").strip().lower()
+        q_clean = q.rstrip('!.,;:? ')
+
+        # 1. Greeting regex
+        for pattern in self.GREETING_PATTERNS:
+            if re.match(pattern, q_clean):
+                return True
+
+        # 2. Pure acknowledgment regex
+        for pattern in self.ACK_PATTERNS:
+            if re.match(pattern, q_clean):
+                return True
+
+        # 3. Under ~4 words (< 4 words)
+        words = q.split()
+        if len(words) < 4:
+            return True
+
+        return False
 
     def sanitize_input(self, query: str) -> dict:
         """
@@ -904,22 +937,18 @@ Your response:"""
             logger.error("RAGAS metrics error: %s", e)
             return zero
     
-    def rewrite_query(self, query: str, chat_history: list = None) -> str:
-        """
-        Rewrite ALL follow-up queries into complete standalone queries using chat history.
-        Works for: pronoun references, vague questions, incomplete queries, follow-ups.
-        """
+    def _plain_rewrite_query(self, query: str, chat_history: list = None) -> str:
+        """Original plain rewrite logic for pre-filtered messages that have history."""
         if not chat_history or len(chat_history) == 0:
             return query
-        
-        # Format history for context
+
         history_text = ""
         for msg in chat_history[-6:]:
             sender = "User" if msg.get("sender") == "user" else "Assistant"
             text = msg.get("text", msg.get("message_text", ""))
             if text.strip():
                 history_text += f"{sender}: {text}\n"
-        
+
         prompt = f"""You are a query rewriter for a medical chatbot.
 
 Your job is to convert the user's follow-up question into a COMPLETE, STANDALONE question
@@ -941,27 +970,171 @@ RULES:
 5. Keep the rewritten question in the SAME LANGUAGE as the original query.
 6. Output ONLY the rewritten question — no explanations, no notes.
 
-Examples:
-- History: "User: I have fever and headache" → Query: "Tell me its causes" → "Tell me causes of fever and headache"
-- History: "User: Mujhy bukhar hai" → Query: "Iska ilaaj batao" → "Bukhar ka ilaaj batao"
-- History: "User: I have dengue" → Query: "What to do?" → "What to do for dengue?"
-- History: "User: Stomach pain" → Query: "Which medicines?" → "Which medicines for stomach pain?"
-- History: "User: Fever and cough" → Query: "Aur kya?" → "Fever and cough ke aur kya symptoms hain?"
-- History: "User: I have fever" → Query: "What are its symptoms?" → "What are the symptoms of fever?"
-
 Rewritten Question:"""
 
         try:
             rewritten = self._call_aux_llm(prompt).strip()
-            
-            # Remove any quotes, explanations
             rewritten = rewritten.strip('"').strip("'").strip()
-            
             if rewritten and len(rewritten) > 5 and rewritten != query:
                 logger.info("Query Rewritten: '%s' -> '%s'", query, rewritten)
                 return rewritten
-            
             return query
         except Exception as e:
-            logger.error(f"Query rewrite error: {e}")
+            logger.error("Plain query rewrite error: %s", e)
             return query
+
+    def rewrite_query(
+        self, query: str, chat_history: list = None, patient_context: dict = None
+    ) -> tuple[str, dict]:
+        """
+        Merged query rewriting AND structured patient fact extraction in a SINGLE LLM call.
+        Extends query-rewriting LLM prompt to return:
+        {"rewritten_query": "...", "new_facts": {"age": "34", ...}}
+        
+        Returns:
+            (rewritten_query: str, new_facts: dict)
+        """
+        # Cheap pre-filter: skip fact extraction LLM work if greeting, <4 words, or pure ack
+        if self.should_skip_fact_extraction(query):
+            logger.info(
+                "[MEMORY] Pre-filter matched for query '%s' — skipping fact extraction LLM call (zero extra call).",
+                query
+            )
+            # Skip straight to plain rewrite behavior with new_facts={}
+            if not chat_history or len(chat_history) == 0:
+                return query, {}
+            return self._plain_rewrite_query(query, chat_history), {}
+
+        # Format history for context
+        history_text = ""
+        if chat_history and len(chat_history) > 0:
+            for msg in chat_history[-6:]:
+                sender = "User" if msg.get("sender") == "user" else "Assistant"
+                text = msg.get("text", msg.get("message_text", ""))
+                if text.strip():
+                    history_text += f"{sender}: {text}\n"
+
+        prompt = f"""You are an expert clinical conversation analyzer and query rewriter for SEHAT AI.
+
+Perform TWO tasks in a single JSON response:
+1. REWRITTEN QUERY:
+   - Convert the user's message into a complete, standalone question using conversation history for context.
+   - If the query uses pronouns (it, this, that, iska, iski, etc.), replace them with the actual disease/symptom from history.
+   - If the query is already complete and standalone, return it as-is.
+   - Keep the rewritten question in the SAME LANGUAGE as the user query.
+   - Output ONLY the query text without conversational filler.
+
+2. NEW FACTS EXTRACTION:
+   - Extract ONLY medical and demographic facts newly stated by the user in THIS message (e.g., age, gender, symptoms, duration, preexisting conditions, medications taken, allergies).
+   - EXPLICIT RULE: Do NOT repeat or re-extract facts already present in Existing Patient Context.
+   - EXPLICIT RULE: NEVER invent, extrapolate, or guess facts. Only extract what the user explicitly stated. Omit rather than guess.
+   - If no new facts are stated in this message, return an empty object {{}} for new_facts.
+   - Use clean, standard lowercase keys (e.g. "age", "gender", "symptoms", "duration", "medications", "conditions").
+
+--- CONTEXT ---
+Existing Patient Context:
+{json.dumps(patient_context, indent=2) if patient_context else "None"}
+
+Conversation History:
+{history_text if history_text else "No prior messages."}
+
+Current User Message: {query}
+
+--- OUTPUT FORMAT ---
+Respond ONLY with a valid JSON object matching this schema (no markdown formatting, no code fences, no extra text):
+{{
+  "rewritten_query": "<rewritten standalone query>",
+  "new_facts": {{}}
+}}"""
+
+        try:
+            raw_resp = self._call_aux_llm(prompt).strip()
+            
+            # Clean markdown code fences if present
+            cleaned = raw_resp
+            if "```" in cleaned:
+                matches = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
+                if matches:
+                    cleaned = matches[0].strip()
+
+            data = json.loads(cleaned)
+            rewritten_query = data.get("rewritten_query", query).strip()
+            new_facts = data.get("new_facts")
+            if not isinstance(new_facts, dict) or new_facts is None:
+                new_facts = {}
+
+            if rewritten_query and len(rewritten_query) > 5 and rewritten_query != query:
+                logger.info("Query Rewritten: '%s' -> '%s'", query, rewritten_query)
+            if new_facts:
+                logger.info("[MEMORY] Extracted new facts from query: %s", new_facts)
+
+            return (rewritten_query or query), new_facts
+
+        except Exception as e:
+            logger.warning("[MEMORY] Merged rewrite/fact extraction error (%s), falling back to raw query: %s", e, raw_resp if 'raw_resp' in locals() else '')
+            return query, {}
+
+    def summarize_turns_with_groq(self, existing_summary: str, overflowing_turns: list) -> str:
+        """
+        Summarize newly overflowing conversation turns using Groq (fast/cheap).
+        Explicit rule: summary may only compress what is in source turns, never add new claims.
+        Updates/merges into existing_summary rather than restarting from scratch.
+        """
+        if not overflowing_turns:
+            return existing_summary or ""
+
+        turns_text_parts = []
+        for turn in overflowing_turns:
+            turn_idx = turn.get("turn_index", "?")
+            u_text = turn.get("user", "").strip()
+            b_text = turn.get("bot", "").strip()
+            turns_text_parts.append(f"Turn {turn_idx}:\nUser: {u_text}\nSEHAT: {b_text}")
+        turns_text = "\n\n".join(turns_text_parts)
+
+        prompt = f"""You are a medical conversation summarizer for SEHAT AI.
+
+Your task is to produce a concise, clinically accurate rolling summary of the conversation by merging newly overflowing turns into the existing summary.
+
+--- STRICT RULES ---
+1. You may ONLY compress and reflect what is explicitly stated in the source turns and existing summary. NEVER add new claims, invent symptoms, or guess diagnoses.
+2. Retain essential clinical details: patient age/demographics, symptoms and their duration, known conditions, medications mentioned, and key guidance given by SEHAT.
+3. Merge into the existing summary: update and consolidate so previous information is retained in a compact, coherent paragraph.
+4. Output ONLY the updated summary text. No introductions, no bullet labels, no meta-commentary.
+
+--- EXISTING SUMMARY ---
+{existing_summary if existing_summary else "No prior summary."}
+
+--- NEW TURNS TO MERGE ---
+{turns_text}
+
+Updated Summary:"""
+
+        groq_key = (os.getenv("GROQ_API_KEY") or "").strip().strip('"').strip("'")
+        if not groq_key:
+            logger.warning("[SUMMARIZATION] GROQ_API_KEY not configured, keeping existing summary")
+            return existing_summary or ""
+
+        model_name = os.getenv("GROQ_SUMMARIZATION_MODEL", "llama-3.1-8b-instant")
+        logger.info(
+            "[SUMMARIZATION] Triggered rolling summarization for %d turns using Groq (%s)",
+            len(overflowing_turns), model_name
+        )
+
+        try:
+            client = ChatGroq(
+                model_name=model_name,
+                groq_api_key=groq_key,
+                temperature=0.2,
+                max_tokens=512,
+                timeout=30,
+                max_retries=1,
+            )
+            resp = client.invoke(prompt)
+            summary = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+            if summary:
+                logger.info("[SUMMARIZATION] Groq (%s) successfully updated rolling summary (%d chars)", model_name, len(summary))
+                return summary
+            return existing_summary or ""
+        except Exception as e:
+            logger.error("[SUMMARIZATION] Groq summarization call failed: %s", e)
+            return existing_summary or ""

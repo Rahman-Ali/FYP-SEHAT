@@ -130,6 +130,45 @@ def extract_turn_pairs(messages):
     return turns
 
 
+def merge_patient_facts(current_context: dict, new_facts: dict) -> tuple[dict, bool]:
+    """
+    Merge newly extracted patient facts into session.patient_context.
+    - Adds new keys.
+    - If a new fact contradicts an existing one, update it and log the change
+      (do NOT surface to user).
+    - Returns (updated_context, changed_bool).
+    """
+    if not isinstance(current_context, dict):
+        current_context = {}
+    if not isinstance(new_facts, dict) or not new_facts:
+        return current_context, False
+
+    updated = dict(current_context)
+    changed = False
+
+    for key, val in new_facts.items():
+        if val is None or val == "":
+            continue
+        key_norm = str(key).strip().lower()
+        val_str = str(val).strip()
+
+        if key_norm in updated:
+            old_val = str(updated[key_norm]).strip()
+            if old_val != val_str:
+                logger.info(
+                    "[MEMORY] Patient fact update (contradiction resolved) for '%s': '%s' -> '%s'",
+                    key_norm, old_val, val_str
+                )
+                updated[key_norm] = val
+                changed = True
+        else:
+            logger.info("[MEMORY] New patient fact recorded for '%s': '%s'", key_norm, val_str)
+            updated[key_norm] = val
+            changed = True
+
+    return updated, changed
+
+
 class ChatService:
     """Business logic for chat operations."""
     
@@ -188,8 +227,19 @@ class ChatService:
         
         clarification_round = (session.session_metadata or {}).get("clarification_round", 0)
         context = self.rag_service.retrieve_context(
-            query, formatted_history, clarification_round=clarification_round
+            query, formatted_history,
+            clarification_round=clarification_round,
+            rolling_summary=session.rolling_summary,
+            patient_context=session.patient_context
         )
+        
+        # Phase 3: Merge new_facts into session.patient_context
+        new_facts = context.get("extracted_facts") or context.get("new_facts") or {}
+        if new_facts and isinstance(new_facts, dict):
+            updated_ctx, changed = merge_patient_facts(session.patient_context, new_facts)
+            if changed:
+                session.patient_context = updated_ctx
+                session.save(update_fields=['patient_context', 'updated_at'])
         response = self.rag_service.generate_with_context(query, context, formatted_history)
 
         if context.get("status") == "clarifying":

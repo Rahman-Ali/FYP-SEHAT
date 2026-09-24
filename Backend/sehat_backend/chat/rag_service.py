@@ -258,9 +258,11 @@ SUFFICIENT"""
 
     def retrieve_context(
         self, query: str, chat_history: list = None,
-        clarification_round: int = 0
+        clarification_round: int = 0,
+        rolling_summary: str = None,
+        patient_context: dict = None
     ) -> dict:
-        """Steps 1-4 of RAG pipeline with emergency detection + query rewriting.
+        """Steps 1-4 of RAG pipeline with emergency detection + query rewriting + fact extraction.
 
         Args:
             clarification_round: Number of clarifying questions already asked
@@ -268,6 +270,8 @@ SUFFICIENT"""
                 returns status='clarifying' with a follow-up question.
                 On round 5 the clarification gate is skipped and full retrieval
                 is forced regardless (hard cap).
+            rolling_summary: Rolling summary text of older turns.
+            patient_context: Structured dictionary of known patient facts.
         """
         # Run security check first
         sanitize_result = self.llm_service.sanitize_input(query)
@@ -277,7 +281,9 @@ SUFFICIENT"""
                 "chunks": [],
                 "language": "english",
                 "english_query": query,
-                "original_query": query
+                "original_query": query,
+                "extracted_facts": {},
+                "new_facts": {}
             }
 
         status = self.llm_service.validate_query(query)
@@ -289,7 +295,9 @@ SUFFICIENT"""
             "chunks": [],
             "language": language,
             "english_query": query,
-            "original_query": query
+            "original_query": query,
+            "extracted_facts": {},
+            "new_facts": {}
         }
 
         if status in ("invalid", "unclear", "greeting"):
@@ -308,7 +316,9 @@ SUFFICIENT"""
         # Evaluates raw query before rewrite. Hard cap on round 5 forces retrieval.
         if status == "valid" and clarification_round < 5:
             needs_clarify, follow_up = self._needs_clarification(
-                query, chat_history
+                query, chat_history,
+                rolling_summary=rolling_summary,
+                patient_context=patient_context
             )
             if needs_clarify:
                 logger.info(
@@ -322,12 +332,21 @@ SUFFICIENT"""
                     "english_query": query,
                     "original_query": query,
                     "follow_up_question": follow_up,
+                    "extracted_facts": {},
+                    "new_facts": {}
                 }
 
-        # Query rewriting runs only when the query is specific/proceeding to retrieval
+        # Merged query rewriting and patient fact extraction (Phase 3: single LLM call)
         rewritten_query = query
-        if status == "valid" and chat_history:
-            rewritten_query = self.llm_service.rewrite_query(query, chat_history)
+        extracted_facts = {}
+        if status == "valid":
+            rewritten_result = self.llm_service.rewrite_query(
+                query, chat_history, patient_context=patient_context
+            )
+            if isinstance(rewritten_result, tuple):
+                rewritten_query, extracted_facts = rewritten_result
+            else:
+                rewritten_query = rewritten_result
 
         english_query = self.llm_service.translate_to_english(rewritten_query, language)
         chunks = self.vector_service.hybrid_search(english_query)
@@ -335,7 +354,9 @@ SUFFICIENT"""
         base_response.update({
             "chunks": chunks,
             "language": language,
-            "english_query": english_query
+            "english_query": english_query,
+            "extracted_facts": extracted_facts,
+            "new_facts": extracted_facts
         })
 
         return base_response
