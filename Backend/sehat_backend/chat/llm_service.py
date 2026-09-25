@@ -1049,7 +1049,8 @@ Rewritten Question:"""
                 "new_facts": dict,
                 "missing_for_diagnosis": list,
                 "follow_up_question": str,
-                "target_language": str
+                "target_language": str,
+                "subject_reference": str | None   # null = self; non-null = third party ("my wife", "my friend", etc.)
             }
         """
         default_res = {
@@ -1058,7 +1059,8 @@ Rewritten Question:"""
             "new_facts": {},
             "missing_for_diagnosis": [],
             "follow_up_question": "",
-            "target_language": "english"
+            "target_language": "english",
+            "subject_reference": None,
         }
 
         # Cheap pre-filter for initial greetings/acknowledgments without history (saves LLM call)
@@ -1127,6 +1129,15 @@ Perform the following clinical tasks in a SINGLE JSON response:
 6. TARGET LANGUAGE:
    - If translation_request, return the requested language ("roman_urdu" or "english"). Otherwise, the language of the user query ("roman_urdu" or "english").
 
+7. SUBJECT REFERENCE:
+   - If the user's message mentions a THIRD PARTY who is the patient (e.g. "my wife", "my friend has fever",
+     "my uncle has cough", "the patient I'm asking about", "my neighbor's child", "meri biwi", "mera dost",
+     "mera chacha"), extract the EXACT natural-language reference as written (e.g. "my wife", "my friend",
+     "meri biwi"). Use the user's exact wording, do NOT normalize or translate.
+   - If the message is about the USER THEMSELVES (e.g. "I have fever", "mujhe dard hai", no third party
+     mentioned at all), return null.
+   - If ambiguous or no explicit third-party reference, return null (default to self).
+
 --- CONTEXT ---
 Known Patient Context:
 {json.dumps(patient_context, indent=2) if patient_context else "None"}
@@ -1146,7 +1157,8 @@ Respond ONLY with a valid JSON object matching this schema (no markdown fences, 
   "new_facts": {{}},
   "missing_for_diagnosis": [],
   "follow_up_question": "",
-  "target_language": "roman_urdu | english"
+  "target_language": "roman_urdu | english",
+  "subject_reference": null
 }}"""
 
         try:
@@ -1169,10 +1181,13 @@ Respond ONLY with a valid JSON object matching this schema (no markdown fences, 
                 missing_for_diagnosis = []
             follow_up_question = data.get("follow_up_question", "").strip()
             target_language = data.get("target_language", "english").strip().lower()
+            subject_reference = data.get("subject_reference")  # None or str
+            if subject_reference is not None:
+                subject_reference = str(subject_reference).strip() or None
 
             logger.info(
-                "[INTAKE] Intent: %s, missing: %s, facts: %s",
-                intent, missing_for_diagnosis, new_facts
+                "[INTAKE] Intent: %s, missing: %s, facts: %s, subject: %s",
+                intent, missing_for_diagnosis, new_facts, subject_reference
             )
 
             # ── Programmatic baseline check (defense-in-depth, no extra LLM call) ──
@@ -1220,7 +1235,8 @@ Respond ONLY with a valid JSON object matching this schema (no markdown fences, 
                 "new_facts": new_facts,
                 "missing_for_diagnosis": missing_for_diagnosis,
                 "follow_up_question": follow_up_question,
-                "target_language": target_language
+                "target_language": target_language,
+                "subject_reference": subject_reference,
             }
 
         except Exception as e:

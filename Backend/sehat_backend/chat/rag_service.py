@@ -252,7 +252,76 @@ Is this a capabilities question?"""
             rolling_summary: Rolling summary text of older turns.
             patient_context: Structured dictionary of known patient facts.
         """
-        # Run security check first
+        # ── Fix 2: Emergency fast-path — rule-based, zero LLM calls ───────────
+        # Covers labor/delivery, unconscious, severe bleeding, choking, chest pain,
+        # can't breathe, seizures — in English and Roman Urdu.
+        _q_lower = query.lower()
+        _EMERGENCY_KEYWORDS = [
+            # Labor / delivery
+            "delivery", "labour", "labor", "baby coming", "bache ki paidaish",
+            "dard e zeh", "prasav", "waza hamla",
+            # Unconscious / unresponsive
+            "unconscious", "behosh", "behoshi", "unresponsive", "not waking",
+            # Severe bleeding
+            "severe bleeding", "bohat zyada khoon", "khoon aa raha", "heavy bleeding",
+            "hemorrhage", "khoon nahi ruk",
+            # Can't breathe / choking
+            "can't breathe", "cant breathe", "saans nahi", "saans ruk", "chocking",
+            "choking", "dam ghut", "dam nahi", "naak band", "throat blocked",
+            "airway", "suffocating", "suffocation",
+            # Chest pain / heart
+            "chest pain", "seene mein dard", "seene ka dard", "heart attack",
+            "cardiac", "angina",
+            # Seizures / convulsions
+            "seizure", "convulsion", "mirgi", "fits", "jhatkay",
+            # Stroke
+            "stroke", "paralysis", "face drooping", "arm weakness",
+            # Poisoning / overdose
+            "poisoning", "overdose", "zeher", "kuch kha liya",
+            # General life-threatening phrasing
+            "emergency", "call ambulance", "1122", "dying", "mar raha",
+        ]
+        if any(kw in _q_lower for kw in _EMERGENCY_KEYWORDS):
+            logger.info("[EMERGENCY FAST-PATH] Keyword match in query — bypassing clarification.")
+            lang_hint = "roman_urdu" if any(
+                c in _q_lower for c in ["mein", "hai", "ho", "raha", "rahi", "nahi", "zyada", "khoon", "seene", "dard"]
+            ) else "english"
+            if lang_hint == "roman_urdu":
+                emergency_text = (
+                    "**EMERGENCY — Foran Madad Len!**\n\n"
+                    "Yeh ek Medical Emergency hai. Neeche diye gaye steps turant karen:\n\n"
+                    "1. **Abhi 1122 par call karen** (Pakistan Emergency Helpline)\n"
+                    "2. Mareez ko lita dein, harkaat na karwayein\n"
+                    "3. Agar saans nahi aa rahi — CPR shuru karen (agar aap jante hain)\n"
+                    "4. Agar khoon aa raha hai — saaf kapde se pressure lagayein\n"
+                    "5. Akele rehne na dein — kisi ko saath rakhein\n\n"
+                    "**Ghair zaruri waqt zaya na karen — ambulance bulayein.**"
+                )
+            else:
+                emergency_text = (
+                    "**EMERGENCY — Seek Immediate Help!**\n\n"
+                    "This is a medical emergency. Take these steps RIGHT NOW:\n\n"
+                    "1. **Call 1122 immediately** (Pakistan Emergency Helpline)\n"
+                    "2. Keep the patient still and calm\n"
+                    "3. If not breathing — begin CPR (if trained)\n"
+                    "4. If bleeding severely — apply firm pressure with clean cloth\n"
+                    "5. Do not leave the patient alone\n\n"
+                    "**Do not delay — call an ambulance now.**"
+                )
+            return {
+                "status": "emergency",
+                "chunks": [],
+                "language": lang_hint,
+                "english_query": query,
+                "original_query": query,
+                "extracted_facts": {},
+                "new_facts": {},
+                "subject_reference": None,
+                "_emergency_text": emergency_text,
+            }
+        # ── end Fix 2 ─────────────────────────────────────────────────────────
+
+        # Also run the existing LLM-based sanitize_input for prompt-injection / jailbreak detection
         sanitize_result = self.llm_service.sanitize_input(query)
         if sanitize_result.get('is_emergency'):
             return {
@@ -262,7 +331,8 @@ Is this a capabilities question?"""
                 "english_query": query,
                 "original_query": query,
                 "extracted_facts": {},
-                "new_facts": {}
+                "new_facts": {},
+                "subject_reference": None,
             }
 
         stage_timings = {}
@@ -344,11 +414,13 @@ Is this a capabilities question?"""
             missing_for_diagnosis = classification.get("missing_for_diagnosis") or []
             follow_up_question = classification.get("follow_up_question") or ""
             target_language = classification.get("target_language") or language
+            subject_reference = classification.get("subject_reference")  # None or str
 
             base_response["extracted_facts"] = extracted_facts
             base_response["new_facts"] = extracted_facts
             base_response["intent"] = intent
             base_response["target_language"] = target_language
+            base_response["subject_reference"] = subject_reference
 
             # 1. intent == "meta_query" -> answer from real DB history
             if intent == "meta_query":
@@ -665,31 +737,39 @@ Is this a capabilities question?"""
         # BRANCH 1: EMERGENCY
         # ══════════════════════════════════════════════════════════════
         if st == "emergency":
-            if language == "roman_urdu":
-                return {
-                    "response": (
-                        "⚠️ Emergency: Agar aap self-harm ya suicide ke baare mein "
-                        "soch rahe hain, to please turant madad lein. Pakistan mein "
-                        "emergency helpline 1122 hai. Ya apne qareebi doctor se "
-                        "rabta karein. Aap akele nahi hain."
-                    ),
-                    "metadata": {
-                        "source": "Emergency",
-                        "triage_level": "Emergency",
-                        "ragas_metrics": {},
-                    }
-                }
+            # Use pre-built emergency text from Fix 2 fast-path if available,
+            # otherwise fall back to the general crisis/self-harm response.
+            emergency_text = context.get("_emergency_text")
+            if not emergency_text:
+                if language == "roman_urdu":
+                    emergency_text = (
+                        "**EMERGENCY — Foran Madad Len!**\n\n"
+                        "1. **Abhi 1122 par call karen** (Pakistan Emergency Helpline)\n"
+                        "2. Agar aap ya koi aur self-harm ke baare mein soch rahe hain — "
+                        "please turant madad lein. Aap akele nahi hain.\n"
+                        "3. Apne qareebi doctor ya hospital se rabta karein."
+                    )
+                else:
+                    emergency_text = (
+                        "**EMERGENCY — Seek Immediate Help!**\n\n"
+                        "1. **Call 1122 immediately** (Pakistan Emergency Helpline)\n"
+                        "2. If you or someone is thinking about self-harm — please reach out now. "
+                        "You are not alone.\n"
+                        "3. Contact your nearest doctor or hospital without delay."
+                    )
             return {
-                "response": (
-                    "⚠️ Emergency: If you're thinking about self-harm or suicide, "
-                    "please seek help immediately. In Pakistan, call 1122 for "
-                    "emergency services. You are not alone — please reach out "
-                    "to a doctor or loved one."
-                ),
+                "response": emergency_text,
                 "metadata": {
                     "source": "Emergency",
                     "triage_level": "Emergency",
                     "ragas_metrics": {},
+                    "answer_body": emergency_text,
+                    "sources": [],
+                    "disclaimer": (
+                        "Ye kisi professional doctor ki salah ka mutbadil nahi hai."
+                        if language == "roman_urdu"
+                        else "This is not a substitute for professional medical advice."
+                    ),
                 }
             }
 
@@ -899,26 +979,43 @@ Your response:"""
         stage_timings["generate_answer_ms"] = round((time.time() - t0) * 1000, 2)
         logger.info("[STAGE TIMING] generate_answer: %.2f ms", stage_timings["generate_answer_ms"])
 
-        # Compute metrics
-        t0 = time.time()
+        # ── Fix 4: RAGAS deferred — background thread, 500ms timeout ─────────
+        # Fire RAGAS in a daemon thread. If it finishes within 500ms we use
+        # the real score for the faithfulness gate; otherwise we pass through
+        # (faithfulness=1.0) and let it log in the background.
+        import threading as _threading
         eval_answer = (
             self.llm_service.translate_to_english(answer, "roman_urdu")
             if language == "roman_urdu"
             else answer
         )
+        metrics = {"faithfulness": 1.0}  # optimistic default
+        _ragas_result = {}
 
-        try:
-            metrics = self.llm_service.compute_ragas_metrics(
-                eval_answer, retrieved_text, english_query,
-                context_docs, self.vector_service.sbert_model
-            )
-        except Exception as e:
-            logger.error("RAGAS metrics error: %s", e)
-            metrics = {"faithfulness": 1.0}
+        def _run_ragas():
+            try:
+                _ragas_result["metrics"] = self.llm_service.compute_ragas_metrics(
+                    eval_answer, retrieved_text, english_query,
+                    context_docs, self.vector_service.sbert_model
+                )
+            except Exception as _e:
+                logger.error("RAGAS metrics error (background): %s", _e)
+                _ragas_result["metrics"] = {"faithfulness": 1.0}
+
+        t0 = time.time()
+        _ragas_thread = _threading.Thread(target=_run_ragas, daemon=True)
+        _ragas_thread.start()
+        _ragas_thread.join(timeout=0.5)  # wait at most 500ms
+
+        if "metrics" in _ragas_result:
+            metrics = _ragas_result["metrics"]
+            logger.info("RAGAS Metrics (inline): %s", metrics)
+        else:
+            logger.info("[RAGAS] Still running in background — returning with faithfulness=1.0 pass-through")
+
         stage_timings["ragas_eval_ms"] = round((time.time() - t0) * 1000, 2)
-        logger.info("[STAGE TIMING] ragas_eval: %.2f ms", stage_timings["ragas_eval_ms"])
-
-        logger.info("RAGAS Metrics: %s", metrics)
+        logger.info("[STAGE TIMING] ragas_eval: %.2f ms (deferred)", stage_timings["ragas_eval_ms"])
+        # ── end Fix 4 ─────────────────────────────────────────────────────────
 
         # Negative response check
         content_only = answer

@@ -268,6 +268,45 @@ class ChatService:
             rolling_summary=session.rolling_summary,
             patient_context=session.patient_context
         )
+
+        # ── Fix 1b: Subject-switch detection + context reset ──────────────────
+        # If the unified intake call extracted a third-party subject_reference
+        # that differs from the currently stored active subject, the user has
+        # switched to asking about a completely different person. Reset context
+        # entirely so prior facts don't bleed into the new case.
+        subject_reference = context.get("subject_reference")  # str or None
+        meta = session.session_metadata if isinstance(session.session_metadata, dict) else {}
+        active_subject = meta.get("active_subject")  # None = "self" (default)
+
+        if subject_reference is not None:
+            # Normalize for comparison (case-insensitive, strip whitespace)
+            ref_norm = subject_reference.strip().lower()
+            active_norm = (active_subject or "").strip().lower()
+            if ref_norm != active_norm:
+                logger.info(
+                    "[SUBJECT-SWITCH] New subject '%s' detected (was '%s'). Resetting patient_context and clarification_round.",
+                    subject_reference, active_subject or "self"
+                )
+                # Full reset — discard all prior facts for the old subject
+                session.patient_context = {}
+                meta["active_subject"] = subject_reference
+                meta["clarification_round"] = 0
+                clarification_round = 0  # also reset local variable for this turn
+                session.session_metadata = meta
+                session.save(update_fields=["patient_context", "session_metadata", "updated_at"])
+        elif subject_reference is None and active_subject is not None:
+            # User switched back to talking about themselves — reset context
+            logger.info(
+                "[SUBJECT-SWITCH] User returned to self (was '%s'). Resetting patient_context.",
+                active_subject
+            )
+            session.patient_context = {}
+            meta["active_subject"] = None
+            meta["clarification_round"] = 0
+            clarification_round = 0
+            session.session_metadata = meta
+            session.save(update_fields=["patient_context", "session_metadata", "updated_at"])
+        # ── end Fix 1b ────────────────────────────────────────────────────────
         
         # Phase 3: Merge new_facts into session.patient_context
         new_facts = context.get("extracted_facts") or context.get("new_facts") or {}

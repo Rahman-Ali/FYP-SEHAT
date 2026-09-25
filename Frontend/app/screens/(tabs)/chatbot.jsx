@@ -385,8 +385,19 @@ const handleSend = async () => {
 
   } catch (error) {
     console.error("Send Error:", error);
-    isCurrentSessionEmpty.current = true;
-    const errorMsg = createMessage("Connection Error. Please try again.", true, "Error", null);
+    isCurrentSessionEmpty.current = false; // don't reset to empty — user's message is there
+    // Determine user-facing message based on error type (never show Emergency badge)
+    const status = error?.response?.status;
+    let errText = "Couldn't connect to SEHAT AI. Please try again.";
+    if (status === 429) {
+      errText = "Too many requests. Please wait a moment and try again.";
+    } else if (status === 503) {
+      errText = "SEHAT AI is warming up. Please retry in a few seconds.";
+    } else if (error?.code === 'ECONNABORTED' || error?.message?.includes('timeout')) {
+      errText = "Response is taking longer than usual. Please retry.";
+    }
+    // triage: null, sources: [] — ensures NO badge is ever shown on error
+    const errorMsg = createMessage(errText, true, null, null, [], null);
     setMessages([...updatedMessages, errorMsg]);
   } finally {
     setIsSending(false);
