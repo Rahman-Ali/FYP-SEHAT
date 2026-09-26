@@ -36,7 +36,7 @@ export default function Signup() {
 
   const router = useRouter();
   
-  // 🎯 Track email verification check interval
+  // Email verification check interval
   const verificationIntervalRef = useRef(null);
 
   // Cleanup on unmount
@@ -56,7 +56,7 @@ export default function Signup() {
     }
   };
 
-  // 🎯 Start email verification check (NO nested onSnapshot)
+  // Start email verification check (no nested onSnapshot)
   const startEmailVerificationCheck = (user) => {
     return new Promise((resolve) => {
       const interval = setInterval(async () => {
@@ -120,7 +120,7 @@ export default function Signup() {
       // Send Verification Email
       await sendEmailVerification(user);
 
-      // ✅ Mark Registration Complete
+      // Mark registration complete
       await AsyncStorage.setItem(
         "hasCompletedRegistration",
         "true"
@@ -129,7 +129,7 @@ export default function Signup() {
       setIsLoading(false);
       setEmailSent(true);
 
-      // 🎯 Start checking for email verification
+      // Start checking for email verification
       startEmailVerificationCheck(user).then(() => {
         // Email verified, navigate to home
         router.replace("/screens/(tabs)/home");
@@ -148,7 +148,7 @@ export default function Signup() {
     }
   };
 
-  // 🎯 Manual verify button handler
+  // Manual verify button handler
   const handleManualVerify = async () => {
     try {
       const user = auth.currentUser;
@@ -294,9 +294,8 @@ export default function Signup() {
   );
 }
 
-// 🎨 Styles remain exactly the same as original
+// Styles
 const styles = StyleSheet.create({
-  // ... ALL ORIGINAL STYLES UNCHANGED ...
   container: { flex: 1 },
   background: { flex: 1 },
   keyboardView: { flex: 1 },

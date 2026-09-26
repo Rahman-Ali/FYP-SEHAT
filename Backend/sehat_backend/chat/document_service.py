@@ -5,9 +5,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-# ---------------------------------------------------------------------------
 # Reference-section heading patterns (conservative — only clear labels)
-# ---------------------------------------------------------------------------
 _REFERENCE_HEADING_RE = re.compile(
     r'^\s*(references|bibliography|works\s+cited|further\s+reading)\s*$',
     re.IGNORECASE,
@@ -21,27 +19,14 @@ _PAGE_NUMBER_LINE_RE = re.compile(r'^\s*\d{1,4}\s*$')
 
 
 def _clean_pages(docs):
-    """
-    Clean boilerplate from a list of LangChain Document objects (one per page).
-
-    Steps (conservative — bias toward under-removal):
-      1. Detect repeated headers/footers by line frequency across pages.
-         Only remove a line if it appears on ≥50 % of pages AND on ≥3 pages.
-      2. Remove standalone page-number-only lines.
-      3. Detect and skip TOC pages (>= 60 % of non-empty lines match TOC pattern).
-      4. Truncate reference/bibliography sections from heading to end of doc.
-      5. Collapse 3+ consecutive blank lines to 2.
-
-    Returns a new list of Documents with cleaned page_content.
-    Keeps original metadata unchanged.
-    """
+    """Strip repeated headers/footers, page numbers, TOC pages and reference sections from PDF pages."""
     if not docs:
         return docs
 
     total_pages = len(docs)
     threshold = max(3, int(total_pages * 0.50))  # ≥50 % of pages, at least 3
 
-    # ── Step 1: build line-frequency map ────────────────────────────────────
+    # Step 1: build line-frequency map
     line_counts = Counter()
     for doc in docs:
         # Count each unique stripped line once per page
@@ -57,7 +42,7 @@ def _clean_pages(docs):
         line for line, count in line_counts.items() if count >= threshold
     }
 
-    # ── Step 2-4: process each page ─────────────────────────────────────────
+    # Steps 2-4: process each page
     ref_section_started = False  # once True, all subsequent pages are dropped
     cleaned_docs = []
 
@@ -69,14 +54,14 @@ def _clean_pages(docs):
         lines = doc.page_content.splitlines()
         non_empty = [l for l in lines if l.strip()]
 
-        # ── Step 3: skip TOC pages ───────────────────────────────────────────
+        # Step 3: skip TOC pages
         if non_empty:
             toc_lines = sum(1 for l in non_empty if _TOC_LINE_RE.search(l))
             if toc_lines / len(non_empty) >= 0.60:
                 # Skip this page entirely — it's a table of contents
                 continue
 
-        # ── Steps 1, 2, 4: clean line by line ───────────────────────────────
+        # Steps 1, 2, 4: clean line by line
         cleaned_lines = []
         for line in lines:
             stripped = line.strip()
@@ -96,7 +81,7 @@ def _clean_pages(docs):
 
             cleaned_lines.append(line)
 
-        # ── Step 5: collapse excess blank lines ──────────────────────────────
+        # Step 5: collapse excess blank lines
         text = "\n".join(cleaned_lines)
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = text.strip()
@@ -112,9 +97,7 @@ def _clean_pages(docs):
     return cleaned_docs
 
 
-# ---------------------------------------------------------------------------
-# Filename prefix to disease mapping covering all 15 medical document books
-# ---------------------------------------------------------------------------
+# Filename prefix -> disease tag for all 15 books
 FILENAME_PREFIX_TO_DISEASE = {
     "1-": "dengue",
     "2-": "diarrhoea",
@@ -129,10 +112,7 @@ FILENAME_PREFIX_TO_DISEASE = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Real display titles for all 15 medical PDF books
-# Keys are exact basenames of the files in medical_documents/
-# ---------------------------------------------------------------------------
+# Display titles for all 15 PDFs (keys are exact basenames in medical_documents/)
 FILENAME_TO_DISPLAY_TITLE = {
     "1-DENGUE-WHO-BOOK.pdf":
         "Dengue: Guidelines for Diagnosis, Treatment, Prevention and Control",
@@ -168,12 +148,7 @@ FILENAME_TO_DISPLAY_TITLE = {
 
 
 def get_display_title(filename: str) -> str:
-    """Return the curated human-readable title for a PDF file.
-
-    Looks up the exact basename in FILENAME_TO_DISPLAY_TITLE.  If not found
-    (e.g. a user-uploaded book with a non-standard name), falls back to a
-    cleaned version of the filename (hyphens/underscores → spaces, no ext).
-    """
+    """Return the curated title for a PDF, or a cleaned-up filename if it has none."""
     basename = os.path.basename(filename)
     if basename in FILENAME_TO_DISPLAY_TITLE:
         return FILENAME_TO_DISPLAY_TITLE[basename]
@@ -187,12 +162,7 @@ def get_display_title(filename: str) -> str:
 
 
 def get_disease_from_filename(filename: str) -> str:
-    """Derive disease tag from filename prefix or keywords.
-
-    Maps all 15 standard medical document books to their corresponding disease tag:
-    dengue, diarrhoea, hepatitis_a, influenza, tuberculosis, malaria,
-    skin_allergy, typhoid, common_cold, uti.
-    """
+    """Derive the disease tag from the filename prefix or keywords."""
     clean_name = os.path.basename(filename).strip()
     for prefix in sorted(FILENAME_PREFIX_TO_DISEASE.keys(), key=len, reverse=True):
         if clean_name.startswith(prefix):
@@ -232,20 +202,11 @@ class DocumentService:
         source_hash: str | None = None,
         disease: str | None = None,
     ):
-        """Load PDF and split into chunks.
-
-        Args:
-            pdf_path: Absolute path to the PDF file.
-            source_hash: Optional SHA-256 hex digest of the file bytes. When
-                provided it is stored as ``source_hash`` in every chunk's
-                metadata so Neo4j nodes carry the hash for future comparisons.
-            disease: Optional disease classification tag. If omitted, it is
-                derived automatically from the filename prefix.
-        """
+        """Load a PDF and split it into chunks tagged with source_hash and disease."""
         loader = PyPDFLoader(pdf_path)
         docs = loader.load()
 
-        # ── Clean boilerplate before chunking ────────────────────────────────
+        # Clean boilerplate before chunking
         docs = _clean_pages(docs)
 
         splitter = RecursiveCharacterTextSplitter(

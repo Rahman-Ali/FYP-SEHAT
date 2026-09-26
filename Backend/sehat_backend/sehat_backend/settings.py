@@ -71,8 +71,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'sehat_backend.wsgi.application'
 
-# PostgreSQL Database
-# Database: SQLite in-memory for fast testing, PostgreSQL (Neon) for runtime
+# Database: SQLite in-memory for tests, PostgreSQL (Neon) at runtime
 if 'test' in sys.argv:
     DATABASES = {
         'default': {

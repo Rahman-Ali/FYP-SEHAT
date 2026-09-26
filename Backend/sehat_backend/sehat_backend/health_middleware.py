@@ -3,11 +3,7 @@ from django.http import HttpResponse
 
 
 class HealthCheckMiddleware:
-    """Lightweight health check middleware that intercepts /healthz and /readyz.
-
-    Placed first in MIDDLEWARE so it responds before SecurityMiddleware,
-    avoiding ALLOWED_HOSTS or SSL-redirect issues for health probers / tunnels.
-    """
+    """Answer /healthz and /readyz first in MIDDLEWARE, before SecurityMiddleware (ALLOWED_HOSTS / SSL redirect)."""
 
     def __init__(self, get_response):
         self.get_response = get_response

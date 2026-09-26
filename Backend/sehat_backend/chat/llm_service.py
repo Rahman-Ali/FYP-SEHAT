@@ -72,9 +72,7 @@ class LLMService:
             os.getenv("AUX_LLM_PROVIDER_ORDER", "groq_first")
         )
 
-    # ═══════════════════════════════════════════════════════════════
     # SECURITY: Input Sanitization
-    # ═══════════════════════════════════════════════════════════════
 
     ATTACK_PATTERNS = [
         r'ignore\s+(all\s+)?(previous|above|your)\s+instructions',
@@ -119,13 +117,7 @@ class LLMService:
     ]
 
     def should_skip_fact_extraction(self, query: str) -> bool:
-        """
-        Cheap pre-filter rule before LLM fact extraction:
-        Skip if:
-        1. Greeting (reusing GREETING_PATTERNS regex)
-        2. Under ~4 words (len(words) < 4)
-        3. Pure acknowledgment ('ok', 'thanks', 'yes', 'no', etc.)
-        """
+        """Cheap pre-filter: skip fact extraction for greetings, acknowledgments and messages under 4 words."""
         q = (query or "").strip().lower()
         q_clean = q.rstrip('!.,;:? ')
 
@@ -147,10 +139,7 @@ class LLMService:
         return False
 
     def sanitize_input(self, query: str) -> dict:
-        """
-        Check query for attack patterns and self-harm.
-        Returns: {'safe': bool, 'reason': str, 'is_emergency': bool}
-        """
+        """Check a query for prompt-injection patterns; returns {safe, reason, is_emergency}."""
         query_lower = query.lower().strip()
 
         if len(query) > 500:
@@ -171,9 +160,7 @@ class LLMService:
 
         return {'safe': True, 'reason': '', 'is_emergency': False}
 
-    # ═══════════════════════════════════════════════════════════════
     # QUERY VALIDATION
-    # ═══════════════════════════════════════════════════════════════
 
     def validate_query(self, query: str) -> str:
 
@@ -211,7 +198,7 @@ class LLMService:
 
 
 
-        # [FIX] Short queries — allow as follow-ups with history context
+        # Short queries pass as valid (they may be follow-ups that need history)
 
         words = query_clean.split()
 
@@ -278,9 +265,7 @@ class LLMService:
             logger.error("Validation error: %s", e)
 
             return "unclear"
-    # ═══════════════════════════════════════════════════════════════
     # LANGUAGE DETECTION
-    # ═══════════════════════════════════════════════════════════════
 
     def detect_language(self, query: str) -> str:
         """Returns: 'roman_urdu', 'english', 'invalid_hindi'"""
@@ -312,9 +297,7 @@ class LLMService:
             logger.error("Language detection error: %s", e)
             return "english"
 
-    # ═══════════════════════════════════════════════════════════════
     # TRANSLATION
-    # ═══════════════════════════════════════════════════════════════
 
     def translate_to_english(self, query: str, language: str) -> str:
         """Translate Roman Urdu to English. No length truncation."""
@@ -362,14 +345,12 @@ class LLMService:
             logger.error("Translation error: %s", e)
             return query
 
-    # ═══════════════════════════════════════════════════════════════
     # RELEVANCE CHECK
-    # ═══════════════════════════════════════════════════════════════
 
     def verify_relevance(self, english_query: str, retrieved_text: str, chat_history: list = None) -> bool:
         """Check if retrieved text answers the question with history context."""
         
-        # [MEMORY] Format history for context
+        # Format history for context
         history_context = ""
         if chat_history and len(chat_history) > 0:
             history_parts = []
@@ -412,16 +393,10 @@ class LLMService:
             logger.error("Relevance check error: %s", e)
             return True
 
-    # ═══════════════════════════════════════════════════════════════
     # TRIAGE CLASSIFICATION
-    # ═══════════════════════════════════════════════════════════════
 
     def classify_triage(self, query: str, answer: str) -> str:
-        """Classify urgency level of user symptoms/query and generated advice.
-
-        Returns one of: 'Emergency', 'Doctor', 'Self-Care'.
-        Defaults to 'Doctor' on any error or timeout.
-        """
+        """Classify urgency as Emergency, Doctor or Self-Care; defaults to Doctor on any error."""
         prompt = (
             "You are a medical triage urgency classifier.\n"
             "Judge clinical risk from meaning (any language, spelling, or wording) and assign exactly ONE level.\n\n"
@@ -457,10 +432,7 @@ class LLMService:
             logger.warning("[AUX LLM] Triage classification failed (%s), defaulting to Doctor", e)
             return "Doctor"
         
-    # ═══════════════════════════════════════════════════════════════
-    # AUXILIARY LLM CALL  (lang-detect · rewrite · relevance · greet)
-    # Controlled by AUX_LLM_PROVIDER_ORDER env var (groq_first|gemini_first)
-    # ═══════════════════════════════════════════════════════════════
+    # AUXILIARY LLM CALL (order set by AUX_LLM_PROVIDER_ORDER: groq_first | gemini_first)
 
     def _aux_provider_call(self, provider: str, prompt: str) -> str:
         """Call a single provider and return raw text. Raises on any failure."""
@@ -489,8 +461,7 @@ class LLMService:
                     _groq_blocked_until = time.time() + _retry_after_seconds(e)
                     logger.warning("[AUX LLM] Groq rate-limited; skipping it for %.0fs", _groq_blocked_until - time.time())
                 raise
-            # gpt-oss can spend the whole max_tokens budget on reasoning and return empty or
-            # cut-off output; treat that as a failure so the chain falls back to a complete answer.
+            # gpt-oss may spend max_tokens on reasoning (empty/cut-off output): treat as a failure.
             if (getattr(resp, "response_metadata", None) or {}).get("finish_reason") == "length":
                 raise ValueError("Groq output truncated at max_tokens")
             return (resp.content if hasattr(resp, "content") else str(resp)).strip()
@@ -515,17 +486,7 @@ class LLMService:
         raise ValueError(f"Unknown provider: {provider}")
 
     def _call_aux_llm(self, prompt: str) -> str:
-        """
-        Shared chain for the 5 lightweight aux functions:
-          detect_language · rewrite_query · verify_relevance
-          · detect_capabilities_query · greeting/capabilities generation
-
-        Order (AUX_LLM_PROVIDER_ORDER, default groq_first):
-          groq_first   -> Groq(openai/gpt-oss-20b) -> Gemini(gemini-3.1-flash-lite) -> OpenAI
-          gemini_first -> Gemini(gemini-3.1-flash-lite) -> Groq(openai/gpt-oss-20b) -> OpenAI
-
-        Main answer generation (Gemini->Groq via _call_generation_llm) is NOT affected.
-        """
+        """Shared aux LLM chain: Groq -> Gemini -> OpenAI (order from AUX_LLM_PROVIDER_ORDER)."""
         order = os.getenv("AUX_LLM_PROVIDER_ORDER", "groq_first").strip().lower()
         primary, secondary = ("gemini", "groq") if order == "gemini_first" else ("groq", "gemini")
 
@@ -567,14 +528,10 @@ class LLMService:
 
         raise RuntimeError("[AUX LLM] All providers exhausted — Groq, Gemini, and OpenAI all failed")
 
-    # ═══════════════════════════════════════════════════════════════
     # CAPABILITIES & GREETINGS (AUX LLM)
-    # ═══════════════════════════════════════════════════════════════
 
     def detect_capabilities_query(self, query_text: str) -> bool:
-        """
-        LLM-based detection of capabilities/greeting queries.
-        """
+        """LLM-based detection of capabilities/greeting queries."""
         prompt = f"""Determine if the user is asking about what SEHAT can do,
 what help it provides, what questions can be asked, or who/what SEHAT is.
 
@@ -663,15 +620,9 @@ Your response:"""
             "and medical guidance for conditions like dengue, malaria, typhoid, influenza, and diarrhea."
         )
 
-    # ═══════════════════════════════════════════════════════════════
     # ANSWER GENERATION (GEMINI PRIMARY -> GROQ FALLBACK)
-    # ═══════════════════════════════════════════════════════════════
     def _call_generation_llm(self, prompt: str) -> str:
-        """
-        Generate answer using Google Gemini (gemini-3.1-flash-lite) as sole primary.
-        Falls back to Groq (llama-3.1-8b-instant) on exception, timeout, or empty response.
-        No OpenAI call anywhere in this path.
-        """
+        """Generate the answer with Gemini; fall back to Groq (GROQ_MODEL) on error, timeout or empty output."""
         # 1. Primary: Google Gemini (gemini-3.1-flash-lite)
         google_api_key = os.getenv("GOOGLE_API_KEY")
         if google_api_key:
@@ -815,7 +766,7 @@ Your response:"""
         combined_memory = "\n\n".join(memory_sections)
         context_block = f"CONVERSATION CONTEXT:\n{combined_memory}\n\n" if combined_memory else ""
 
-        # ── Structured generation prompt (user-approved template) ────────────
+        # Structured generation prompt
         prompt = (
             f"You are SEHAT, an expert AI medical assistant providing healthcare guidance "
             f"based on official WHO/EAU medical guidelines.\n\n"
@@ -869,10 +820,7 @@ Your response:"""
                     )
                     return no_info_msg, model_name
 
-            # [BUG2 FIX] Urdu purity check for Roman Urdu responses
-            # Step 1 (HARD GATE): Detect native Arabic-script Urdu (Unicode \u0600-\u06FF).
-            # This MUST run first — a native-script answer has 0 English indicators, so the
-            # old count-based check never fired. Regex is cheap, no LLM call.
+            # Roman Urdu purity: first catch Arabic-script Urdu (the English-word check below misses it).
             if language == "roman_urdu":
                 arabic_script_count = sum(
                     1 for ch in answer if '\u0600' <= ch <= '\u06FF'
@@ -904,7 +852,7 @@ Your response:"""
                     except Exception as e:
                         logger.error("[BUG2] Arabic-script retry failed: %s", e)
 
-                # Step 2: English-language leakage check (original logic, unchanged)
+                # Then check for English leakage
                 english_indicators = [
                     " the ", " is ", " are ", " was ", " were ", " have ", " has ",
                     " this ", " that ", " with ", " from ", " they ", " them ",
@@ -946,9 +894,7 @@ Your response:"""
         except Exception as e:
             logger.error("Generation error: %s", e)
             return no_info_msg, "unknown"
-   # ═══════════════════════════════════════════════════════════════
     # RAGAS METRICS
-    # ═══════════════════════════════════════════════════════════════
 
     def compute_ragas_metrics(
         self, answer: str, retrieved_text: str,
@@ -1065,20 +1011,7 @@ Rewritten Question:"""
     def classify_and_rewrite_query(
         self, query: str, chat_history: list = None, patient_context: dict = None, clarification_round: int = 0
     ) -> dict:
-        """
-        Unified single-call doctor intake reasoning, intent classification, query rewriting,
-        patient fact extraction, and diagnostic gap tracking.
-        Returns:
-            {
-                "intent": "new_symptom_info | followup_answer | meta_query | translation_request | off_topic | sufficient_for_answer",
-                "rewritten_query": str,
-                "new_facts": dict,
-                "missing_for_diagnosis": list,
-                "follow_up_question": str,
-                "target_language": str,
-                "subject_reference": str | None   # null = self; non-null = third party ("my wife", "my friend", etc.)
-            }
-        """
+        """Single LLM call: intake reasoning, intent, query rewrite, new facts, missing details and triage."""
         default_res = {
             "intent": "sufficient_for_answer",
             "rewritten_query": query,
@@ -1243,9 +1176,7 @@ Respond ONLY with a valid JSON object matching this schema (no markdown fences, 
                 intent, triage_level, missing_for_diagnosis, new_facts, subject_reference
             )
 
-            # ── Programmatic baseline check (defense-in-depth, no extra LLM call) ──
-            # If LLM still wants clarification but combined facts already cover 3 clinical
-            # dimensions (primary symptom + timing + one additional descriptor), promote to answer.
+            # Promote to an answer if combined facts already cover symptom + timing + one more descriptor.
             if intent in ("new_symptom_info", "followup_answer") and missing_for_diagnosis and clarification_round < 5:
                 combined = {**(patient_context or {}), **(new_facts or {})}
                 combined_keys = " ".join(k.lower() for k in combined)
@@ -1271,7 +1202,7 @@ Respond ONLY with a valid JSON object matching this schema (no markdown fences, 
                     missing_for_diagnosis = []
                     follow_up_question = ""
 
-            # ── Hard cap: if clarification_round >= 5, force answer regardless of intent ──
+            # Hard cap: after 5 clarification rounds, answer regardless of intent
             if clarification_round >= 5 and intent not in ("meta_query", "translation_request", "capabilities_query", "small_talk", "off_topic"):
                 if intent != "sufficient_for_answer":
                     logger.info(
@@ -1307,18 +1238,12 @@ Respond ONLY with a valid JSON object matching this schema (no markdown fences, 
     def rewrite_query(
         self, query: str, chat_history: list = None, patient_context: dict = None
     ) -> tuple[str, dict]:
-        """
-        Backwards-compatible wrapper calling classify_and_rewrite_query.
-        Returns:
-            (rewritten_query: str, new_facts: dict)
-        """
+        """Backwards-compatible wrapper; returns (rewritten_query, new_facts)."""
         res = self.classify_and_rewrite_query(query, chat_history=chat_history, patient_context=patient_context)
         return res.get("rewritten_query", query), res.get("new_facts", {})
 
     def translate_response(self, text: str, target_language: str) -> str:
-        """Translate previous bot message into target_language (roman_urdu or english).
-        Applies Roman-Urdu purity check (Arabic-script detector) to guarantee Latin letters.
-        """
+        """Translate the previous bot message to target_language, with the Roman Urdu purity check."""
         if not text or not text.strip():
             return "No previous response to translate."
 
@@ -1373,11 +1298,7 @@ Respond ONLY with a valid JSON object matching this schema (no markdown fences, 
             return text
 
     def summarize_turns_with_groq(self, existing_summary: str, overflowing_turns: list) -> str:
-        """
-        Summarize newly overflowing conversation turns using Groq (fast/cheap).
-        Explicit rule: summary may only compress what is in source turns, never add new claims.
-        Updates/merges into existing_summary rather than restarting from scratch.
-        """
+        """Merge overflowing turns into the rolling summary via Groq (compress only, never add claims)."""
         if not overflowing_turns:
             return existing_summary or ""
 

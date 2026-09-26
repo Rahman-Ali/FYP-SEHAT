@@ -10,13 +10,13 @@ export default function RootLayout() {
   const router = useRouter();
   const segments = useSegments();
   
-  // 🎯 Track all listeners for proper cleanup
+  // Track all listeners for cleanup
   const roleUnsubscribeRef = useRef(null);
   const authUnsubscribeRef = useRef(null);
   
   const [initialized, setInitialized] = useState(false);
 
-  // 🎯 Initial route guard (ONE-TIME CHECK)
+  // Initial route guard (one-time check)
   useEffect(() => {
     const checkAuthAndRedirect = async () => {
       try {
@@ -60,7 +60,7 @@ export default function RootLayout() {
     checkAuthAndRedirect();
   }, []);
 
-  // 🎯 Auth state + Role listener (PROPERLY CLEANED)
+  // Auth state + role listener
   useEffect(() => {
     const setupListeners = () => {
       // Cleanup previous role listener
@@ -72,7 +72,7 @@ export default function RootLayout() {
       const user = auth.currentUser;
       if (!user) return;
 
-      // 🎯 Single role listener with proper cleanup
+      // Single role listener
       roleUnsubscribeRef.current = onRoleChange(user.uid, (newRole, oldRole) => {
         Alert.alert(
           "Role Updated",
@@ -91,7 +91,7 @@ export default function RootLayout() {
       });
     };
 
-    // 🎯 Auth listener - stored for cleanup
+    // Auth listener (stored for cleanup)
     authUnsubscribeRef.current = auth.onAuthStateChanged((user) => {
       if (user) {
         setupListeners();
@@ -109,7 +109,7 @@ export default function RootLayout() {
       setupListeners();
     }
 
-    // 🎯 Complete cleanup on unmount
+    // Cleanup on unmount
     return () => {
       if (authUnsubscribeRef.current) {
         authUnsubscribeRef.current();

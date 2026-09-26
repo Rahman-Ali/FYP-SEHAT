@@ -17,9 +17,7 @@ logger = logging.getLogger(__name__)
 _EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="sehat-llm")
 
 
-# ---------------------------------------------------------------------------
 # File-hash helper
-# ---------------------------------------------------------------------------
 
 def _compute_file_hash(path: str) -> str:
     """Return the SHA-256 hex digest of *path*'s raw bytes."""
@@ -42,21 +40,10 @@ class RAGService:
             'medical_documents'
         )
 
-    # ========================================================================
     # DOCUMENT MANAGEMENT
-    # ========================================================================
 
     def load_document(self, pdf_path: str, book_name: str) -> str:
-        """Load a PDF document into the RAG system.
-
-        Skip-if-unchanged: computes SHA-256 of the file bytes and compares it
-        to the hash stored in Neo4j.  If they match (and FORCE_REINGEST is not
-        set) the file is skipped entirely — no delete, no embedding, no upload.
-
-        Set FORCE_REINGEST=true in the environment to bypass the hash check and
-        always re-ingest every file (useful after cleaning-logic changes that
-        don't alter file bytes).
-        """
+        """Load a PDF into the RAG index; unchanged files are skipped by SHA-256 hash unless FORCE_REINGEST is set."""
         filename = os.path.basename(pdf_path)
         force = os.getenv("FORCE_REINGEST", "false").strip().lower() in (
             "1", "true", "yes"
@@ -83,7 +70,7 @@ class RAGService:
 
             logger.info("[INGEST] loading: %s (force=%s)", filename, force)
 
-            # ── Delete stale chunks first (replace, not append) ───────────────
+            # Delete stale chunks first (replace, not append)
             deleted = self.vector_service.delete_chunks_by_source(filename)
             if deleted:
                 logger.info(
@@ -137,11 +124,7 @@ class RAGService:
             return {"success": False, "filename": filename, "error": str(e)}
 
     def get_loaded_documents(self) -> dict:
-        """Get list of all documents currently in the system.
-
-        Returns:
-            dict with 'success' (bool), 'documents' (list), 'error' (str|None)
-        """
+        """Return {success, documents, error} for all indexed documents."""
         try:
             neo4j_docs = self.vector_service.get_document_list()
             file_docs = self.doc_service.list_pdf_files(self.medical_docs_dir)
@@ -165,15 +148,10 @@ class RAGService:
             logger.error("Error getting document list: %s", e)
             return {"success": False, "documents": [], "error": str(e)}
 
-    # ========================================================================
     # QUERY CLASSIFICATION HELPERS
-    # ========================================================================
 
     def detect_capabilities_query(self, query_text: str) -> bool:
-        """
-        LLM-based detection of capabilities/greeting queries.
-        Only called for short queries to save API costs.
-        """
+        """LLM check for capabilities/greeting questions (short queries only)."""
         prompt = f"""Determine if the user is asking about what SEHAT can do,
 what help it provides, what questions can be asked, or who/what SEHAT is.
 
@@ -198,8 +176,7 @@ Is this a capabilities question?"""
             return False
 
     def _build_meta_history_answer(self, query: str, chat_history: list, patient_context: dict) -> str:
-        """Answer meta queries directly from backend-authoritative DB history without hallucination.
-        Intent is classified by the LLM upstream — no phrase matching here."""
+        """Answer meta queries from the stored chat history (intent is decided upstream by the LLM)."""
         user_msgs = [m for m in (chat_history or []) if m.get("sender") == "user"]
         if not user_msgs:
             return "I don't have access to any previous questions in this conversation yet."
@@ -235,9 +212,7 @@ Is this a capabilities question?"""
             return True, res.get("follow_up_question", "Could you provide more details?")
         return False, ""
 
-    # ========================================================================
     # CONTEXT RETRIEVAL
-    # ========================================================================
 
     def retrieve_context(
         self, query: str, chat_history: list = None,
@@ -245,17 +220,7 @@ Is this a capabilities question?"""
         rolling_summary: str = None,
         patient_context: dict = None
     ) -> dict:
-        """Steps 1-4 of RAG pipeline with emergency detection + query rewriting + fact extraction.
-
-        Args:
-            clarification_round: Number of clarifying questions already asked
-                for this session.  If < 5 and the query is under-specified,
-                returns status='clarifying' with a follow-up question.
-                On round 5 the clarification gate is skipped and full retrieval
-                is forced regardless (hard cap).
-            rolling_summary: Rolling summary text of older turns.
-            patient_context: Structured dictionary of known patient facts.
-        """
+        """Classify, rewrite and retrieve context for a query (clarification capped at 5 rounds)."""
         # Also run the existing LLM-based sanitize_input for prompt-injection / jailbreak detection
         sanitize_result = self.llm_service.sanitize_input(query)
         if sanitize_result.get('is_emergency'):
@@ -272,8 +237,7 @@ Is this a capabilities question?"""
 
         stage_timings = {}
 
-        # validate_query, detect_language and the intake classifier only need the raw
-        # query/history, so run them concurrently; results are applied in the original order.
+        # These three only need the raw query/history, so they run concurrently.
         use_classifier = "_needs_clarification" not in self.__dict__
         q_clean = query.lower().strip().rstrip('!.,;:? ')
         if any(re.match(p, q_clean) for p in self.llm_service.GREETING_PATTERNS):
@@ -283,8 +247,7 @@ Is this a capabilities question?"""
             is_regex_greeting = False
         t0 = time.time()
         f_status = _EXECUTOR.submit(self.llm_service.validate_query, query)
-        # Regex greetings: local language rule (matched the LLM on all 26 greeting forms tested:
-        # salam family -> roman_urdu, everything else -> english). Others keep the LLM detector.
+        # Regex greetings use a local language rule (matches the LLM on all tested forms).
         f_lang = None if is_regex_greeting else _EXECUTOR.submit(self.llm_service.detect_language, query)
         f_cls = _EXECUTOR.submit(
             self.llm_service.classify_and_rewrite_query, query,
@@ -315,9 +278,7 @@ Is this a capabilities question?"""
             "stage_timings": stage_timings,
         }
 
-        # Safety: a classifier Emergency overrides an "unclear"/"invalid" validation result
-        # (never for inputs blocked by the prompt-injection filter). No extra call: the
-        # classifier is already running in parallel.
+        # Safety: a classifier Emergency overrides an unclear/invalid validation (never for prompt-injection inputs).
         cls_emergency = (
             f_cls is not None
             and status in ("invalid", "unclear")
@@ -334,8 +295,7 @@ Is this a capabilities question?"""
             base_response["language"] = language
             return base_response
 
-        # ── General Conversational Intake Reasoning (Unified Single Call) ──
-        # Check if _needs_clarification was specifically mocked on this instance (for tests)
+        # Intake reasoning (the _needs_clarification path is only used when tests mock it)
         if "_needs_clarification" in self.__dict__:
             t0 = time.time()
             rewritten_result = self.llm_service.rewrite_query(
@@ -507,20 +467,10 @@ Is this a capabilities question?"""
 
 
 
-    # ========================================================================
     # CITATION BUILDER
-    # ========================================================================
 
     def _build_citations(self, context_docs: list) -> tuple:
-        """Build retrieved text, citation string block, and structured sources list.
-
-        Returns:
-            retrieved_text (str): numbered context blocks for the LLM prompt.
-            cite_block (str):     "--- Sources ---" string for plain-text fallback.
-            pages_str (str):      comma-separated page numbers.
-            sources (list):       structured list of {title, pages} dicts for the
-                                  structured API response (Phase 2).
-        """
+        """Return (retrieved_text, cite_block, pages_str, sources) for the retrieved chunks."""
         blocks = []
         pages = []
         citations_dict = {}    # book_name  -> set of page nums
@@ -584,9 +534,7 @@ Is this a capabilities question?"""
 
         return retrieved_text, cite, pages_str, sources
 
-    # ========================================================================
     # MAIN GENERATION FLOW
-    # ========================================================================
 
     def generate_with_context(
         self, query: str, context_data: dict, chat_history: list = None,
@@ -594,7 +542,7 @@ Is this a capabilities question?"""
     ) -> dict:
         """Steps 5-6 of RAG pipeline with full response handling."""
 
-        # ── HELPER: No-info message ──────────────────────────────────────
+        # No-info message
         def no_info(lang):
             if lang == "roman_urdu":
                 return (
@@ -606,7 +554,7 @@ Is this a capabilities question?"""
                 "knowledge base. Please consult a doctor."
             )
 
-        # ── HELPER: Capabilities response ────────────────────────────────
+        # Capabilities response
         def get_capabilities_response(lang):
             if lang == "roman_urdu":
                 return (
@@ -630,17 +578,15 @@ Is this a capabilities question?"""
                 "Just describe your symptoms or ask a medical question — I'm here to help!"
             )
 
-        # ── HELPER: Check if query is short (for capabilities detection) ──
+        # Short-query check (for capabilities detection)
         def is_short_query(text):
             return len(text.split()) <= 10 and len(text) <= 80
 
-        # ── INITIAL DATA ──────────────────────────────────────────────────
+        # Initial data
         st = context_data.get("status", "valid")
         language = context_data.get("language", "english")
 
-        # ══════════════════════════════════════════════════════════════
-        # BRANCH 0: CLARIFYING (Phase 3)
-        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0: CLARIFYING
         if st == "clarifying":
             follow_up = context_data.get("follow_up_question", "")
             if not follow_up:
@@ -667,9 +613,7 @@ Is this a capabilities question?"""
                 }
             }
 
-        # ══════════════════════════════════════════════════════════════
-        # BRANCH 0b: META_HISTORY — answer from real DB history (Bug 1 fix)
-        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0b: META_HISTORY — answer from stored history
         if st == "meta_history":
             meta_answer = context_data.get("meta_answer", "I can't retrieve that from our conversation history.")
             # Answer the follow-up from the actual history; keep the deterministic answer as fallback.
@@ -710,9 +654,7 @@ Is this a capabilities question?"""
             }
 
 
-        # ══════════════════════════════════════════════════════════════
-        # BRANCH 0c: TRANSLATION_REQUEST — re-render last bot message in target language
-        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0c: TRANSLATION_REQUEST
         if st == "translation_request":
             last_bot_text = ""
             for m in reversed(chat_history or []):
@@ -743,9 +685,7 @@ Is this a capabilities question?"""
                 }
             }
 
-        # ══════════════════════════════════════════════════════════════
-        # BRANCH 0d: OFF_TOPIC — polite no-info response, patient facts retained
-        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0d: OFF_TOPIC
         if st == "off_topic":
             out_of_scope = (
                 "Main sirf sehat se mutaliq sawalon mein madad kar sakta hoon."
@@ -765,9 +705,7 @@ Is this a capabilities question?"""
                 }
             }
 
-        # ══════════════════════════════════════════════════════════════
-        # BRANCH 0e: SMALL_TALK — short friendly reply, invite a health question
-        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0e: SMALL_TALK
         if st == "small_talk":
             small_talk = (
                 "Shukriya! Main SEHAT hoon, aapka health assistant. Aap apni sehat ke baare mein kya poochna chahenge?"
@@ -787,12 +725,9 @@ Is this a capabilities question?"""
                 }
             }
 
-        # ══════════════════════════════════════════════════════════════
         # BRANCH 1: EMERGENCY
-        # ══════════════════════════════════════════════════════════════
         if st == "emergency":
-            # "Call 1122" header + situation-specific first-aid steps from the classifier,
-            # otherwise fall back to the general crisis/self-harm response.
+            # "Call 1122" header + the classifier's first-aid steps; generic crisis text if none.
             emergency_text = None
             emergency_advice = (context_data.get("_emergency_advice") or "").strip()
             if emergency_advice:
@@ -841,12 +776,9 @@ Is this a capabilities question?"""
                 }
             }
 
-        # ══════════════════════════════════════════════════════════════
         # BRANCH 2: GREETING
-        # ══════════════════════════════════════════════════════════════
         if st == "greeting":
-            # Template reply for regex-matched greetings (no LLM call); same style as the
-            # previous LLM greeting: return the greeting, introduce SEHAT, invite a health question.
+            # Template reply for regex greetings (no LLM call).
             g = query.lower().strip().rstrip('!.,;:? ')
             if language == "roman_urdu":
                 greeting_text = (
@@ -873,11 +805,7 @@ Is this a capabilities question?"""
                 "metadata": {"source": "Greeting (Template)", "language": language, "ragas_metrics": {}}
             }
 
-                # ══════════════════════════════════════════════════════════════
-        # BRANCH 3: CAPABILITIES (LLM-generated, no hardcoded text)
-        # ══════════════════════════════════════════════════════════════
-        # The intake classifier already decides this (intent "capabilities_query" -> status
-        # "capabilities"); the separate LLM check only runs when the classifier did not.
+        # BRANCH 3: CAPABILITIES (classifier intent; separate LLM check only if the classifier didn't run)
         if st == "capabilities" or (
             "intent" not in context_data and is_short_query(query) and self.detect_capabilities_query(query)
         ):
@@ -931,9 +859,7 @@ Your response:"""
                     "metadata": {"source": "Capabilities (Fallback)", "ragas_metrics": {}}
                 }
 
-        # ══════════════════════════════════════════════════════════════
         # BRANCH 4: INVALID
-        # ══════════════════════════════════════════════════════════════
         if st == "invalid":
             if language == "roman_urdu":
                 return {
@@ -946,9 +872,7 @@ Your response:"""
                 "metadata": {"source": "Validation", "ragas_metrics": {}}
             }
 
-        # ══════════════════════════════════════════════════════════════
         # BRANCH 5: UNCLEAR
-        # ══════════════════════════════════════════════════════════════
         if st == "unclear":
             if language == "roman_urdu":
                 return {
@@ -962,9 +886,7 @@ Your response:"""
                 "metadata": {"source": "Validation", "ragas_metrics": {}}
             }
 
-        # ══════════════════════════════════════════════════════════════
         # BRANCH 6: HINDI
-        # ══════════════════════════════════════════════════════════════
         if st == "invalid_hindi":
             return {
                 "response": (
@@ -975,15 +897,13 @@ Your response:"""
                 "metadata": {"source": "Validation", "ragas_metrics": {}}
             }
 
-        # ══════════════════════════════════════════════════════════════
-        # BRANCH 7: VALID - MAIN RAG PIPELINE
-        # ══════════════════════════════════════════════════════════════
+        # BRANCH 7: MAIN RAG PIPELINE
         context_docs = context_data.get("chunks", [])
         english_query = context_data.get("english_query", query)
         original_query = context_data.get("original_query", query)
         triage_level = context_data.get("triage_level")
 
-        # ── HELPER: fallback when no answer can be produced (triage-aware) ──
+        # Triage-aware fallback when no answer can be produced
         def no_answer(lang):
             if (triage_level or "Doctor") == "Self-Care":
                 return no_info(lang)
@@ -1005,8 +925,7 @@ Your response:"""
 
         stage_timings = dict(context_data.get("stage_timings") or {})
 
-        # Relevance check and answer generation are independent -> run concurrently.
-        # If the relevance check fails, the generated answer is discarded (same output as before).
+        # Relevance check runs alongside generation; the answer is dropped if it fails.
         t0 = time.time()
         f_answer = _EXECUTOR.submit(
             self.llm_service.generate_answer,
@@ -1054,10 +973,7 @@ Your response:"""
         stage_timings["generate_answer_ms"] = round((time.time() - t0) * 1000, 2)
         logger.info("[STAGE TIMING] generate_answer: %.2f ms", stage_timings["generate_answer_ms"])
 
-        # ── Fix 4: RAGAS deferred — background thread, 500ms timeout ─────────
-        # Fire RAGAS in a daemon thread. If it finishes within 500ms we use
-        # the real score for the faithfulness gate; otherwise we pass through
-        # (faithfulness=1.0) and let it log in the background.
+        # RAGAS runs in a background thread; wait at most 500 ms, else pass through (faithfulness=1.0).
         import threading as _threading
         metrics = {"faithfulness": 1.0}  # optimistic default
         _ragas_result = {}
@@ -1091,7 +1007,6 @@ Your response:"""
 
         stage_timings["ragas_eval_ms"] = round((time.time() - t0) * 1000, 2)
         logger.info("[STAGE TIMING] ragas_eval: %.2f ms (deferred)", stage_timings["ragas_eval_ms"])
-        # ── end Fix 4 ─────────────────────────────────────────────────────────
 
         # Negative response check
         content_only = answer
@@ -1162,7 +1077,7 @@ Your response:"""
                 "ragas_metrics": metrics,
                 "triage_level": triage_level,
                 "stage_timings": stage_timings,
-                # ── Structured fields (Phase 2) ───────────────────────────
+                # Structured fields
                 "answer_body": answer_body,
                 "sources": final_sources,
                 "disclaimer": DISCLAIMER,

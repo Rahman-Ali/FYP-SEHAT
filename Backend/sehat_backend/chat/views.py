@@ -25,11 +25,7 @@ auth_service = AuthenticationService()
 
 
 def extract_and_verify_token(request):
-    """
-    Extracts Bearer token from Authorization header or request body,
-    verifies it via AuthenticationService, and returns (verified_uid, error_response).
-    If verification fails, returns (None, Response(..., status=401)).
-    """
+    """Verify the Bearer token (header or body); returns (verified_uid, None) or (None, 401 response)."""
     auth_header = request.headers.get('Authorization') or request.META.get('HTTP_AUTHORIZATION')
     token = None
     if auth_header and auth_header.strip().lower().startswith('bearer '):
@@ -52,15 +48,9 @@ def extract_and_verify_token(request):
 
     return verified_uid, None
 
-# ==========================================================
-# REST OF THE FILE REMAINS EXACTLY THE SAME
-# ==========================================================
-# ... (all existing code from HELPER functions to ADMIN VIEWS) ...
 
 
-# ==========================================================
 # HELPER: Validate User Owns Session
-# ==========================================================
 def get_user_session_or_404(session_id, firebase_uid, with_message_count=False):
     try:
         qs = ChatSession.objects
@@ -77,9 +67,7 @@ def get_user_session_or_404(session_id, firebase_uid, with_message_count=False):
         raise Http404("Session not found")
 
 
-# ==========================================================
 # PUBLIC API VIEWS
-# ==========================================================
 
 @api_view(['GET'])
 def health_check(request):
@@ -333,9 +321,7 @@ def update_session_title(request):
     return Response(serializer.data)
 
 
-# ==========================================================
 # ADMIN API VIEWS
-# ==========================================================
 
 @api_view(['GET'])
 def admin_list_documents(request):

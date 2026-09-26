@@ -87,8 +87,7 @@ export default function ProfileScreen() {
             refreshed?.email &&
             refreshed.email.toLowerCase() === data.pendingEmail.toLowerCase()
           ) {
-            // User confirmed — update Firestore email and clear pending
-            // onSnapshot will fire again, hitting Case 3 below
+            // Confirmed: update Firestore email and clear pending (onSnapshot then hits Case 3)
             await updateDoc(userDocRef, {
               email: refreshed.email,
               pendingEmail: deleteField(),
@@ -105,8 +104,7 @@ export default function ProfileScreen() {
         return;
       }
 
-      // Case 3: No pendingEmail + Firestore email differs from original Auth email
-      // This fires right after Case 2 clears pendingEmail — means email was just confirmed
+      // Case 3: no pendingEmail and Firestore email differs from Auth email (just confirmed via Case 2)
       if (
         data.email &&
         data.email.toLowerCase() !== currentUser.email.toLowerCase()

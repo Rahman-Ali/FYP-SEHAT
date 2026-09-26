@@ -1,14 +1,4 @@
-"""
-Live sequential 7-turn verification for SEHAT general conversational reasoning.
-Exercises NEW variations never tested before:
-- "kal se bukhar hai" (Roman Urdu new symptom)
-- "tez bukhar hai 102F aur sar dard bhi hai" (Followup answer)
-- "say that in Urdu" (Translation request)
-- "did you forget what I told you" (Meta query)
-- "I also like playing cricket on weekends" (Off-topic)
-- "I have a rash and it's spreading" (Symptom needing follow-up)
-- "It is on both my arms, started today, and it is very itchy" (Intake completed)
-"""
+"""Live 7-turn check of conversational intake (symptoms, follow-up, translation, meta, off-topic)."""
 import os, sys, django, uuid, time
 
 if hasattr(sys.stdout, "reconfigure"):

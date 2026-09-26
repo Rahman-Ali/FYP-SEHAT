@@ -86,16 +86,7 @@ FULL_TURN_WINDOW = 8
 
 
 def extract_turn_pairs(messages):
-    """
-    Groups an ordered sequence of Message objects or dicts into turn-pairs.
-    Each turn is:
-    {
-        "turn_index": int,
-        "user": str,
-        "bot": str,
-        "messages": list of dicts [{'sender': ..., 'text': ...}]
-    }
-    """
+    """Group ordered messages into turn pairs: {turn_index, user, bot, messages}."""
     turns = []
     current_turn = None
     for msg in messages:
@@ -132,13 +123,7 @@ def extract_turn_pairs(messages):
 
 
 def merge_patient_facts(current_context: dict, new_facts: dict) -> tuple[dict, bool]:
-    """
-    Merge newly extracted patient facts into session.patient_context.
-    - Adds new keys.
-    - If a new fact contradicts an existing one, update it and log the change
-      (do NOT surface to user).
-    - Returns (updated_context, changed_bool).
-    """
+    """Merge new facts into patient_context (contradictions are updated and logged, not shown to the user); returns (context, changed)."""
     if not isinstance(current_context, dict):
         current_context = {}
     if not isinstance(new_facts, dict) or not new_facts:
@@ -202,14 +187,7 @@ class ChatService:
         return messages
 
     def trigger_rolling_summarization_if_needed(self, session, turns=None) -> bool:
-        """
-        FULL_TURN_WINDOW = 8 turn-pairs kept in full.
-        When total turns exceed summarized_up_to_turn + FULL_TURN_WINDOW:
-        call Groq once with (existing rolling_summary + newly-overflowing turns)
-        to produce an updated summary — merge, don't restart from scratch.
-        Update summarized_up_to_turn.
-        Does NOT run on every request, only when newly exceeded.
-        """
+        """Summarise turns beyond the last FULL_TURN_WINDOW into rolling_summary (only when newly exceeded)."""
         if turns is None:
             prior_messages = list(
                 Message.objects.filter(session=session).order_by('sequence_number', 'timestamp')
@@ -232,26 +210,22 @@ class ChatService:
     # backend/chat/services.py
 
     def process_user_query(self, session_id, query, chat_history=None, session=None):
-        """Process user query through RAG pipeline with backend-authoritative memory.
-
-        `session` may be passed by the view (already fetched + ownership-checked) to
-        avoid a second identical SELECT."""
+        """Run the RAG pipeline for a query; `session` may be passed by the view to skip a second SELECT."""
         t_req_start = time.time()
         if session is None:
             session = ChatSession.objects.get(id=session_id)
         
-        # [MEMORY] Phase 2: Backend is authoritative source of truth.
-        # Ignore client-supplied chat_history; fetch full ordered messages from Postgres for this session.
+        # The DB is the source of truth for history; client-supplied chat_history is ignored.
         prior_messages = list(
             Message.objects.filter(session=session).order_by('sequence_number', 'timestamp')
         )
         turns = extract_turn_pairs(prior_messages)
         logger.info("[MEMORY] Backend-authoritative history: %d prior messages (%d turns)", len(prior_messages), len(turns))
 
-        # [MEMORY] Phase 4: Rolling summarization (Groq, rare trigger on window overflow)
+        # Rolling summarization (only when the turn window overflows)
         self.trigger_rolling_summarization_if_needed(session, turns)
 
-        # [MEMORY] Phase 5: Last FULL_TURN_WINDOW turns kept in full
+        # Last FULL_TURN_WINDOW turns kept in full
         recent_turns = turns[-FULL_TURN_WINDOW:] if turns else []
         recent_history = []
         for turn in recent_turns:
@@ -273,11 +247,7 @@ class ChatService:
             patient_context=session.patient_context
         )
 
-        # ── Fix 1b: Subject-switch detection + context reset ──────────────────
-        # If the unified intake call extracted a third-party subject_reference
-        # that differs from the currently stored active subject, the user has
-        # switched to asking about a completely different person. Reset context
-        # entirely so prior facts don't bleed into the new case.
+        # Subject switch: a new third-party patient resets patient_context so prior facts don't carry over.
         subject_reference = context.get("subject_reference")  # str or None
         meta = session.session_metadata if isinstance(session.session_metadata, dict) else {}
         active_subject = meta.get("active_subject")  # None = "self" (default)
@@ -319,9 +289,8 @@ class ChatService:
             clarification_round = 0
             session.session_metadata = meta
             session_changed = True
-        # ── end Fix 1b ────────────────────────────────────────────────────────
         
-        # Phase 3: Merge new_facts into session.patient_context
+        # Merge new facts into patient_context
         new_facts = context.get("extracted_facts") or context.get("new_facts") or {}
         if new_facts and isinstance(new_facts, dict):
             updated_ctx, changed = merge_patient_facts(session.patient_context, new_facts)
@@ -329,7 +298,7 @@ class ChatService:
                 session.patient_context = updated_ctx
                 session_changed = True
 
-        # Phase 5: Wire rolling_summary and patient_context into final generation
+        # Generate the reply with rolling_summary and patient_context
         try:
             response = self.rag_service.generate_with_context(
                 query, context, recent_history,
@@ -353,11 +322,9 @@ class ChatService:
 
         t_db_1 = time.time()
         bot_meta = dict(response.get('metadata', {}))
-        # Pipeline timings live in the retrieval context for every branch (greeting, clarifying,
-        # emergency, ...); the full-answer branch adds its own on top.
+        # Retrieval-context timings cover every branch; the full-answer branch adds its own.
         stage_timings = {**(context.get("stage_timings") or {}), **(bot_meta.get("stage_timings") or {})}
-        # Store timings with the single bot INSERT (no second metadata UPDATE round-trip);
-        # stored values cover the request up to this final write.
+        # Timings are stored with the single bot INSERT (no second UPDATE).
         stage_timings["db_writes_ms"] = round(t_user_create_ms, 2)
         stage_timings["total_wall_clock_ms"] = round((t_db_1 - t_req_start) * 1000, 2)
         bot_meta["stage_timings"] = stage_timings
@@ -468,10 +435,7 @@ class AuthenticationService:
     """Firebase authentication integration."""
 
     def verify_firebase_token(self, token: str):
-        """
-        Verify Firebase ID token sent from the client using firebase_admin SDK.
-        Returns: verified uid (str) on success, or None on missing/invalid/expired token.
-        """
+        """Verify a Firebase ID token with firebase_admin; returns the uid, or None if missing/invalid/expired."""
         if not token or not isinstance(token, str) or not token.strip():
             logger.warning("Firebase token missing or empty")
             return None

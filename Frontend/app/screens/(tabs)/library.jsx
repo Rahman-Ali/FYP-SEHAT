@@ -20,9 +20,7 @@ import { WebView } from "react-native-webview";
 import { useEffect, useState } from "react";
 import { booksData } from "../../books";
 
-// ─────────────────────────────────────────────
 // Filter Chip
-// ─────────────────────────────────────────────
 const FilterChip = ({ label, isActive, onPress }) => (
   <TouchableOpacity
     style={[
@@ -37,10 +35,8 @@ const FilterChip = ({ label, isActive, onPress }) => (
   </TouchableOpacity>
 );
 
-// ─────────────────────────────────────────────
 // PDF Viewer Modal
-// ─────────────────────────────────────────────
-const pdfCache = {}; // 👈 global memory cache
+const pdfCache = {}; // global memory cache
 
 const PDFViewerModal = ({ visible, pdfSource, title, color, onClose }) => {
   const [uri, setUri] = useState(null);
@@ -48,19 +44,19 @@ const PDFViewerModal = ({ visible, pdfSource, title, color, onClose }) => {
   useEffect(() => {
     const load = async () => {
       try {
-        // ✅ STEP 1: CHECK MEMORY CACHE FIRST
+        // 1. Check memory cache first
         if (pdfCache[pdfSource]) {
           setUri(pdfCache[pdfSource]);
           return;
         }
 
-        // ✅ STEP 2: LOAD ONLY IF NOT CACHED
+        // 2. Load only if not cached
         const asset = Asset.fromModule(pdfSource);
         await asset.downloadAsync();
 
         const finalUri = asset.uri;
 
-        // ✅ STEP 3: SAVE IN CACHE
+        // 3. Save in cache
         pdfCache[pdfSource] = finalUri;
 
         setUri(finalUri);
@@ -95,9 +91,7 @@ const PDFViewerModal = ({ visible, pdfSource, title, color, onClose }) => {
     </Modal>
   );
 };
-// ─────────────────────────────────────────────
 // Disease Card
-// ─────────────────────────────────────────────
 const DiseaseCard = ({ item, expanded, toggleExpand, isUrdu, onViewPDF }) => {
   const t = (en, ur) => (isUrdu ? ur : en);
 
@@ -202,9 +196,7 @@ const DiseaseCard = ({ item, expanded, toggleExpand, isUrdu, onViewPDF }) => {
   );
 };
 
-// ─────────────────────────────────────────────
 // Reusable Section Component
-// ─────────────────────────────────────────────
 const Section = ({ title, items, icon, iconColor, headerColor }) => (
   <View style={styles.section}>
     <Text style={[styles.sectionHeader, { color: headerColor }]}>{title}</Text>
@@ -217,9 +209,7 @@ const Section = ({ title, items, icon, iconColor, headerColor }) => (
   </View>
 );
 
-// ─────────────────────────────────────────────
 // Main Screen
-// ─────────────────────────────────────────────
 export default function LibraryScreen() {
   const [searchQuery, setSearchQuery] = useState("");
   const [activeFilter, setActiveFilter] = useState("All");
@@ -381,16 +371,14 @@ export default function LibraryScreen() {
   );
 }
 
-// ─────────────────────────────────────────────
 // Styles
-// ─────────────────────────────────────────────
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
     backgroundColor: "#F5F7FA",
   },
 
-  // ── Header ──
+  // Header
   header: {
     paddingTop: Platform.OS === "android" ? StatusBar.currentHeight + 20 : 60,
     paddingBottom: 25,
@@ -415,7 +403,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
 
-  // ── Language Toggle ──
+  // Language Toggle
   langToggle: {
     flexDirection: "row",
     alignItems: "center",
@@ -439,7 +427,7 @@ const styles = StyleSheet.create({
     color: "#0D47A1",
   },
 
-  // ── Search ──
+  // Search
   searchContainer: {
     flexDirection: "row",
     alignItems: "center",
@@ -455,7 +443,7 @@ const styles = StyleSheet.create({
     color: "#333",
   },
 
-  // ── Filters ──
+  // Filters
   filterContainer: {
     marginTop: 20,
     marginBottom: 10,
@@ -479,11 +467,11 @@ const styles = StyleSheet.create({
     color: "#757575",
   },
 
-  // ── List ──
+  // List
   container: { flex: 1 },
   contentContainer: { paddingHorizontal: 20, paddingBottom: 40 },
 
-  // ── Card ──
+  // Card
   card: {
     backgroundColor: "#FFF",
     borderRadius: 16,
@@ -526,7 +514,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
 
-  // ── Card Body ──
+  // Card Body
   cardBody: {
     paddingHorizontal: 16,
     paddingBottom: 20,
@@ -559,7 +547,7 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
 
-  // ── Warning ──
+  // Warning
   warningBox: {
     flexDirection: "row",
     alignItems: "center",
@@ -575,7 +563,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 
-  // ── PDF Button ──
+  // PDF Button
   pdfButton: {
     flexDirection: "row",
     alignItems: "center",
@@ -590,7 +578,7 @@ const styles = StyleSheet.create({
     fontSize: 15,
   },
 
-  // ── Empty State ──
+  // Empty State
   emptyState: {
     alignItems: "center",
     marginTop: 60,
@@ -601,7 +589,7 @@ const styles = StyleSheet.create({
     color: "#9E9E9E",
   },
 
-  // ── PDF Modal ──
+  // PDF Modal
   pdfSafeArea: {
     flex: 1,
     backgroundColor: "#FFF",

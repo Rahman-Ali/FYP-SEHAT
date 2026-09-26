@@ -2,7 +2,7 @@
 import { MaterialCommunityIcons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { LinearGradient } from "expo-linear-gradient";
-import { useRouter } from "expo-router"; // ✅ Added
+import { useRouter } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { getAuth, onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, getFirestore } from "firebase/firestore";
@@ -22,7 +22,7 @@ const db = getFirestore(app);
 const auth = getAuth(app);
 
 export default function HomeScreen() {
-  const router = useRouter();  // ✅ Added
+  const router = useRouter();
   const [userName, setUserName] = useState("User");
   const [userActivity, setUserActivity] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -114,7 +114,6 @@ export default function HomeScreen() {
 
   const navigateToActivity = (item) => {
     if (item.isChat) {
-      // ✅ Changed to router.push
       router.push({
         pathname: "/screens/chatbot",
         params: {
@@ -153,7 +152,6 @@ export default function HomeScreen() {
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionTitle}>Your Recent Activity</Text>
             {userActivity.length > 0 && (
-              // ✅ Changed to router.push
               <TouchableOpacity onPress={() => router.push("/screens/history")}>
                 <Text style={styles.seeAll}>See All</Text>
               </TouchableOpacity>

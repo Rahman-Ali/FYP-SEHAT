@@ -31,10 +31,10 @@ export default function Login() {
   const [isLoading, setIsLoading] = useState(false);
   const [isCheckingSession, setIsCheckingSession] = useState(true);
 
-  // 🎯 Ref to track role listener for proper cleanup
+  // Role listener ref (for cleanup)
   const roleListenerRef = useRef(null);
 
-  // 🎯 Helper function: Navigate based on role
+  // Navigate based on role
   const navigateByRole = (role) => {
     if (role === "admin") {
       router.replace("/screens/admin/AdminDashboard");
@@ -43,7 +43,7 @@ export default function Login() {
     }
   };
 
-  // 🎯 Properly managed auth state + role listener
+  // Auth state + role listener
   useEffect(() => {
     let isMounted = true;
 
@@ -59,7 +59,7 @@ export default function Login() {
       if (user && user.emailVerified) {
         console.log("[LOGIN] Auth state: user logged in & verified");
         
-        // 🎯 Single role listener - no nested onSnapshot
+        // Single role listener (no nested onSnapshot)
         const userDocRef = doc(db, "users", user.uid);
         
         roleListenerRef.current = onSnapshot(
@@ -128,11 +128,10 @@ export default function Login() {
 
       console.log("[LOGIN] User logged in:", user.uid);
 
-      // ✅ MARK AS REGISTERED (safe fallback)
+      // Mark as registered (safe fallback)
       await AsyncStorage.setItem("hasCompletedRegistration", "true");
 
-      // 🎯 Role listener will auto-navigate via onSnapshot above
-      // No manual navigation needed - listener handles it
+      // The role listener above navigates automatically
 
     } catch (error) {
       setIsLoading(false);
@@ -163,7 +162,6 @@ export default function Login() {
   }
 
   return (
-    // ... EXACT SAME JSX AS ORIGINAL, NO CHANGES ...
     <View style={styles.container}>
       <StatusBar
         barStyle="dark-content"
@@ -261,7 +259,7 @@ export default function Login() {
   );
 }
 
-// 🎨 Styles remain exactly the same as original
+// Styles
 const styles = StyleSheet.create({
   container: { flex: 1 },
   background: { flex: 1 },

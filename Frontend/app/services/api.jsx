@@ -191,7 +191,7 @@ export const apiService = {
     try {
       const firebaseUid = apiService._getFirebaseUid();
 
-      // [MEMORY] Frontend already formatted — use directly
+      // History is already formatted by the caller
       const recentHistory = (chatHistory || []).slice(-6);
 
       const response = await api.post("/chat/query/", {

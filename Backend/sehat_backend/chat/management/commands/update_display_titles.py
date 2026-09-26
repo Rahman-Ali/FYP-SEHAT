@@ -1,15 +1,4 @@
-"""
-Management command: update_display_titles
-Sets the `display_title` property on existing MedicalDocument nodes in Neo4j
-using the curated title mapping from document_service.py.
-
-This is a PROPERTY-ONLY update — it never deletes nodes, re-embeds text, or
-alters any other property (embedding, text, source_hash, source_file, etc.).
-
-Usage:
-    python manage.py update_display_titles            # live run
-    python manage.py update_display_titles --dry-run  # print plan, no writes
-"""
+"""Set display_title on existing Neo4j MedicalDocument nodes (property-only; --dry-run to preview)."""
 import os
 from django.core.management.base import BaseCommand, CommandError
 from neo4j import GraphDatabase

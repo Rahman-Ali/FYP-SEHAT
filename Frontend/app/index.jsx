@@ -1,4 +1,4 @@
-// app/index.jsx - COMPLETELY REPLACE
+// app/index.jsx
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -51,8 +51,7 @@ export default function Index() {
 
     // Also listen for auth state changes
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      // This fires on every auth change
-      // No need to re-route here as initial check handled it
+      // Fires on every auth change; the initial check already handled routing
     });
 
     return unsubscribe;

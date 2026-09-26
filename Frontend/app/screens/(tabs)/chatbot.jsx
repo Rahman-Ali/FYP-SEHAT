@@ -186,8 +186,7 @@ export default function ChatbotScreen() {
     try {
       setIsLoading(true);
       await loadAllChatSessions(uid);
-      // Session is NOT created on server here — only local welcome state
-      // Server session will be created lazily when user sends first message
+      // Only local welcome state here; the server session is created on the first message
       createNewSession();
     } catch (error) {
       console.error("Init Error:", error);
@@ -200,7 +199,7 @@ export default function ChatbotScreen() {
 const loadAllChatSessions = async (uid) => {
   if (!uid) return [];
   try {
-    // 🎯 ONLY fetch session list - NO messages inside loop
+    // Fetch the session list only (no messages)
     const sessions = await apiService.getAllSessions();
     
     if (sessions && Array.isArray(sessions)) {
@@ -230,7 +229,7 @@ const loadAllChatSessions = async (uid) => {
 
     const result = await apiService.getSessionMessages(sid);
     
-    // 🎯 FIX: API returns {count, messages} object, not direct array
+    // API returns {count, messages}, not an array
     const serverMessages = result.messages || result || [];
 
     if (serverMessages && Array.isArray(serverMessages) && serverMessages.length > 0) {
@@ -277,8 +276,7 @@ const loadAllChatSessions = async (uid) => {
 };
 
   const createNewSession = () => {
-    // DO NOT call API here — session only created on server when first message is sent
-    // This prevents empty sessions from being stored in the database
+    // No API call here: the server session is created on the first message (avoids empty sessions)
     setSessionId(null); // null = pending, not yet on server
     setCurrentChatTitle("New Chat");
     const welcomeMsg = createMessage("Hello! I am SEHAT AI. How can I help you?", true);
@@ -297,7 +295,7 @@ const loadAllChatSessions = async (uid) => {
     await saveMessagesLocally(localId, [msg]);
   };
 
-  // FIX 1: If current session is empty, show message instead of creating new session
+  // If the current session is empty, show a message instead of creating a new one
   const handleNewChat = useCallback(() => {
     if (isCurrentSessionEmpty.current) {
       // Already in a new empty chat — inform the user
@@ -360,8 +358,7 @@ const handleSend = async () => {
       recentMessages
     );
 
-    // Update title on first user message (in the background, so the reply is shown without
-    // waiting for the title round trip; the history list refreshes once the title is saved)
+    // Update the title in the background so the reply shows immediately
     const userMsgCount = updatedMessages.filter(m => !m.isBot).length;
     if (userMsgCount === 1) {
       const newTitle = userText.length > 25 ? userText.substring(0, 25) + "..." : userText;
@@ -428,7 +425,7 @@ const toggleHistory = () => {
   setShowHistory((prev) => {
     const willShow = !prev;
     
-    // 🎯 ONLY fetch when OPENING history, skip if already loaded
+    // Fetch only when opening history and not yet loaded
     if (willShow && userUid && chatHistory.length === 0) {
       loadAllChatSessions(userUid);
     }
@@ -498,7 +495,7 @@ const toggleHistory = () => {
         </View>
       </View>
 
-      {/* Body — FIX 3: KeyboardAvoidingView wraps only the body, not the header */}
+      {/* Body (KeyboardAvoidingView wraps only the body, not the header) */}
       <KeyboardAvoidingView
         style={styles.body}
         behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -585,7 +582,7 @@ const toggleHistory = () => {
                       message.triage === "Monitor" && styles.monitorBubble,
                     ]}>
 
-                      {/* ── Triage badge (prominently shown when triage is available) ── */}
+                      {/* Triage badge */}
                       {triageBadge && (
                         <View style={[styles.triageBadge, { backgroundColor: triageBadge.bg, borderColor: triageBadge.border }]}>
                           <MaterialCommunityIcons name={triageBadge.icon} size={14} color={triageBadge.text} style={{ marginRight: 5 }} />
@@ -595,7 +592,7 @@ const toggleHistory = () => {
                         </View>
                       )}
 
-                      {/* ── Formatted Answer body with bold, italic, and bullet points ── */}
+                      {/* Formatted answer body */}
                       <FormattedMedicalText
                         text={message.text}
                         isBot={message.isBot}
@@ -603,7 +600,7 @@ const toggleHistory = () => {
                         styles={styles}
                       />
 
-                      {/* ── Legacy condition tag (for history messages) ── */}
+                      {/* Legacy condition tag (history messages) */}
                       {message.condition && !triageBadge && (
                         <View style={styles.medicalInfo}>
                           <View style={styles.conditionTag}>
@@ -613,7 +610,7 @@ const toggleHistory = () => {
                         </View>
                       )}
 
-                      {/* ── Collapsible Sequenced Sources ── */}
+                      {/* Collapsible sources */}
                       {hasSources && (
                         <View style={styles.sourcesContainer}>
                           <TouchableOpacity
@@ -667,7 +664,7 @@ const toggleHistory = () => {
                         </View>
                       )}
 
-                      {/* ── Disclaimer ── */}
+                      {/* Disclaimer */}
                       {message.isBot && message.disclaimer && (
                         <Text style={styles.bubbleDisclaimer}>{message.disclaimer}</Text>
                       )}
@@ -694,7 +691,7 @@ const toggleHistory = () => {
               )}
             </ScrollView>
 
-            {/* FIX 3: Input bar — clean layout, no overlapping icons */}
+            {/* Input bar */}
             <View style={[styles.inputBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>
               <View style={styles.inputRow}>
                 <TextInput
@@ -836,7 +833,7 @@ const styles = StyleSheet.create({
   triageSelfCare: { backgroundColor: "rgba(76,175,80,0.1)" },
   triageText: { fontSize: 12, fontWeight: "600" },
 
-  // Phase 2: Triage badge (always shown when triage is set)
+  // Triage badge (shown when triage is set)
   triageBadge: {
     flexDirection: "row", alignItems: "center",
     alignSelf: "flex-start",
@@ -859,7 +856,7 @@ const styles = StyleSheet.create({
   boldInlineText: { fontWeight: "700", color: "#0F172A" },
   italicInlineText: { fontStyle: "italic", color: "#475569" },
 
-  // Phase 2: Collapsible Sources
+  // Collapsible sources
   sourcesContainer: {
     marginTop: 12,
     paddingTop: 10,
@@ -887,7 +884,7 @@ const styles = StyleSheet.create({
     fontSize: 11, color: "#64748B", marginTop: 2, fontWeight: "500",
   },
 
-  // Phase 2: Disclaimer inside bubble
+  // Disclaimer inside bubble
   bubbleDisclaimer: {
     fontSize: 11, color: "#90A4AE",
     marginTop: 10,

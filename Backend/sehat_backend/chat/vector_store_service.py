@@ -90,13 +90,7 @@ class VectorStoreService:
             raise
 
     def warm_up_bm25_from_neo4j(self):
-        """Rebuild the in-memory BM25 index from all text stored in Neo4j.
-
-        Called after the startup ingestion loop so that files skipped by the
-        hash-check still have their text available for BM25 retrieval.
-        If _all_chunks is already populated (from files that were actually
-        re-ingested this run) this adds the skipped files' text on top.
-        """
+        """Rebuild the in-memory BM25 index from all chunk text stored in Neo4j."""
         try:
             driver = GraphDatabase.driver(
                 self.NEO4J_URI,
@@ -197,12 +191,7 @@ class VectorStoreService:
         print(f"Total chunks in store: {len(self._all_chunks)}")
 
     def _attach_neo4j_store_if_needed(self):
-        """Connect to the EXISTING Neo4j vector index without inserting any data.
-
-        Called after BM25 warm-up (skip-all sessions) so that vector search
-        works even when add_chunks_to_store was never invoked this run.
-        Also called lazily at the top of hybrid_search as a safety net.
-        """
+        """Attach to the existing Neo4j vector index without writing any data."""
         if self.neo4j_vector_store is not None:
             return  # already attached
         try:
@@ -271,10 +260,7 @@ class VectorStoreService:
             return 0
 
     def get_source_hash(self, source_file: str) -> str | None:
-        """Return the SHA-256 hash stored on any existing chunk for source_file.
-
-        Returns None if no chunks exist yet or if no hash property is set.
-        """
+        """Return the SHA-256 hash stored on a chunk of source_file, or None."""
         try:
             driver = GraphDatabase.driver(
                 self.NEO4J_URI,
@@ -338,8 +324,7 @@ class VectorStoreService:
             print("Vector store not ready")
             return []
 
-        # Lazy-attach: covers the case where warm_up ran but the attach call
-        # failed silently, or if the caller bypasses warm_up entirely.
+        # Lazy attach in case warm-up's attach failed or was bypassed.
         self._attach_neo4j_store_if_needed()
 
         # Vector search (network) runs concurrently with BM25 (local CPU)

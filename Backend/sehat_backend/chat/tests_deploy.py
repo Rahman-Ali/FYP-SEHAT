@@ -1,7 +1,4 @@
-"""
-Tests for: HealthCheckMiddleware, warmup state machine, hash-error -> zero deletes.
-Run with: python manage.py test chat.tests_deploy
-"""
+"""Deployment tests: health middleware, warm-up, ingestion safety, citations, clarification and memory."""
 import json
 import threading
 import time
@@ -13,9 +10,7 @@ from langchain_core.documents import Document
 from chat.rag_service import RAGService
 
 
-# ---------------------------------------------------------------------------
 # 1. Health middleware tests
-# ---------------------------------------------------------------------------
 
 class HealthMiddlewareTest(TestCase):
     """Test that /healthz and /readyz respond correctly without touching DB/Neo4j."""
@@ -62,8 +57,7 @@ class HealthMiddlewareTest(TestCase):
     def test_process_query_returns_503_warming_up(self):
         """process_query must return 503 warming_up with Retry-After when state=loading."""
         with patch("chat.warmup.get_warmup_state", return_value="loading"):
-            # We still need a valid auth token flow to reach the warmup check.
-            # Patch auth to return a dummy uid.
+            # Patch auth to a dummy uid so the request reaches the warm-up check.
             with patch("chat.views.extract_and_verify_token", return_value=("uid-test", None)):
                 response = self.client.post(
                     "/api/chat/query/",
@@ -88,9 +82,7 @@ class HealthMiddlewareTest(TestCase):
                 self.assertEqual(data["error"], "knowledge_base_unavailable")
 
 
-# ---------------------------------------------------------------------------
 # 2. Warmup state machine tests
-# ---------------------------------------------------------------------------
 
 class WarmupStateMachineTest(unittest.TestCase):
     """Tests for chat.warmup state transitions without real Neo4j/models."""
@@ -169,16 +161,13 @@ class WarmupStateMachineTest(unittest.TestCase):
         self.assertIsNone(get_warmup_error())
 
 
-# ---------------------------------------------------------------------------
 # 3. Hash-error -> zero deletes
-# ---------------------------------------------------------------------------
 
 class HashErrorSafetyTest(unittest.TestCase):
     """Verify that a hash-read error causes skip (no delete) in load_document."""
 
     def test_hash_read_error_does_not_delete_chunks(self):
-        """If get_source_hash raises, load_document must return a skip result
-        and must NOT call delete_chunks_by_source."""
+        """A hash read error must skip the file and never delete chunks."""
         from chat.rag_service import RAGService
 
         rag = RAGService()
@@ -189,8 +178,7 @@ class HashErrorSafetyTest(unittest.TestCase):
         )
         rag.vector_service.delete_chunks_by_source = MagicMock()
 
-        # Provide a real (but tiny) dummy PDF path via a mock so we never
-        # actually read a file.
+        # Dummy PDF path via a mock; no file is read.
         with patch("chat.rag_service._compute_file_hash", return_value="abc123"):
             result = rag.load_document("/fake/path/doc.pdf", "Test Doc")
 
@@ -214,9 +202,7 @@ class HashErrorSafetyTest(unittest.TestCase):
         rag.vector_service.delete_chunks_by_source.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# 4. Phase 1 & 2: Citation Title & Display Title Fallback Tests
-# ---------------------------------------------------------------------------
+# 4. Citation title & display title fallback tests
 
 class CitationTitleFallbackTest(unittest.TestCase):
     """Verify that _build_citations uses display_title when available and falls back cleanly."""
@@ -263,9 +249,7 @@ class CitationTitleFallbackTest(unittest.TestCase):
         self.assertEqual(sources[0]["pages"], ["12"])
 
 
-# ---------------------------------------------------------------------------
-# 5. Phase 3: Step-back Clarifying Question Tests
-# ---------------------------------------------------------------------------
+# 5. Clarifying question tests
 
 class ClarificationRoundTest(unittest.TestCase):
     """Verify that clarification gate triggers when round < 5 and is bypassed at round 5."""
@@ -320,21 +304,10 @@ class ClarificationRoundTest(unittest.TestCase):
         self.assertEqual(res["metadata"]["source"], "Clarification Gate")
 
 
-# ---------------------------------------------------------------------------
-# 6. Contextual Memory & Token Budget Tests
-# ---------------------------------------------------------------------------
+# 6. Contextual memory & token budget tests
 
 class ContextualMemoryTests(TestCase):
-    """
-    Tests for:
-    - Merged rewrite + fact extraction (single LLM call, token budget)
-    - Pre-filter skipping fact extraction for greetings and short acks
-    - Structured patient facts extraction and contradiction handling
-    - Rolling summarization trigger (8-turn window, Groq model, updates not resets)
-    - Step-back clarification checking patient_context first
-    - Backend authoritative history ignoring client-supplied history
-    - Backward-compatible session defaults
-    """
+    """Merged rewrite/fact extraction, pre-filters, patient facts, rolling summary, clarification and DB-backed history."""
 
     def setUp(self):
         from chat.services import ChatService
@@ -410,13 +383,7 @@ class ContextualMemoryTests(TestCase):
         self.assertEqual(ctx["age"], "35")  # Updated, not duplicated
 
     def test_summarization_trigger_and_model(self):
-        """
-        Verify rolling summarization trigger:
-        - <= 8 turns: 0 summarization calls
-        - 9 turns: triggers once, summarizes turn 1 using Groq (openai/gpt-oss-20b)
-        - 10 turns: triggers once, updates existing summary
-        - 15 turns test conversation verifies updates not resets
-        """
+        """Rolling summary triggers only past 8 turns and updates (not resets) the existing summary."""
         from chat.services import extract_turn_pairs, ChatService
         from chat.models import Message
 

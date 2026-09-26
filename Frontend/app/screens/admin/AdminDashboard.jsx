@@ -21,7 +21,7 @@ import { BASE_URL as ROOT_API_URL } from "../../services/api";
 
 const BASE_URL = `${ROOT_API_URL}/chat`;
 
-// ─── Doc Card (memoized) ─────────────────────────────────────────────────────
+// Doc Card (memoized)
 const DocCard = memo(function DocCard({ item, onRemove, isRemoving }) {
   const isPending = !item.indexed;
   return (
@@ -63,7 +63,7 @@ const DocCard = memo(function DocCard({ item, onRemove, isRemoving }) {
   );
 });
 
-// ─── Stat Card (memoized) ────────────────────────────────────────────────────
+// Stat Card (memoized)
 const StatCard = memo(function StatCard({ icon, color, bg, value, label }) {
   return (
     <View style={styles.statCard}>
@@ -76,7 +76,7 @@ const StatCard = memo(function StatCard({ icon, color, bg, value, label }) {
   );
 });
 
-// ─── Main Component ──────────────────────────────────────────────────────────
+// Main Component
 export default function AdminDashboard() {
   const router = useRouter();
   const [documents, setDocuments] = useState([]);
@@ -255,7 +255,7 @@ export default function AdminDashboard() {
     ? documents.reduce((s, d) => s + (d.chunk_count || 0), 0)
     : 0;
 
-  // ── Loading Screen ─────────────────────────────────────────────────────────
+  // Loading Screen
   if (isLoading) {
     return (
       <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
@@ -409,7 +409,7 @@ export default function AdminDashboard() {
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
+// Styles
 const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: "#0F172A" },
 
