@@ -70,7 +70,7 @@
     },
     "owner": "rahmanali",
     "runtimeVersion": {
-      "policy": "appVersion"
+      "policy": "sdkVersion"
     },
     "updates": {
       "url": "https://u.expo.dev/b01d1dc6-ca19-46ed-9e15-335860caf34f"

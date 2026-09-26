@@ -1,6 +1,7 @@
 import os
 import socket
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_neo4j import Neo4jVector
@@ -11,6 +12,8 @@ from neo4j import GraphDatabase
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+_SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sehat-search")
 
 
 class VectorStoreService:
@@ -339,6 +342,11 @@ class VectorStoreService:
         # failed silently, or if the caller bypasses warm_up entirely.
         self._attach_neo4j_store_if_needed()
 
+        # Vector search (network) runs concurrently with BM25 (local CPU)
+        f_neo4j = _SEARCH_EXECUTOR.submit(
+            self.neo4j_vector_store.similarity_search, english_query, k=10
+        ) if self.neo4j_vector_store else None
+
         bm25_docs = []
         if self.sparse_retriever:
             try:
@@ -347,12 +355,9 @@ class VectorStoreService:
                 print(f"BM25 search error: {e}")
 
         neo4j_docs = []
-        if self.neo4j_vector_store:
+        if f_neo4j:
             try:
-                neo4j_docs = self.neo4j_vector_store.similarity_search(
-                    english_query,
-                    k=10
-                )
+                neo4j_docs = f_neo4j.result()
             except Exception as e:
                 print(f"Neo4j search error: {e}")
 
@@ -392,11 +397,10 @@ class VectorStoreService:
             return docs_to_return
 
         q_emb = self.sbert_model.encode(english_query, convert_to_tensor=True)
-        scored = []
-        for doc in unique_docs:
-            d_emb = self.sbert_model.encode(doc.page_content, convert_to_tensor=True)
-            score = util.cos_sim(q_emb, d_emb).item()
-            scored.append((score, doc))
+        # One batched encode for all candidates instead of one call per document
+        d_embs = self.sbert_model.encode([doc.page_content for doc in unique_docs], convert_to_tensor=True)
+        sims = util.cos_sim(q_emb, d_embs)[0].tolist()
+        scored = list(zip(sims, unique_docs))
 
         scored = sorted(scored, key=lambda x: x[0], reverse=True)
         top_score = scored[0][0] if scored else 0

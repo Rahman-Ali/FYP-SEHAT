@@ -277,8 +277,16 @@ class ChatService:
         subject_reference = context.get("subject_reference")  # str or None
         meta = session.session_metadata if isinstance(session.session_metadata, dict) else {}
         active_subject = meta.get("active_subject")  # None = "self" (default)
+        is_emergency = context.get("status") == "emergency"
 
-        if subject_reference is not None:
+        if is_emergency and (subject_reference or None) != active_subject:
+            # Emergency turn: track the subject but keep known facts (no context wipe mid-crisis)
+            meta["active_subject"] = subject_reference
+            meta["clarification_round"] = 0
+            clarification_round = 0
+            session.session_metadata = meta
+            session.save(update_fields=["session_metadata", "updated_at"])
+        elif subject_reference is not None:
             # Normalize for comparison (case-insensitive, strip whitespace)
             ref_norm = subject_reference.strip().lower()
             active_norm = (active_subject or "").strip().lower()
@@ -328,13 +336,18 @@ class ChatService:
             if not isinstance(session.session_metadata, dict):
                 session.session_metadata = {}
             session.session_metadata["clarification_round"] = clarification_round + 1
-        elif status_type in ("valid", "sufficient_for_answer", "meta_history", "off_topic"):
+        elif status_type in ("valid", "sufficient_for_answer", "meta_history", "off_topic", "emergency"):
             if isinstance(session.session_metadata, dict) and "clarification_round" in session.session_metadata:
                 session.session_metadata["clarification_round"] = 0
 
         t_db_1 = time.time()
         bot_meta = dict(response.get('metadata', {}))
         stage_timings = dict(bot_meta.get("stage_timings", {}))
+        # Store timings with the single bot INSERT (no second metadata UPDATE round-trip);
+        # stored values cover the request up to this final write.
+        stage_timings["db_writes_ms"] = round(t_user_create_ms, 2)
+        stage_timings["total_wall_clock_ms"] = round((t_db_1 - t_req_start) * 1000, 2)
+        bot_meta["stage_timings"] = stage_timings
 
         bot_msg = Message.objects.create(
             session=session,
@@ -346,11 +359,6 @@ class ChatService:
 
         t_db_writes_ms = round(t_user_create_ms + (time.time() - t_db_1) * 1000, 2)
         total_wall_clock_ms = round((time.time() - t_req_start) * 1000, 2)
-        stage_timings["db_writes_ms"] = t_db_writes_ms
-        stage_timings["total_wall_clock_ms"] = total_wall_clock_ms
-        bot_meta["stage_timings"] = stage_timings
-        bot_msg.metadata = bot_meta
-        bot_msg.save(update_fields=['metadata'])
 
         logger.info(
             "[TIMING SUMMARY] total=%.2f ms | "

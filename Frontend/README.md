@@ -1,50 +1,41 @@
-# Welcome to your Expo app 👋
+# SEHAT — Mobile App (Expo / React Native)
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Chat-based health assistant app. Talks to the Django backend in `../Backend`. Project overview: [../README.md](../README.md) · Full flow: [../FYP-SEHAT-ARCHITECTURE.md](../FYP-SEHAT-ARCHITECTURE.md)
 
-## Get started
-
-1. Install dependencies
-
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
+## Run
 ```bash
-npm run reset-project
+npm install
+npx expo start -c      # a = Android emulator, i = iOS simulator, or scan QR with Expo Go
 ```
+The phone and the backend PC must be on the same Wi-Fi (or use an ngrok URL).
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+## Point the app at the backend
+Edit **`app/services/api.jsx` → `getBaseUrl()`**. It currently returns a fixed address:
+```js
+return 'http://10.185.171.104:8000/api';
+```
+Replace it with `http://<your-PC-LAN-IP>:8000/api` (and add that IP to `ALLOWED_HOSTS` in the backend `.env`) or with your ngrok URL + `/api`.
 
-## Learn more
+## Screens (file-based routing, `app/`)
+| File | Screen |
+|---|---|
+| `index.jsx`, `_layout.jsx` | Entry + root layout |
+| `screens/login.jsx`, `signup.jsx`, `forgetPassword.jsx` | Firebase auth |
+| `screens/service1.jsx` … `service4.jsx` | Intro / landing pages |
+| `screens/(tabs)/home.jsx` | Home |
+| `screens/(tabs)/chatbot.jsx` | **Chat** — triage badge, answer body, collapsible sources, disclaimer |
+| `screens/(tabs)/library.jsx` | Disease library / PDF books |
+| `screens/(tabs)/profile.jsx` | Profile |
+| `screens/admin/AdminDashboard.jsx` | Admin: list / add / remove guideline PDFs |
+| `books.jsx` | Curated disease content (English + Roman Urdu) |
 
-To learn more about developing your project with Expo, look at the following resources:
+## API client (`app/services/api.jsx`)
+- Axios instance with `BASE_URL`, 90 s timeout, JSON headers.
+- Request interceptor adds `Authorization: Bearer <Firebase ID token>` from the logged-in user.
+- `apiService` methods: `createChatSession`, `getAllSessions`, `getSessionDetail`, `getSessionMessages`, `sendMessage` (→ `POST /chat/query/`), `updateSessionTitle`, `deleteSession`, `deleteMessage`, `healthCheck`.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+## Chat response → UI (`chatbot.jsx`)
+The bot message's `metadata` drives the bubble:
+- `triage_level`: `Emergency` → red badge, `Doctor` → orange "Consult Doctor", `Self-Care` → green, `null` → no badge.
+- `answer_body` (text), `sources` (title + pages), `disclaimer`.
+- Error handling: `503` → "SEHAT AI is warming up. Please retry in a few seconds." (backend loads models for ~50 s after a restart; no auto-retry yet).

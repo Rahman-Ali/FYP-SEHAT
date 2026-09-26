@@ -3,6 +3,7 @@ import re
 import time
 import hashlib
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from .document_service import DocumentService
 from .vector_store_service import VectorStoreService
@@ -11,6 +12,9 @@ from .llm_service import LLMService
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Shared pool for independent LLM calls within one request (network-bound)
+_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="sehat-llm")
 
 
 # ---------------------------------------------------------------------------
@@ -252,75 +256,6 @@ Is this a capabilities question?"""
             rolling_summary: Rolling summary text of older turns.
             patient_context: Structured dictionary of known patient facts.
         """
-        # ── Fix 2: Emergency fast-path — rule-based, zero LLM calls ───────────
-        # Covers labor/delivery, unconscious, severe bleeding, choking, chest pain,
-        # can't breathe, seizures — in English and Roman Urdu.
-        _q_lower = query.lower()
-        _EMERGENCY_KEYWORDS = [
-            # Labor / delivery
-            "delivery", "labour", "labor", "baby coming", "bache ki paidaish",
-            "dard e zeh", "prasav", "waza hamla",
-            # Unconscious / unresponsive
-            "unconscious", "behosh", "behoshi", "unresponsive", "not waking",
-            # Severe bleeding
-            "severe bleeding", "bohat zyada khoon", "khoon aa raha", "heavy bleeding",
-            "hemorrhage", "khoon nahi ruk",
-            # Can't breathe / choking
-            "can't breathe", "cant breathe", "saans nahi", "saans ruk", "chocking",
-            "choking", "dam ghut", "dam nahi", "naak band", "throat blocked",
-            "airway", "suffocating", "suffocation",
-            # Chest pain / heart
-            "chest pain", "seene mein dard", "seene ka dard", "heart attack",
-            "cardiac", "angina",
-            # Seizures / convulsions
-            "seizure", "convulsion", "mirgi", "fits", "jhatkay",
-            # Stroke
-            "stroke", "paralysis", "face drooping", "arm weakness",
-            # Poisoning / overdose
-            "poisoning", "overdose", "zeher", "kuch kha liya",
-            # General life-threatening phrasing
-            "emergency", "call ambulance", "1122", "dying", "mar raha",
-        ]
-        if any(kw in _q_lower for kw in _EMERGENCY_KEYWORDS):
-            logger.info("[EMERGENCY FAST-PATH] Keyword match in query — bypassing clarification.")
-            lang_hint = "roman_urdu" if any(
-                c in _q_lower for c in ["mein", "hai", "ho", "raha", "rahi", "nahi", "zyada", "khoon", "seene", "dard"]
-            ) else "english"
-            if lang_hint == "roman_urdu":
-                emergency_text = (
-                    "**EMERGENCY — Foran Madad Len!**\n\n"
-                    "Yeh ek Medical Emergency hai. Neeche diye gaye steps turant karen:\n\n"
-                    "1. **Abhi 1122 par call karen** (Pakistan Emergency Helpline)\n"
-                    "2. Mareez ko lita dein, harkaat na karwayein\n"
-                    "3. Agar saans nahi aa rahi — CPR shuru karen (agar aap jante hain)\n"
-                    "4. Agar khoon aa raha hai — saaf kapde se pressure lagayein\n"
-                    "5. Akele rehne na dein — kisi ko saath rakhein\n\n"
-                    "**Ghair zaruri waqt zaya na karen — ambulance bulayein.**"
-                )
-            else:
-                emergency_text = (
-                    "**EMERGENCY — Seek Immediate Help!**\n\n"
-                    "This is a medical emergency. Take these steps RIGHT NOW:\n\n"
-                    "1. **Call 1122 immediately** (Pakistan Emergency Helpline)\n"
-                    "2. Keep the patient still and calm\n"
-                    "3. If not breathing — begin CPR (if trained)\n"
-                    "4. If bleeding severely — apply firm pressure with clean cloth\n"
-                    "5. Do not leave the patient alone\n\n"
-                    "**Do not delay — call an ambulance now.**"
-                )
-            return {
-                "status": "emergency",
-                "chunks": [],
-                "language": lang_hint,
-                "english_query": query,
-                "original_query": query,
-                "extracted_facts": {},
-                "new_facts": {},
-                "subject_reference": None,
-                "_emergency_text": emergency_text,
-            }
-        # ── end Fix 2 ─────────────────────────────────────────────────────────
-
         # Also run the existing LLM-based sanitize_input for prompt-injection / jailbreak detection
         sanitize_result = self.llm_service.sanitize_input(query)
         if sanitize_result.get('is_emergency'):
@@ -337,15 +272,29 @@ Is this a capabilities question?"""
 
         stage_timings = {}
 
+        # validate_query, detect_language and the intake classifier only need the raw
+        # query/history, so run them concurrently; results are applied in the original order.
+        use_classifier = "_needs_clarification" not in self.__dict__
+        q_clean = query.lower().strip().rstrip('!.,;:? ')
+        if any(re.match(p, q_clean) for p in self.llm_service.GREETING_PATTERNS):
+            use_classifier = False  # regex greeting returns early; skip the classifier call
         t0 = time.time()
-        status = self.llm_service.validate_query(query)
+        f_status = _EXECUTOR.submit(self.llm_service.validate_query, query)
+        f_lang = _EXECUTOR.submit(self.llm_service.detect_language, query)
+        f_cls = _EXECUTOR.submit(
+            self.llm_service.classify_and_rewrite_query, query,
+            chat_history=chat_history, patient_context=patient_context,
+            clarification_round=clarification_round
+        ) if use_classifier else None
+
+        status = f_status.result()
         stage_timings["validate_query_ms"] = round((time.time() - t0) * 1000, 2)
         logger.info("[STAGE TIMING] validate_query: %.2f ms", stage_timings["validate_query_ms"])
-        
-        t0 = time.time()
-        language = self.llm_service.detect_language(query)
+
+        language = f_lang.result()
         stage_timings["detect_language_ms"] = round((time.time() - t0) * 1000, 2)
         logger.info("[STAGE TIMING] detect_language: %.2f ms", stage_timings["detect_language_ms"])
+        cls_english_query = ""
 
         base_response = {
             "status": status,
@@ -358,7 +307,18 @@ Is this a capabilities question?"""
             "stage_timings": stage_timings,
         }
 
-        if status in ("invalid", "unclear", "greeting"):
+        # Safety: a classifier Emergency overrides an "unclear"/"invalid" validation result
+        # (never for inputs blocked by the prompt-injection filter). No extra call: the
+        # classifier is already running in parallel.
+        cls_emergency = (
+            f_cls is not None
+            and status in ("invalid", "unclear")
+            and sanitize_result.get("safe", True)
+            and f_cls.result().get("triage_level") == "Emergency"
+        )
+        if cls_emergency:
+            logger.info("[TRIAGE] Classifier Emergency overrides validation status '%s'.", status)
+        if status in ("invalid", "unclear", "greeting") and not cls_emergency:
             return base_response
 
         if language == "invalid_hindi":
@@ -398,8 +358,7 @@ Is this a capabilities question?"""
                         "stage_timings": stage_timings,
                     }
         else:
-            t0 = time.time()
-            classification = self.llm_service.classify_and_rewrite_query(
+            classification = f_cls.result() if f_cls else self.llm_service.classify_and_rewrite_query(
                 query,
                 chat_history=chat_history,
                 patient_context=patient_context,
@@ -410,12 +369,32 @@ Is this a capabilities question?"""
 
             intent = classification.get("intent", "sufficient_for_answer")
             rewritten_query = classification.get("rewritten_query", query)
+            cls_english_query = classification.get("english_query") or ""
             extracted_facts = classification.get("new_facts") or {}
             missing_for_diagnosis = classification.get("missing_for_diagnosis") or []
             follow_up_question = classification.get("follow_up_question") or ""
             target_language = classification.get("target_language") or language
             subject_reference = classification.get("subject_reference")  # None or str
+            triage_level = classification.get("triage_level")
 
+            # 0. Model-based triage: Emergency short-circuits before any intent routing
+            if triage_level == "Emergency":
+                logger.info("[TRIAGE] Emergency detected by classifier — skipping translation and search.")
+                return {
+                    "status": "emergency",
+                    "chunks": [],
+                    "language": target_language,
+                    "english_query": query,
+                    "original_query": query,
+                    "extracted_facts": extracted_facts,
+                    "new_facts": extracted_facts,
+                    "subject_reference": subject_reference,
+                    "triage_level": "Emergency",
+                    "_emergency_advice": classification.get("emergency_advice") or "",
+                    "stage_timings": stage_timings,
+                }
+
+            base_response["triage_level"] = triage_level
             base_response["extracted_facts"] = extracted_facts
             base_response["new_facts"] = extracted_facts
             base_response["intent"] = intent
@@ -462,8 +441,21 @@ Is this a capabilities question?"""
                         "extracted_facts": extracted_facts,
                         "new_facts": extracted_facts,
                         "intent": intent,
+                        "triage_level": triage_level,
                     }
                 # If missing_for_diagnosis is empty OR clarification_round == 5 -> proceed to retrieval
+
+            # 3a. intent == "capabilities_query" -> capabilities reply, no retrieval
+            if intent == "capabilities_query":
+                logger.info("[INTAKE] Capabilities query detected.")
+                base_response["status"] = "capabilities"
+                return base_response
+
+            # 3b. intent == "small_talk" -> friendly reply, no retrieval
+            if intent == "small_talk":
+                logger.info("[INTAKE] Small talk detected.")
+                base_response["status"] = "small_talk"
+                return base_response
 
             # 4. intent == "off_topic" -> respond with no_info fallback, facts still merged
             if intent == "off_topic":
@@ -482,7 +474,10 @@ Is this a capabilities question?"""
             return base_response
 
         t0 = time.time()
-        english_query = self.llm_service.translate_to_english(rewritten_query, language)
+        if language != "english" and cls_english_query:
+            english_query = cls_english_query  # already translated by the intake classifier
+        else:
+            english_query = self.llm_service.translate_to_english(rewritten_query, language)
         stage_timings["translate_query_ms"] = round((time.time() - t0) * 1000, 2)
         logger.info("[STAGE TIMING] translate_query: %.2f ms", stage_timings["translate_query_ms"])
 
@@ -669,6 +664,30 @@ Is this a capabilities question?"""
         # ══════════════════════════════════════════════════════════════
         if st == "meta_history":
             meta_answer = context_data.get("meta_answer", "I can't retrieve that from our conversation history.")
+            # Answer the follow-up from the actual history; keep the deterministic answer as fallback.
+            history_text = "\n".join(
+                f"{'User' if m.get('sender') == 'user' else 'Assistant'}: {m.get('text', m.get('message_text', ''))}"
+                for m in (chat_history or [])[-10:]
+            )
+            if history_text.strip():
+                history_prompt = (
+                    "You are SEHAT, a medical assistant. Answer the user's latest message using ONLY "
+                    "the conversation history below. Briefly restate what the user already told you "
+                    "(who the patient is and their symptoms) and what you advised. If it was an "
+                    "emergency, remind them to call 1122. Do not invent facts. "
+                    f"Reply in {'Roman Urdu' if language == 'roman_urdu' else 'English'}, 2-4 sentences.\n\n"
+                    f"Conversation history:\n{history_text}\n\n"
+                    f"User's latest message: {query}\n\nResponse:"
+                )
+                try:
+                    hist_resp = self.llm_service.llm.invoke(history_prompt)
+                    hist_text = (
+                        hist_resp.content if hasattr(hist_resp, "content") else str(hist_resp)
+                    ).strip()
+                    if hist_text:
+                        meta_answer = hist_text
+                except Exception as e:
+                    logger.error("History answer generation error: %s", e)
             return {
                 "response": meta_answer,
                 "metadata": {
@@ -720,14 +739,41 @@ Is this a capabilities question?"""
         # BRANCH 0d: OFF_TOPIC — polite no-info response, patient facts retained
         # ══════════════════════════════════════════════════════════════
         if st == "off_topic":
+            out_of_scope = (
+                "Main sirf sehat se mutaliq sawalon mein madad kar sakta hoon."
+                if language == "roman_urdu"
+                else "I can only help with health questions."
+            )
             return {
-                "response": no_info(language),
+                "response": out_of_scope,
                 "metadata": {
-                    "source": "No relevant chunks",
+                    "source": "Out of scope",
                     "language": language,
                     "ragas_metrics": {},
                     "triage_level": None,
-                    "answer_body": no_info(language),
+                    "answer_body": out_of_scope,
+                    "sources": [],
+                    "disclaimer": "",
+                }
+            }
+
+        # ══════════════════════════════════════════════════════════════
+        # BRANCH 0e: SMALL_TALK — short friendly reply, invite a health question
+        # ══════════════════════════════════════════════════════════════
+        if st == "small_talk":
+            small_talk = (
+                "Shukriya! Main SEHAT hoon, aapka health assistant. Aap apni sehat ke baare mein kya poochna chahenge?"
+                if language == "roman_urdu"
+                else "Thanks for asking! I'm SEHAT, your health assistant. What health question can I help you with?"
+            )
+            return {
+                "response": small_talk,
+                "metadata": {
+                    "source": "Small talk",
+                    "language": language,
+                    "ragas_metrics": {},
+                    "triage_level": None,
+                    "answer_body": small_talk,
                     "sources": [],
                     "disclaimer": "",
                 }
@@ -737,9 +783,23 @@ Is this a capabilities question?"""
         # BRANCH 1: EMERGENCY
         # ══════════════════════════════════════════════════════════════
         if st == "emergency":
-            # Use pre-built emergency text from Fix 2 fast-path if available,
+            # "Call 1122" header + situation-specific first-aid steps from the classifier,
             # otherwise fall back to the general crisis/self-harm response.
-            emergency_text = context.get("_emergency_text")
+            emergency_text = None
+            emergency_advice = (context_data.get("_emergency_advice") or "").strip()
+            if emergency_advice:
+                if language == "roman_urdu":
+                    emergency_text = (
+                        "**EMERGENCY — Foran Madad Len!**\n\n"
+                        "**Abhi 1122 par call karen** (Pakistan Emergency Helpline)\n\n"
+                        f"{emergency_advice}"
+                    )
+                else:
+                    emergency_text = (
+                        "**EMERGENCY — Seek Immediate Help!**\n\n"
+                        "**Call 1122 immediately** (Pakistan Emergency Helpline)\n\n"
+                        f"{emergency_advice}"
+                    )
             if not emergency_text:
                 if language == "roman_urdu":
                     emergency_text = (
@@ -816,7 +876,11 @@ Is this a capabilities question?"""
                 # ══════════════════════════════════════════════════════════════
         # BRANCH 3: CAPABILITIES (LLM-generated, no hardcoded text)
         # ══════════════════════════════════════════════════════════════
-        if is_short_query(query) and self.detect_capabilities_query(query):
+        # The intake classifier already decides this (intent "capabilities_query" -> status
+        # "capabilities"); the separate LLM check only runs when the classifier did not.
+        if st == "capabilities" or (
+            "intent" not in context_data and is_short_query(query) and self.detect_capabilities_query(query)
+        ):
             capabilities_prompt = f"""You are SEHAT AI, a medical assistant.
 
 The user is asking about what you can do, what diseases you know about,
@@ -917,13 +981,22 @@ Your response:"""
         context_docs = context_data.get("chunks", [])
         english_query = context_data.get("english_query", query)
         original_query = context_data.get("original_query", query)
+        triage_level = context_data.get("triage_level")
+
+        # ── HELPER: fallback when no answer can be produced (triage-aware) ──
+        def no_answer(lang):
+            if (triage_level or "Doctor") == "Self-Care":
+                return no_info(lang)
+            if lang == "roman_urdu":
+                return "Baraye meharbani jald az jald kisi doctor ko dikhayein."
+            return "Please see a doctor soon."
 
         if not context_docs:
             return {
-                "response": no_info(language),
+                "response": no_answer(language),
                 "metadata": {
                     "source": "No relevant chunks",
-                    "triage_level": "Doctor",
+                    "triage_level": triage_level or "Doctor",
                     "ragas_metrics": {},
                 }
             }
@@ -932,8 +1005,18 @@ Your response:"""
 
         stage_timings = dict(context_data.get("stage_timings") or {})
 
-        # Relevance check
+        # Relevance check and answer generation are independent -> run concurrently.
+        # If the relevance check fails, the generated answer is discarded (same output as before).
         t0 = time.time()
+        f_answer = _EXECUTOR.submit(
+            self.llm_service.generate_answer,
+            original_query,
+            retrieved_text,
+            language,
+            chat_history,
+            rolling_summary=rolling_summary,
+            patient_context=patient_context
+        )
         try:
             is_relevant = self.llm_service.verify_relevance(english_query, retrieved_text, chat_history)
         except Exception as e:
@@ -944,34 +1027,26 @@ Your response:"""
 
         if not is_relevant:
             return {
-                "response": no_info(language),
+                "response": no_answer(language),
                 "metadata": {
                     "source": "Relevance check failed",
-                    "triage_level": "Doctor",
+                    "triage_level": triage_level or "Doctor",
                     "ragas_metrics": {},
                     "stage_timings": stage_timings,
                 }
             }
 
-        # Generate answer
-        t0 = time.time()
+        # Generate answer (already running since the relevance check started)
         try:
-            answer, model_name = self.llm_service.generate_answer(
-                original_query,
-                retrieved_text,
-                language,
-                chat_history,
-                rolling_summary=rolling_summary,
-                patient_context=patient_context
-            )
+            answer, model_name = f_answer.result()
         except Exception as e:
             logger.error("Answer generation error: %s", e)
             stage_timings["generate_answer_ms"] = round((time.time() - t0) * 1000, 2)
             return {
-                "response": no_info(language),
+                "response": no_answer(language),
                 "metadata": {
                     "source": "LLM generation failed",
-                    "triage_level": "Doctor",
+                    "triage_level": triage_level or "Doctor",
                     "ragas_metrics": {},
                     "stage_timings": stage_timings,
                 }
@@ -984,16 +1059,17 @@ Your response:"""
         # the real score for the faithfulness gate; otherwise we pass through
         # (faithfulness=1.0) and let it log in the background.
         import threading as _threading
-        eval_answer = (
-            self.llm_service.translate_to_english(answer, "roman_urdu")
-            if language == "roman_urdu"
-            else answer
-        )
         metrics = {"faithfulness": 1.0}  # optimistic default
         _ragas_result = {}
 
         def _run_ragas():
             try:
+                # Translation is only needed for the metric, so it runs in the background too
+                eval_answer = (
+                    self.llm_service.translate_to_english(answer, "roman_urdu")
+                    if language == "roman_urdu"
+                    else answer
+                )
                 _ragas_result["metrics"] = self.llm_service.compute_ragas_metrics(
                     eval_answer, retrieved_text, english_query,
                     context_docs, self.vector_service.sbert_model
@@ -1029,7 +1105,6 @@ Your response:"""
         ans_lower = answer.lower()
         is_negative = (
             len(content_only) < 30
-            or "maafi" in ans_lower
             or ("sorry" in ans_lower and "could not find" in ans_lower)
             or no_info(language).lower()[:30] in ans_lower
         )
@@ -1070,11 +1145,12 @@ Your response:"""
                 ).strip()
             final_sources = sources
 
-        # Classify triage level
-        t0 = time.time()
-        triage_level = self.llm_service.classify_triage(original_query, answer)
-        stage_timings["classify_triage_ms"] = round((time.time() - t0) * 1000, 2)
-        logger.info("[STAGE TIMING] classify_triage: %.2f ms", stage_timings["classify_triage_ms"])
+        # Triage comes from the intake classifier; classify only if it is missing
+        if not triage_level:
+            t0 = time.time()
+            triage_level = self.llm_service.classify_triage(original_query, answer)
+            stage_timings["classify_triage_ms"] = round((time.time() - t0) * 1000, 2)
+            logger.info("[STAGE TIMING] classify_triage: %.2f ms", stage_timings["classify_triage_ms"])
 
         return {
             "response": final_response,          # full string (DB / plain-text)

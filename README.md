@@ -1,273 +1,192 @@
-# SEHAT (صحت) — AI-Powered Multilingual Medical Assistant
+# SEHAT (صحت) — AI Medical Assistant (English + Roman Urdu)
 
-> **Final Year Project (FYP)**  
-> An intelligent, clinical decision-support and health guidance system designed to provide accurate, guideline-grounded medical assistance for rural and underserved communities in Pakistan.
+> **Final Year Project.** A mobile chatbot that answers health questions in **English** or **Roman Urdu**, grounded in WHO / WGO / EAU guideline PDFs, with page-level citations and triage (`Emergency` / `Doctor` / `Self-Care`).
 
----
-
-## 📌 Overview
-
-**SEHAT** is an AI-powered medical chatbot that bridges healthcare accessibility gaps. Users can ask medical questions and describe symptoms in either **English** or **Roman Urdu** (Urdu written in Latin script). 
-
-The backend employs an advanced **Hybrid Retrieval-Augmented Generation (RAG)** pipeline grounded in vetted World Health Organization (WHO), WGO, and EAU clinical guidelines. Answers include precise page-level citations, automated urgency triage (`Emergency`, `Doctor`, `Self-Care`), and rigorous mathematical safety gates to prevent medical hallucinations.
+For the full technical walkthrough (every step of a request, with file and function names) see **[FYP-SEHAT-ARCHITECTURE.md](FYP-SEHAT-ARCHITECTURE.md)**.
 
 ---
 
-## ✨ Key Features
+## 1. What it does (in 30 seconds)
 
-### 1. 🌐 Native Dual-Language Support (English & Roman Urdu)
-- Automatic language detection and translation into clinical English queries.
-- Strict language purity checks ensuring Roman Urdu responses are natural and free of unintended code-switching or English markers.
-
-### 2. 🔍 Hybrid RAG Retrieval Engine
-- **Sparse Retrieval:** BM25 keyword matching for exact medical terms and drug names (weight: 0.4).
-- **Dense Retrieval:** Neo4j Aura graph-backed vector store using SBERT embeddings (weight: 0.6).
-- **Reciprocal Rank Fusion (RRF):** Blends sparse and dense candidate documents.
-- **Semantic Reranking & Dynamic Cutoff:** SBERT (`all-MiniLM-L6-v2`) reranks candidates with dynamic confidence thresholds (e.g. `< 0.48` cutoff to filter out-of-scope queries like diabetes or asthma).
-
-### 3. 📚 Curated WHO Medical Knowledge Base
-- Ingests **15 medical reference books** covering **10 core disease domains**:
-  1. Dengue Fever
-  2. Diarrhoea
-  3. Hepatitis A
-  4. Influenza
-  5. Tuberculosis (TB)
-  6. Malaria
-  7. Skin Allergy & Contact Dermatitis
-  8. Typhoid Fever
-  9. Common Cold
-  10. Urinary Tract Infections (UTI)
-- Automated disease tagging stamped across both Neo4j nodes and in-memory BM25 indices.
-- **Incremental Ingestion:** SHA-256 byte hashing skips unchanged files on startup; startup BM25 warm-up restores indices from Neo4j without re-embedding.
-
-### 4. 🛡️ Clinical Safety & Quality Gates
-- **Emergency / Self-Harm Intercept:** Immediate bypass for suicidal ideation or self-harm queries with localized emergency helplines (`1122` in Pakistan).
-- **Automated Triage Classification:** Auxiliary LLM classifies each query into `Emergency`, `Doctor`, or `Self-Care`.
-- **Hallucination Prevention (RAGAS Gate):** Evaluates faithfulness before returning answers. If faithfulness score drops below `0.25`, the response safely falls back to a medical disclaimer and physician referral.
-- **Exact Citations:** Every substantiated answer includes document name and page number references.
-
-### 5. ⚡ Multi-Model LLM Orchestration
-- **Primary Generator:** Google Gemini 3.1 Flash Lite (`gemini-3.1-flash-lite`).
-- **Auxiliary & Fallback:** Groq LLaMA 3.1 8B (`llama-3.1-8b-instant`) for query validation, translation, triage classification, and fallback generation.
-
-### 6. 📱 Cross-Platform Mobile Application
-- Built with **React Native** and **Expo**.
-- Modern, accessible UI with chat history, document viewing, role-based profiles (User, Doctor, Admin), and an Admin Dashboard for real-time document management.
-- Secure user authentication powered by **Firebase Auth**.
+1. User logs in (Firebase) on the **Expo / React Native** app and types a message.
+2. App sends it to the **Django** backend (`POST /api/chat/query/`) with a Firebase ID token.
+3. Backend runs one **intake classifier** LLM call that decides: emergency? greeting / small talk? off-topic? needs a follow-up question? enough info to answer? It also assigns the **triage level**.
+4. If an answer is needed: **hybrid search** (BM25 + Neo4j vectors + SBERT rerank) over the guideline PDFs → **Gemini** writes the answer → citations + disclaimer are attached.
+5. User message, bot message, triage and sources are saved in **PostgreSQL (Neon)** and returned to the app.
 
 ---
 
-## 🏗️ System Architecture
+## 2. Tech stack
+
+| Layer | Technology | Where |
+|---|---|---|
+| Mobile app | React Native + Expo Router, Axios | `Frontend/app/` |
+| Auth | Firebase Auth (client) + Firebase Admin token verification (server) | `Frontend/firebase.config.js`, `chat/services.py` → `AuthenticationService` |
+| API | Django 4.2 + Django REST Framework | `Backend/sehat_backend/chat/views.py`, `chat/urls.py` |
+| Chat storage | PostgreSQL on **Neon** (cloud) | `chat/models.py` (`ChatSession`, `Message`) |
+| Vector store | **Neo4j Aura** (cloud), index `medical_docs`, label `MedicalDocument` | `chat/vector_store_service.py` |
+| Keyword search | In-memory BM25 (rebuilt from Neo4j at startup) | `chat/vector_store_service.py` |
+| Embeddings / rerank | `sentence-transformers/all-MiniLM-L6-v2` (local CPU) | `chat/vector_store_service.py` |
+| Answer generation | Google **Gemini** `gemini-3.1-flash-lite` (fallback: Groq) | `llm_service.py` → `_call_generation_llm` |
+| Auxiliary LLM calls (classify, validate, language, relevance, greeting) | **Groq** `openai/gpt-oss-20b` → **Gemini** → OpenAI (3rd tier) | `llm_service.py` → `_call_aux_llm` |
+
+---
+
+## 3. Repository layout (real file names)
 
 ```
-                      ┌──────────────────────────────────────┐
-                      │    React Native Mobile Client        │
-                      │     (Expo / iOS / Android / Web)     │
-                      └──────────────────┬───────────────────┘
-                                         │ HTTPS / REST
-                                         ▼
-                      ┌──────────────────────────────────────┐
-                      │     Django REST Framework API        │
-                      │  Rate Limiter & Input Sanitization   │
-                      └──────────────────┬───────────────────┘
-                                         │
-        ┌────────────────────────────────┴────────────────────────────────┐
-        ▼                                                                 ▼
-┌───────────────────────────────┐                       ┌───────────────────────────────────┐
-│     Firebase Authentication   │                       │          RAG Pipeline             │
-│   Token Verification & Roles  │                       │  • Language Detection             │
-└───────────────────────────────┘                       │  • Emergency / Safety Filter      │
-                                                        └─────────────────┬─────────────────┘
-                                                                          │
-                        ┌─────────────────────────────────────────────────┴───────────────────┐
-                        ▼                                                                     ▼
-        ┌────────────────────────────────┐                                    ┌───────────────────────────────┐
-        │       Retrieval Engine         │                                    │      Generation & Safety      │
-        │  • BM25 Sparse Search (0.4)    │                                    │  • Gemini 3.1 Flash Lite      │
-        │  • Neo4j Aura Vector (0.6)     │                                    │  • Groq LLaMA 3.1 (Fallback)  │
-        │  • SBERT Cosine Reranking      │                                    │  • RAGAS Faithfulness Gate    │
-        │  • Dynamic Threshold (<0.48)   │                                    │  • Triage Level Classifier    │
-        └────────────────────────────────┘                                    └───────────────────────────────┘
-```
-
----
-
-## 📂 Project Structure
-
-```
-FYP-SEHAT/
+FYP-SEHAT-NEW/
+├── README.md                         ← this file
+├── FYP-SEHAT-ARCHITECTURE.md         ← full request flow & design
 ├── Backend/
-│   ├── medical_documents/           # WHO/WGO clinical guideline PDF documents
-│   ├── sehat_backend/
-│   │   ├── manage.py                # Django management entry point
-│   │   ├── .env.example             # Documented environment template with WARP notes
-│   │   ├── sehat_backend/           # Django settings, WSGI, ASGI, URLs
-│   │   │   ├── settings.py          # App settings, DB config & middleware setup
-│   │   │   ├── health_middleware.py # Non-blocking /healthz and /readyz middleware
-│   │   │   └── urls.py
-│   │   └── chat/                    # Core RAG and Chat application
-│   │       ├── document_service.py  # PDF cleaning, text splitting, disease tagging
-│   │       ├── vector_store_service.py # BM25 + Neo4j vector store & SBERT reranker
-│   │       ├── llm_service.py       # Gemini/Groq LLM chains, triage & language checks
-│   │       ├── rag_service.py       # Main RAG coordinator & evaluation gates
-│   │       ├── services.py          # Session management & lazy service singleton
-│   │       ├── warmup.py            # Async thread model loader & BM25 index builder
-│   │       ├── models.py            # ChatSession and Message ORM models
-│   │       ├── views.py             # DRF API endpoints (lazy init, 503 warmup guards)
-│   │       ├── serializers.py       # REST API serializers
-│   │       ├── tests_deploy.py      # Automated deployment & lifecycle tests
-│   │       └── management/
-│   │           └── commands/
-│   │               └── ingest_documents.py # Safe CLI document ingestion runner
-│   └── requirements.txt             # Python dependencies
-├── Frontend/
-│   ├── app/                         # Expo Router screens and navigation
-│   │   ├── screens/                 # ChatScreen, HomeScreen, AdminDashboard
-│   │   ├── services/api.jsx         # Axios API client with dynamic EXPO_PUBLIC_API_URL
-│   │   └── _layout.jsx              # Root app layout & theme
-│   ├── .env                         # Local frontend environment config
-│   ├── package.json                 # Node dependencies
-│   └── firebase.config.js           # Firebase Client SDK configuration
-├── .gitignore                       # Git ignore rules
-├── FYP-SEHAT-ARCHITECTURE.md        # Comprehensive system architecture & audit
-└── README.md                        # Project documentation
+│   ├── requirements.txt              ← pinned Python deps (keep venv in sync!)
+│   ├── medical_documents/            ← 15 guideline PDFs (10 diseases)
+│   └── sehat_backend/
+│       ├── manage.py
+│       ├── .env                      ← secrets (git-ignored, never commit)
+│       ├── secrets/                  ← Firebase service account (git-ignored)
+│       ├── sehat_backend/
+│       │   ├── settings.py           ← DB (Neon, conn health checks), ALLOWED_HOSTS, DRF
+│       │   ├── urls.py               ← mounts /api/chat/
+│       │   └── health_middleware.py  ← /healthz (always 200), /readyz (503 until warm)
+│       └── chat/
+│           ├── urls.py               ← all /api/chat/... routes
+│           ├── views.py              ← endpoints, token check, rate limit, 503 warm-up gate
+│           ├── services.py           ← ChatService.process_user_query (memory, facts, DB saves)
+│           ├── rag_service.py        ← RAGService: retrieve_context + generate_with_context
+│           ├── llm_service.py        ← LLMService: all prompts & provider chains
+│           ├── vector_store_service.py ← hybrid_search (BM25 + Neo4j + SBERT rerank)
+│           ├── document_service.py   ← PDF load, clean, chunk, disease tags
+│           ├── warmup.py             ← background model load + BM25 build at startup
+│           ├── models.py             ← ChatSession, Message
+│           ├── serializers.py        ← exposes triage_level, sources, answer_body
+│           ├── tests_deploy.py       ← automated tests
+│           └── management/commands/
+│               ├── ingest_documents.py      ← index PDFs into Neo4j
+│               └── update_display_titles.py ← fix citation titles on existing nodes
+└── Frontend/
+    ├── app.json, package.json
+    ├── firebase.config.js
+    └── app/
+        ├── _layout.jsx, index.jsx
+        ├── services/api.jsx          ← Axios client + BASE_URL + all API calls
+        └── screens/
+            ├── login.jsx, signup.jsx, forgetPassword.jsx
+            ├── (tabs)/chatbot.jsx     ← chat UI (triage pill, sources, disclaimer)
+            ├── (tabs)/home.jsx, library.jsx, profile.jsx
+            └── admin/AdminDashboard.jsx ← add/remove guideline documents
 ```
 
 ---
 
-## 🚀 Getting Started
+## 4. API endpoints (`/api/chat/…`)
 
-### Prerequisites
-- **Python 3.10+**
-- **Node.js 18+** & **npm**
-- **Neo4j Aura** cloud instance (or local Neo4j 5+ with GDS plugin)
-- API Keys for **Google Gemini** and **Groq**
-- **Firebase Project** with Authentication enabled
+Session, message and query endpoints require `Authorization: Bearer <Firebase ID token>` (verified server-side with Firebase Admin).
+> ⚠️ The three `admin/documents/*` endpoints currently do **not** verify a token — anyone who can reach the server can list/add/remove PDFs. Add auth before exposing the server publicly.
 
----
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `health/` | Public health check |
+| POST | `sessions/create/` | New chat session |
+| POST | `sessions/list/` | List the user's sessions |
+| POST | `sessions/detail/` | One session |
+| DELETE | `sessions/delete/` | Delete a session |
+| PATCH | `sessions/update-title/` | Rename a session |
+| POST | `messages/list/` | Messages of a session |
+| DELETE | `messages/delete/` | Delete a message |
+| POST | `query/` | **Ask a question** (main pipeline) |
+| GET | `admin/documents/list/` | List indexed PDFs |
+| POST | `admin/documents/add/` | Upload + index a PDF |
+| DELETE | `admin/documents/remove/` | Remove a PDF and its chunks |
 
-### Backend Setup
-
-1. **Navigate to the backend directory:**
-   ```bash
-   cd Backend
-   ```
-
-2. **Create and activate a virtual environment:**
-   ```bash
-   python -m venv venv
-   # On Windows:
-   venv\Scripts\activate
-   # On macOS/Linux:
-   source venv/bin/activate
-   ```
-
-3. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Configure Environment Variables:**
-   Create a `.env` file inside `Backend/sehat_backend/` (or repository root):
-   ```env
-   SECRET_KEY=your-django-secret-key
-   DEBUG=True
-
-   # AI / LLM Keys
-   GOOGLE_API_KEY=your-google-gemini-api-key
-   GROQ_API_KEY=your-groq-api-key
-
-   # Neo4j Aura Database
-   NEO4J_URI=neo4j+s://<your-instance-id>.databases.neo4j.io
-   NEO4J_USERNAME=neo4j
-   NEO4J_PASSWORD=your-neo4j-password
-   NEO4J_DATABASE=neo4j
-
-   # Firebase Service Account
-   FIREBASE_SERVICE_ACCOUNT_KEY=secrets/firebase-service-account.json
-   FIREBASE_PROJECT_ID=sehat-538ee
-
-   # Allowed Hosts & Database (PostgreSQL / Neon)
-   ALLOWED_HOSTS=localhost,127.0.0.1,omission-moonshine-cinnamon.ngrok-free.dev
-   DATABASE_URL=postgresql://<user>:<password>@<host>/neondb?sslmode=require&channel_binding=require
-
-   # NOTE ON CLOUDFLARE WARP:
-   # If PostgreSQL connection fails with "Permission denied" on Windows,
-   # run `warp-cli disconnect` in your terminal or configure a split-tunnel exclusion.
-
-   # Ingestion Settings (optional)
-   ALLOW_INGEST=true
-   FORCE_REINGEST=false
-   ```
-
-5. **Run database migrations:**
-   ```bash
-   cd sehat_backend
-   python manage.py migrate
-   ```
-
-6. **Start the backend server:**
-   ```bash
-   python manage.py runserver 0.0.0.0:8000
-   ```
-   *Health checks (`/healthz`) are immediately active; heavy embedding models and BM25 index warm up in the background and report ready at `/readyz`.*
-
-7. **Start the ngrok tunnel (in a separate terminal):**
-   ```bash
-   ngrok http 8000 --url omission-moonshine-cinnamon.ngrok-free.dev
-   ```
+Other routes: `/healthz` (always 200) and `/readyz` (503 until warm-up finishes).
 
 ---
 
-### Frontend Setup & Mobile Deployment
+## 5. Setup
 
-1. **Navigate to the frontend directory:**
-   ```bash
-   cd Frontend
-   ```
+### Backend
+```bash
+cd Backend
+python -m venv venv
+venv\Scripts\activate            # Windows  (macOS/Linux: source venv/bin/activate)
+pip install -r requirements.txt  # re-run after every pull: a stale venv breaks the OpenAI fallback
+cd sehat_backend
+python manage.py migrate
+python manage.py runserver 0.0.0.0:8000
+```
+Wait for `[warmup] SUCCESS` in the console (~50 s: embedding models ~36 s + BM25 index ~12 s). Until then `/api/chat/query/` returns **503 `warming_up`** by design.
 
-2. **Install Node dependencies:**
-   ```bash
-   npm install
-   ```
+Index documents (only when PDFs change; unchanged files are skipped by SHA-256 hash):
+```bash
+python manage.py ingest_documents                       # all PDFs in Backend/medical_documents/
+python manage.py ingest_documents --file 1-DENGUE-WHO-BOOK.pdf
+```
 
-3. **Configure Environment:**
-   Set `EXPO_PUBLIC_API_URL` in `Frontend/.env`:
-   ```env
-   EXPO_PUBLIC_API_URL=https://omission-moonshine-cinnamon.ngrok-free.dev/api
-   ```
+### Backend `.env` (`Backend/sehat_backend/.env`) — variable names only
+```env
+SECRET_KEY=...
+DJANGO_DEBUG=False
+ALLOWED_HOSTS=localhost,127.0.0.1,<your-LAN-IP>,<your-ngrok-domain>
+DATABASE_URL=postgresql://...neon.tech/neondb?sslmode=require
 
-4. **Configure Firebase:**
-   Ensure `Frontend/firebase.config.js` points to your active Firebase project credentials.
+NEO4J_URI=neo4j+s://<id>.databases.neo4j.io
+NEO4J_USERNAME=...
+NEO4J_PASSWORD=...
+NEO4J_DATABASE=...
 
-5. **Start Expo with clear cache:**
-   ```bash
-   npx expo start -c
-   ```
-   Press `a` for Android emulator, `i` for iOS simulator, or scan the QR code using the **Expo Go** app on a physical device. All requests from mobile data or local Wi-Fi route seamlessly through the ngrok static domain.
+GOOGLE_API_KEY=...        # Gemini (answers + aux fallback)
+GROQ_API_KEY=...          # Groq (first aux provider)
+OPEN_AI_API_KEY=...       # optional 3rd-tier fallback (needs paid credits)
+AUX_LLM_PROVIDER_ORDER=groq_first   # or gemini_first
+
+FIREBASE_SERVICE_ACCOUNT_KEY=secrets/firebase-service-account.json
+FIREBASE_PROJECT_ID=sehat-538ee
+FORCE_REINGEST=false
+```
+> The phone's server address **must** be in `ALLOWED_HOSTS`, otherwise every request gets Django's `400 Bad Request`.
+
+### Frontend
+```bash
+cd Frontend
+npm install
+npx expo start -c
+```
+The backend address is set in **`Frontend/app/services/api.jsx` → `getBaseUrl()`**. It currently returns a fixed LAN address (`http://10.185.171.104:8000/api`); change it to your PC's IP (same Wi-Fi as the phone) or your ngrok URL.
 
 ---
 
-## 🧪 Testing & Verification
-
-SEHAT includes test scripts verifying RAG retrieval accuracy, disease tagging, and out-of-scope fallback behavior:
-
-- **Full RAG Pipeline Verification:**
-  ```bash
-  python manage.py test chat
-  ```
-- **Live Retrieval Multi-Disease Test:**
-  Tests across all 10 guideline diseases and verifies out-of-scope fallbacks (e.g. diabetes, asthma) trigger the proper `no_info` response.
+## 6. Testing
+```bash
+cd Backend/sehat_backend
+python manage.py test chat.tests_deploy
+```
+Covers health middleware, warm-up state machine, ingestion hash safety, citation titles, clarification rounds, contextual memory and conversational reasoning (18 DB-free tests + DB tests on in-memory SQLite).
 
 ---
 
-## 👥 Contributors
+## 7. Troubleshooting
 
-- **Rahman Ali** — Lead Developer & RAG Pipeline Architect
+| Symptom | Cause | Fix |
+|---|---|---|
+| `400 Bad Request` (143-byte HTML) on every call | Server IP not in `ALLOWED_HOSTS` | Add it to `.env`, restart |
+| `503 warming_up` right after starting the server | Models / BM25 still loading (~50 s) | Wait for `[warmup] SUCCESS`, then retry |
+| Slow replies, logs show `Groq rate-limited` | Groq free tier: 8,000 tokens/min, 200,000 tokens/day | Automatic: Groq is skipped until its limit resets and Gemini answers instead |
+| Gemini `429 ResourceExhausted` | Gemini free tier requests/min | Space out requests; limits are per minute |
+| OpenAI fallback `insufficient_quota` | No credits on the OpenAI key | Skipped automatically for 1 h; add credits or ignore |
+| `'ChatOpenAI' object has no attribute '_add_version'` | venv out of sync with `requirements.txt` | `pip install -r requirements.txt` |
+| First request after idle fails with `OperationalError` | Neon closed the idle DB connection | Handled by `conn_health_checks=True` in `settings.py` |
+| `TimeoutError: timed out` tracebacks in `runserver` | Phone's idle keep-alive socket closed by the dev server | Harmless (dev server only) |
+
+---
+
+## 8. Known limits
+- Free LLM tiers cap throughput (roughly 2–3 full chat turns per minute before falling back to slower providers).
+- Streaming responses are not implemented: the app waits for the full JSON (see architecture doc §9).
+- Knowledge base covers 10 diseases; other medical topics get a "please see a doctor" style reply.
+
+---
+
+## Contributors
+- **Rahman Ali** — Lead developer & RAG pipeline
 - **FYP Team SEHAT**
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

@@ -1,532 +1,211 @@
-# FYP-SEHAT: System Architecture & Technical Audit
+# SEHAT — Architecture & Request Flow
 
-## 1. One-Paragraph Summary
+This document explains **exactly what happens in the code**, step by step, with real file and function names. Setup instructions are in [README.md](README.md).
 
-**FYP-SEHAT** is a mobile health assistance application built to provide reliable medical guidance for rural communities in Pakistan. A user types a health question or symptom into a React Native mobile application in either English or Roman Urdu (Urdu words written with English letters). The request travels over an ngrok tunnel to a Python Django backend, which converts the query into English, searches through indexed World Health Organization (WHO) medical booklets using a hybrid search engine (combining keyword search and AI vector similarity hosted on Neo4j Aura), and feeds the retrieved facts to a Large Language Model (Google Gemini 3.1 Flash Lite with Groq LLaMA 3.1 fallback) to generate an easy-to-understand answer. The final response includes source citations showing the exact booklet name and page numbers, enforces medical disclaimers, evaluates answer quality with a mathematical safety gate, and stores the chat history in a PostgreSQL database linked to the user's Firebase account.
+All backend paths are relative to `Backend/sehat_backend/`.
 
 ---
 
-## 2. Big-Picture Architecture Diagram
-
-The flowchart below illustrates how every layer of the system connects together—from the mobile user's screen down to the AI services and databases.
+## 1. Big picture
 
 ```mermaid
 flowchart TD
-    subgraph Client["Frontend (Mobile App - React Native / Expo)"]
-        UI["User Interface (Chat Screen / Library / Home)"]
-        FAuth["Firebase Client SDK (Auth & User Profiles)"]
-        AxiosClient["API Service (Axios Client - EXPO_PUBLIC_API_URL)"]
+    subgraph App["Mobile app (Frontend/app)"]
+        UI["screens/(tabs)/chatbot.jsx"]
+        API["services/api.jsx (Axios + Firebase token)"]
+    end
+    subgraph Django["Django backend"]
+        MW["sehat_backend/health_middleware.py\n/healthz, /readyz"]
+        V["chat/views.py\nprocess_query()"]
+        CS["chat/services.py\nChatService.process_user_query()"]
+        R1["chat/rag_service.py\nretrieve_context()"]
+        R2["chat/rag_service.py\ngenerate_with_context()"]
+        L["chat/llm_service.py\nLLMService"]
+        VS["chat/vector_store_service.py\nhybrid_search()"]
+        W["chat/warmup.py\n(background start-up)"]
+    end
+    subgraph Cloud["Cloud services"]
+        PG[("Neon PostgreSQL\nchat_sessions, messages")]
+        N4J[("Neo4j Aura\nMedicalDocument + vector index medical_docs")]
+        GROQ["Groq  openai/gpt-oss-20b"]
+        GEM["Google Gemini  gemini-3.1-flash-lite"]
+        FB["Firebase Auth"]
     end
 
-    subgraph Tunnel["Network & Edge Layer"]
-        Ngrok["ngrok Secure Tunnel (Static Domain)
-        omission-moonshine-cinnamon.ngrok-free.dev"]
-    end
-
-    subgraph ExternalAuth["Identity & Profile Layer"]
-        FBaseAuth["Firebase Authentication"]
-        FStore["Cloud Firestore (User Roles & Profiles)"]
-    end
-
-    subgraph Backend["Backend Layer (Django REST Framework)"]
-        HealthMid["HealthCheckMiddleware
-        - /healthz (Immediate 200 OK)
-        - /readyz (503 until warm)"]
-
-        Views["API Endpoints (views.py)
-        - Rate Limiter (10 req/min)
-        - Input Length Guard (<500 chars)
-        - 503 Warming Up Gate"]
-        
-        Warmup["Background Warm-up Thread (warmup.py)
-        - Resolves Neo4j DB
-        - Loads SBERT Models
-        - Rebuilds BM25 Index"]
-        
-        ChatSvc["Chat Service (services.py)
-        - Session Management
-        - Lazy RAG Service Singleton"]
-        
-        RAG["RAG Coordinator (rag_service.py)
-        - Attack Sanitization
-        - Greeting & Emergency Routing
-        - Faithfulness Gate (<0.25 Check)"]
-        
-        LLMSvc["LLM Service (llm_service.py)
-        - Query Rewriter (Chat History)
-        - Language Detector (English vs Roman Urdu)
-        - English Translator
-        - Relevance Verifier
-        - Answer Generator
-        - Triage Classifier"]
-        
-        VecSvc["Vector Store Service (vector_store_service.py)
-        - BM25 Sparse Search (Rank Weight: 0.4)
-        - Neo4j Dense Vector Search (Rank Weight: 0.6)
-        - SBERT Cosine Reranking & Dynamic Thresholding"]
-    end
-
-    subgraph Management["Management & Ingestion CLI"]
-        IngestCmd["CLI Command: ingest_documents.py
-        - PyPDFLoader & TextSplitter (500/100)
-        - SHA-256 Incremental Change Detection
-        - Skip-on-Hash-Error Protection"]
-    end
-
-    subgraph Databases["Data & Storage Layer"]
-        Postgres[("PostgreSQL Database (Neon)
-        - chat_sessions
-        - messages (with JSON metadata)")]
-        Neo4j[("Neo4j Aura Cloud DB
-        - Node: MedicalDocument
-        - Properties: text, embedding, source_file, page")]
-        DiskStorage[("Local Filesystem
-        - medical_documents/*.pdf")]
-    end
-
-    subgraph AIProviders["External AI & Model Layer"]
-        Gemini["Google Gemini 3.1 Flash Lite (Primary)"]
-        Groq["Groq API (LLaMA 3.1 8B Instant - Fallback)"]
-        LocalEmbed["Local CPU Embeddings
-        (sentence-transformers/all-MiniLM-L6-v2)"]
-    end
-
-    %% User interactions
-    UI -->|"Signs in / Registers"| FAuth
-    FAuth <-->|"Tokens & UID"| FBaseAuth
-    FAuth <-->|"User document & Role"| FStore
-    UI -->|"Types question / Sends chat"| AxiosClient
-    AxiosClient -->|"HTTPS via ngrok"| Ngrok
-    Ngrok --> HealthMid
-    HealthMid --> Views
-
-    %% Backend flow
-    Views --> ChatSvc
-    ChatSvc <-->|"Read / Write sessions & messages"| Postgres
-    ChatSvc --> RAG
-    RAG --> LLMSvc
-    RAG --> VecSvc
-    Views -.->|"Monitors state"| Warmup
-
-    %% Ingestion flow
-    IngestCmd -->|"Splits & Embeds PDFs"| VecSvc
-    DiskStorage -->|"Read raw PDFs"| IngestCmd
-
-    %% Vector Store & AI connections
-    VecSvc <-->|"Dense vector similarity search"| Neo4j
-    VecSvc <-->|"Vector encoding & Reranking"| LocalEmbed
-    LLMSvc <-->|"Primary Generation & Triage"| Gemini
-    LLMSvc -.->|"Fallback LLM"| Groq
-    LLMSvc <-->|"Claim validation embeddings"| LocalEmbed
-
-    %% Output cycle
-    RAG -->|"Response + Citation Block + Metadata"| ChatSvc
-    ChatSvc -->|"Saves Bot Message"| Postgres
-    ChatSvc -->|"Returns JSON response"| Views
-    Views -->|"HTTP 200 OK via Tunnel"| AxiosClient
-    AxiosClient -->|"Displays message bubble"| UI
-
----
-
-## 3. Step-by-Step: What Happens When a User Asks a Health Question
-
-This section traces the full life cycle of a single medical question, from the tap of a button on a smartphone to the final answer displayed on the screen.
-
-### Step 1: User Asks a Question in the Mobile App
-* The user opens the **Chatbot** tab in the React Native mobile app (`chatbot.jsx`).
-* The user types their question into the bottom text input field (or taps one of the predefined quick prompts such as *"I have fever and headache"*).
-* The app validates that the message is not blank and does not exceed 500 characters.
-* A user message bubble appears immediately in the UI.
-
-### Step 2: Request Sent to the Backend
-* The app grabs the active `sessionId` (or leaves it blank if this is the very first message).
-* It extracts the user's Firebase user ID (`firebase_uid`) from the local auth session.
-* It slices the last 6 messages from the conversation to provide memory context.
-* It sends an HTTP `POST` request to `http://<server-ip>:8000/api/chat/query/` with this JSON body:
-  ```json
-  {
-    "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-    "query": "Mujhe 3 din se tez bukhar hai aur ulti ho rahi hai",
-    "firebase_uid": "usr_abc123xyz",
-    "chat_history": [
-      {"sender": "user", "text": "..."},
-      {"sender": "bot", "text": "..."}
-    ]
-  }
-  ```
-
-### Step 3: Security, Rate Limiting, and Session Verification
-* **Rate Limiting:** An in-memory cache checks how many requests this `firebase_uid` has made in the past 60 seconds. If it exceeds 10 requests, the backend immediately returns an HTTP `429 Too Many Requests` error.
-* **Length Check:** The backend rejects queries exceeding 500 characters.
-* **Session Ownership:** The backend looks up the `session_id` in PostgreSQL. If the session exists but belongs to a different `firebase_uid`, it returns a 404 error to prevent unauthorized access.
-* **Database Record:** The user's query is saved into the PostgreSQL `messages` table with an auto-incremented sequence number.
-
-### Step 4: Prompt Sanitization & Emergency Routing
-* The query is scanned against regex patterns for prompt injection attempts (e.g., *"ignore previous instructions"*, *"DAN"*, *"jailbreak"*). If matched, the query is rejected.
-* The query is scanned against self-harm and suicide regex patterns (e.g., *"want to die"*, *"suicide"*).
-* **Emergency Intercept:** If self-harm is detected, the system immediately bypasses retrieval and returns an emergency response in the user's language directing them to Pakistan's **1122 emergency helpline**.
-
-### Step 5: Query Classification, Rewriting, and Language Detection
-* **Greeting Check:** Fast regex patterns check for *"hi"*, *"salam"*, *"assalam-o-alaikum"*, etc. If it is purely a greeting, the LLM generates a friendly 2-sentence greeting without doing any document search.
-* **Query Rewriting:** If past conversation exists, the LLM rewrites follow-up questions into standalone queries. For example, if the previous turn was about *typhoid*, and the user asks *"Iska ilaaj kya hai?"* ("What is its cure?"), the LLM rewrites it to *"Typhoid ka ilaaj kya hai?"*.
-* **Language Detection:**
-  * Checks for Devanagari script characters. If found, it halts and returns an error explaining that Hindi script is not supported.
-  * An LLM classifies the query as either `english` or `roman_urdu`.
-* **Translation to English:** If the query is in Roman Urdu, the LLM translates it into clear English text (e.g., *"I have high fever for 3 days and vomiting"*). This English version is required because the medical reference documents are written in English.
-
-### Step 6: Hybrid Document Retrieval (BM25 + Neo4j Vector)
-The English query is sent to `VectorStoreService.hybrid_search()`:
-1. **Sparse Search (BM25):** Performs keyword matching against loaded document chunks. Up to 10 matching chunks are retrieved.
-2. **Dense Vector Search (Neo4j):** Generates a 384-dimensional vector embedding of the query using the local `sentence-transformers/all-MiniLM-L6-v2` model. It searches the Neo4j Aura database for the top 10 closest document chunks using cosine distance on the vector index `medical_docs`.
-3. **Reciprocal Rank Fusion (RRF):** Combines the ranks from both searches into a unified score:
-   $$\text{Score} = \frac{0.4}{\text{rank}_{\text{BM25}} + 60} + \frac{0.6}{\text{rank}_{\text{Neo4j}} + 60}$$
-4. **SBERT Re-ranking:** Takes the unified unique candidate chunks and computes exact cosine similarity between the query embedding and each chunk embedding using local SBERT.
-5. **Dynamic Cutoff:**
-   * If the top score is $> 0.5$, chunks below $0.35$ are discarded.
-   * If the top score is $> 0.3$, chunks below $0.25$ are discarded.
-   * Otherwise, chunks below $0.20$ are discarded.
-   * Up to the top 5 surviving chunks are selected. If no chunk meets the threshold, the search returns empty.
-
-### Step 7: Relevance Verification
-* Before calling the generator, the system passes the retrieved text and user question to the LLM for a binary check: *"Does this retrieved medical text actually answer this question? (YES or NO)"*.
-* If the LLM responds NO, the system avoids generating false information and immediately responds with a safe fallback:
-  * English: *"Sorry, I could not find information about this in my knowledge base. Please consult a doctor."*
-  * Roman Urdu: *"Maafi chahta hoon, is sawaal ka jawab mere paas mojood documents mein nahi mila. Kisi doctor se rabta karein."*
-
-### Step 8: LLM Answer Generation & Medical Safety Constraints
-* The retrieved text, chat history, and user question are injected into a strict prompt.
-* **Strict Rules Given to the Model:**
-  1. Rely **only** on the provided medical text—never invent facts.
-  2. Answer strictly in the requested language (pure English or pure Roman Urdu). Never mix the two.
-  3. Maximum 5 unique bullet points using dashes.
-  4. Never give recipes, code, or non-medical advice.
-  5. Always include the medical disclaimer: *"This is not a substitute for professional medical advice."*
-* The request is sent to **OpenAI GPT-4o** (or fallback **Groq LLaMA 3.1 8B**).
-
-### Step 9: Language Purity & Faithfulness Verification
-* **Roman Urdu Purity Check:** If the response was meant to be Roman Urdu, the code scans it for English words (e.g., *"the"*, *"infection"*, *"hospital"*, *"treatment"*). If more than 3 English words appear, it triggers a second translation prompt forcing the output into pure Roman Urdu.
-* **RAGAS Faithfulness Evaluation:** The system breaks the LLM's answer into individual claims and computes the cosine similarity between each claim and the retrieved context chunks using the local SBERT model.
-* **The 0.25 Safety Gate:** If the calculated faithfulness score is below `0.25`, the answer is deemed a potential hallucination. The backend discards the entire generated answer and replaces it with the safe "no-info" fallback message.
-
-### Step 10: Attaching Source Citations & Returning Structured Response
-* If the response is valid, the system resolves real curated display titles (e.g. WHO/EAU titles from node/chunk metadata) and returns a structured response:
-  ```
-  --- Sources ---
-  WHO: Background Document on the Diagnosis, Treatment and Prevention of Typhoid Fever: Pages 12, 14
-  ```
-* The response payload includes clean separation of `answer_body`, `sources` (list of title and page numbers), `triage_level`, and `disclaimer` in `metadata`, while `message_text` retains full text for backward compatibility and database search.
-* The bot message is saved to PostgreSQL along with its evaluation metrics, model name, and detected language in the `metadata` JSON column.
-* The backend returns HTTP 200 with both user and bot messages.
-* The React Native app receives the response, renders the structured bubble (colored triage pill, clean body, collapsible sources, disclaimer), and saves the updated conversation locally in `AsyncStorage`.
-
----
-
-## 4. Step-by-Step: How the Medical Knowledge Base Was Built
-
-The knowledge base contains World Health Organization (WHO) clinical and public health guidance for endemic diseases common in Pakistan. Here is how documents enter and are indexed into the system:
-
-```mermaid
-flowchart LR
-    PDF["Raw WHO PDF Booklets
-    (e.g., Typhoid Fever)"] --> PyPDF["PyPDFLoader
-    (Reads text & extracts page numbers)"]
-    PyPDF --> Splitter["RecursiveCharacterTextSplitter
-    (Chunk size: 500 chars, Overlap: 100 chars)"]
-    Splitter --> Chunks["Document Chunks with Metadata
-    {text, page, source_file}"]
-    
-    Chunks --> MiniLM["sentence-transformers/all-MiniLM-L6-v2
-    (Generates 384-d vector embeddings)"]
-    
-    MiniLM --> Neo4jStore["Neo4j Aura Cloud DB
-    (:MedicalDocument)
-    - text
-    - embedding
-    - source_file
-    - page"]
-    
-    Chunks --> BM25Store["In-Memory BM25 Sparse Index
-    (Keyword inverted index)"]
+    UI --> API --> MW --> V --> CS
+    V -. verify token .-> FB
+    CS <--> PG
+    CS --> R1 --> L
+    R1 --> VS --> N4J
+    CS --> R2 --> L
+    L --> GROQ
+    L --> GEM
+    W -. loads models + BM25 .-> VS
 ```
 
-### 1. Source Document Selection
-* The project scope targets **10 minor and prevalent diseases in Pakistan**:
-  1. Common Cold
-  2. Dengue Fever
-  3. Diarrhea / Gastroenteritis
-  4. Hepatitis A (and B)
-  5. Influenza (Flu)
-  6. Malaria
-  7. Skin Allergies
-  8. Tuberculosis (TB)
-  9. Typhoid Fever
-  10. Urinary Tract Infections (UTI)
-* The original PDFs were sourced from World Health Organization guideline booklets and publications.
+---
 
-### 2. Physical Storage in the Project
-* In the frontend (`Frontend/assets/books/`), all **14 WHO PDF files** are bundled directly inside the mobile app for offline reading through an integrated PDF viewer.
-* In the frontend code (`Frontend/app/books.jsx`), there is an extensive 1,268-line curated dataset containing structured causes, symptoms, remedies, complications, and warnings in both English and Roman Urdu for all 10 diseases.
-* In the backend (`Backend/medical_documents/`), **only 1 PDF file** is currently present in the repository (`8-Typhoid-Fever-WHO-BOOK.pdf`).
+## 2. Server start-up (`chat/apps.py` → `chat/warmup.py`)
 
-### 3. Text Extraction and Chunking
-* Document ingestion is decoupled from server startup and executed via the dedicated management command:
-  ```bash
-  python manage.py ingest_documents
-  ```
-  *(Or targeting a specific document: `python manage.py ingest_documents --file 1-DENGUE-WHO-BOOK.pdf`)*
-* **Incremental Hashing:** The command calculates a SHA-256 hash of each PDF. If the hash matches the node hash stored in Neo4j, ingestion is safely skipped to avoid redundant embedding and writes. If hash reading fails due to a network interruption, it safely skips rather than deleting existing data.
-* **Loader:** `langchain_community.document_loaders.PyPDFLoader` reads each page of the PDF file and preserves the original PDF page number.
-* **Splitter:** `langchain_text_splitters.RecursiveCharacterTextSplitter` chunks the text:
-  * `chunk_size = 500` characters.
-  * `chunk_overlap = 100` characters (ensures medical sentences split across boundaries do not lose context).
-  * `separators = ["\n\n", "\n", ". ", " ", ""]`.
-* **Metadata Tagging:** Every chunk receives metadata attributes:
-  * `source_file`: The filename of the PDF (e.g., `8-Typhoid-Fever-WHO-BOOK.pdf`).
-  * `page`: The exact page number where the text appeared in the official WHO document.
-  * `disease`: Disease category tag stamped across Neo4j nodes and BM25 documents.
-
-### 4. Vector Embedding & Database Indexing
-* Chunks pass into `VectorStoreService.add_chunks_to_store()`.
-* **Embedding Model:** `sentence-transformers/all-MiniLM-L6-v2` runs locally on the CPU to convert each 500-character text chunk into a 384-dimensional dense vector representation.
-* **Neo4j Storage:** The chunks and embeddings are pushed to the cloud-hosted Neo4j Aura database:
-  * Node Label: `MedicalDocument`.
-  * Node Properties: `text`, `embedding` (384 floats), `source_file`, `page`, and `disease`.
-  * Index Name: `medical_docs` (vector index for cosine distance calculation).
-* **BM25 Update & Startup Warm-Up:** At runtime, the server starts non-blocking and triggers an asynchronous background thread (`chat/warmup.py`) that loads the embedding model and restores the in-memory `BM25Retriever` index from Neo4j without re-reading or re-embedding the source PDFs.
-
-### 5. Document Management & Deletion
-* The Admin Dashboard allows administrators to view all indexed documents and delete them.
-* When a document is removed, the backend executes Cypher queries against Neo4j to delete the corresponding nodes:
-  ```cypher
-  MATCH (n:MedicalDocument)
-  WHERE n.source_file = $source
-  DETACH DELETE n
-  RETURN count(n) AS deleted_count
-  ```
-* The file is then deleted from the `medical_documents/` folder on the disk, and the in-memory BM25 index is rebuilt without those chunks.
+1. `ChatConfig.ready()` initialises Firebase Admin and calls `start_warmup()` (skipped for `migrate`, `test`, `shell`, … and in the runserver auto-reloader parent).
+2. `_run_warmup()` runs in a background thread:
+   - resolves the Neo4j database name,
+   - loads `all-MiniLM-L6-v2` (`VectorStoreService.load_models`) — ~36 s,
+   - rebuilds the in-memory BM25 index from all Neo4j chunks (`warm_up_bm25_from_neo4j`) — ~12 s,
+   - attaches the Neo4j vector index `medical_docs`.
+3. State goes `idle → loading → ready` (or `failed`). Until `ready`, `/readyz` and `/api/chat/query/` return **503** (`warming_up`, header `Retry-After: 15`); the app shows "SEHAT AI is warming up. Please retry in a few seconds."
 
 ---
 
-## 5. Technology Table: The "Why" and Alternatives
+## 3. One chat message, step by step
 
-| Technology / Library | What It Does in This Project | Why It Was Chosen | Alternatives It Was Chosen Over |
-| :--- | :--- | :--- | :--- |
-| **React Native (Expo SDK 54)** | Cross-platform mobile front-end for patient chat, symptom navigation, and PDF reading. | Allows building an iOS and Android app from a single JavaScript/React codebase. Expo drastically simplifies mobile deployment, fonts, assets, and document picking. *(Inferred: High priority for university FYP demo speed across Android and iOS phones).* | **Flutter** (requires learning Dart; team likely had React/JS skills), **Native Kotlin/Swift** (requires maintaining two completely separate codebases). |
-| **Django (v4.2.7) & DRF (v3.14.0)** | Main backend REST API handling user sessions, chat queries, rate limiting, and document management. | Provides an out-of-the-box admin panel, native ORM, clean security middleware, and deep compatibility with Python's rich AI/ML ecosystem. | **FastAPI** (faster, but lacks built-in admin and mature built-in database migration tooling), **Flask** (requires manually stitching together ORM, migrations, and serializers). |
-| **PostgreSQL** | Relational database storing user chat sessions and individual chat messages. | High reliability, ACID compliance, and native support for `JSONField`, which allows saving arbitrary RAG metadata (evaluation scores, model names, page numbers) alongside structured message text. | **SQLite** (unsuitable for concurrent multi-user production writes), **MongoDB** (less structured relational integrity for chat sessions). |
-| **Neo4j Aura (v5.14.1 / Cloud)** | Cloud database used strictly as a **vector store** via `langchain-neo4j`. Stores document chunks and vector embeddings. | *(Inferred)* The team initially planned a Knowledge Graph with entity relationships (symptoms $\rightarrow$ diseases $\rightarrow$ cures). During development, they adopted LangChain's `Neo4jVector` index to perform vector search directly within Neo4j rather than setting up an additional database. | **Pinecone / Weaviate / ChromaDB** (dedicated vector stores; would have introduced another cloud tool), **Pgvector** (could have stored vectors inside PostgreSQL directly, avoiding Neo4j entirely). |
-| **Google Firebase (Auth & Firestore)** | Handles user registration, email verification, password reset, and user roles (admin vs user). | Provides ready-to-use, secure authentication with built-in email verification and mobile SDKs without writing custom JWT refresh logic on Django. | **Django Built-in Auth / SimpleJWT** (would require building email verification flows, password reset tokens, and mobile session managers from scratch). |
-| **all-MiniLM-L6-v2 (Sentence-Transformers)** | Generates 384-dimensional dense vector embeddings for text chunks and queries; re-ranks search results. | Extremely fast, lightweight (runs efficiently on standard CPU without requiring an expensive GPU), open-source, and free of API usage costs. | **OpenAI text-embedding-3-small** (incurs recurring API token costs and requires an active internet call for every chunk and query). |
-| **BM25 Retriever (LangChain Community)** | Performs keyword-based sparse search over document text chunks. | Complements vector search by catching exact medical names, drug names, and specific terminology that vector models sometimes blur. | **Elasticsearch / OpenSearch** (far too heavy and complex to run for a 10-disease university project). |
-| **Google Gemini 3.1 Flash Lite** | Primary Large Language Model for query translation, query rewriting, relevance verification, and final answer generation. | Exceptional clinical instruction-following, ultra-fast response latency, and rich multi-lingual handling for Roman Urdu translations. | **OpenAI GPT-4o** (configured as alternative enterprise LLM). |
-| **Groq (LLaMA 3.1 8B Instant)** | High-speed auxiliary LLM for triage classification, input sanitization, and fallback generation. | Offers sub-second inference speeds at near-zero latency, running modern open-weight open-source models. | **Anthropic Claude / Google Gemini Pro**. |
-| **LangChain (v1.2.4)** | Glue library connecting document loaders, text splitters, vector stores, and LLM chains. | Drastically reduces boilerplate code needed to chunk PDFs, compute reciprocal rank fusion, and coordinate multi-step prompt chains. | **LlamaIndex** (similarly capable; LangChain has wider community documentation for Neo4j vector integrations). |
+### Step 1 — App (`Frontend/app/screens/(tabs)/chatbot.jsx`, `services/api.jsx`)
+- User types a message; `apiService.sendMessage()` posts to `POST /api/chat/query/` with `session_id`, `query`, `firebase_uid`, `chat_history`.
+- An Axios interceptor attaches `Authorization: Bearer <Firebase ID token>`.
+- Base URL comes from `getBaseUrl()` in `api.jsx`.
 
----
+### Step 2 — View (`chat/views.py` → `process_query`)
+1. `extract_and_verify_token()` verifies the Firebase ID token (Firebase Admin, `AuthenticationService.verify_firebase_token` in `chat/services.py`) → **401** if missing/invalid.
+2. `session_id` and `query` required → **400** otherwise.
+3. Warm-up gate → **503** until the knowledge base is ready.
+4. `check_rate_limit()` — max 10 requests / 60 s per user → **429**.
+5. Query length ≤ 500 chars.
+6. `get_user_session_or_404()` — the session must belong to this user.
+7. Calls `ChatService.process_user_query()`.
 
-## 6. How Urdu and English Are Handled
+### Step 3 — Chat service (`chat/services.py` → `ChatService.process_user_query`)
+1. Loads the session's messages **from the database** (the backend is the source of truth; client `chat_history` is ignored) and groups them into turns (`extract_turn_pairs`).
+2. `trigger_rolling_summarization_if_needed()` — when more than 8 turns exist, older turns are summarised once into `session.rolling_summary`.
+3. Saves the user `Message`.
+4. Calls `RAGService.retrieve_context()` with the last 8 turns, `clarification_round`, `rolling_summary`, `patient_context`.
+5. **Subject tracking**: if the classifier reports a new patient (`subject_reference`, e.g. "my uncle"), `patient_context` is reset. On an **emergency** turn only `active_subject` is updated (facts are kept).
+6. Merges new patient facts into `session.patient_context` (`merge_patient_facts`).
+7. Calls `RAGService.generate_with_context()`.
+8. Updates `clarification_round` (incremented on a follow-up question, reset on an answer / emergency).
+9. Saves the bot `Message` (text + metadata: triage, sources, language, timings) in a single INSERT and logs one `[TIMING SUMMARY]` line.
 
-Handling language correctly is essential because most users in rural Pakistan speak Urdu, but medical textbooks and WHO guidelines are written in English. Furthermore, ordinary smartphone users in Pakistan typically type Urdu using the Latin alphabet (known as **Roman Urdu**, e.g., *"Mujhe bukhar hai"*), rather than Arabic script.
+### Step 4 — Understanding the message (`chat/rag_service.py` → `retrieve_context`)
+1. `sanitize_input()` blocks prompt-injection patterns.
+2. **In parallel** (thread pool `_EXECUTOR`):
+   - `validate_query()` — regex greeting check; short queries (≤ 7 words) pass as valid; longer ones get an LLM check (VALID / UNCLEAR / INVALID / GREETING).
+   - `detect_language()` — `english` / `roman_urdu` (Devanagari → `invalid_hindi`).
+   - `classify_and_rewrite_query()` — the **intake classifier** (skipped for plain greetings).
+3. **Emergency first**: if the classifier returns `triage_level == "Emergency"`, it overrides an "unclear/invalid" validation result (except prompt-injection inputs) and the turn returns immediately with status `emergency` — no search, no generation.
+4. Greeting / invalid / unclear / Hindi → early return with that status.
+5. Otherwise the classifier's `intent` routes the turn:
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User as Rural Patient
-    participant App as Mobile App
-    participant BE as Django RAG
-    participant LLM as Gemini 3.1 Flash / Groq
-    participant VStore as Neo4j & BM25
+| `intent` | Result status | What happens next |
+|---|---|---|
+| `meta_query` ("what did I tell you?") | `meta_history` | Answer from conversation history |
+| `translation_request` | `translation_request` | Re-render last bot reply in the requested language |
+| `new_symptom_info` / `followup_answer` with missing details (and < 5 rounds) | `clarifying` | Ask **one** follow-up question |
+| `capabilities_query` | `capabilities` | Explain what SEHAT can do |
+| `small_talk` | `small_talk` | Short friendly reply, invite a health question |
+| `off_topic` | `off_topic` | "I can only help with health questions." |
+| `sufficient_for_answer` (or 5 rounds reached) | `valid` | Search + answer (below) |
 
-    User->>App: Enters: "Mujhe 2 din se pait me shadeed dard hai" (Roman Urdu)
-    App->>BE: Sends query to backend via ngrok tunnel
-    BE->>LLM: Detect Language
-    LLM-->>BE: Returns: "roman_urdu"
-    BE->>LLM: Translate to English for search
-    LLM-->>BE: Returns: "I have severe stomach pain for 2 days"
-    BE->>VStore: Search WHO English booklets with translated query
-    VStore-->>BE: Returns English medical chunks (e.g. Typhoid, Gastroenteritis)
-    BE->>LLM: Generate final answer strictly in Roman Urdu using English context
-    LLM-->>BE: Returns answer in Roman Urdu + Disclaimer
-    Note over BE: Purity Check: Counts English words.<br/>If > 3 English words, triggers translation retry!
-    BE->>App: Returns pure Roman Urdu response + Source Citations
-    App->>User: Displays message in comfortable language
-```
+6. For `valid`: the English search query comes from the classifier's `english_query` (fallback: `translate_to_english`), then `VectorStoreService.hybrid_search()`.
 
-### 1. Language Detection
-* When a question arrives, the backend first scans for Hindi characters (Devanagari script such as `ा`, `ि`, `ी`). If found, it immediately halts and asks the user to type in English or Roman Urdu (`invalid_hindi`).
-* An LLM prompt evaluates the text:
-  * If it finds Urdu words spelled with Latin characters (e.g., *hai, hain, mera, aapka, kya, bukhar*), it classifies it as `roman_urdu`.
-  * If it is standard English, it classifies it as `english`.
+#### The intake classifier (`llm_service.py` → `classify_and_rewrite_query`)
+One JSON call that returns: `intent`, `rewritten_query` (pronouns resolved from history), `english_query`, `new_facts`, `missing_for_diagnosis`, `follow_up_question`, `target_language`, `subject_reference`, **`triage_level`** and **`emergency_advice`**.
+- Triage is judged from meaning (any spelling / language), using current message + history. No keyword lists.
+- On a classifier failure, `classify_triage()` is called once as backup; if that also fails the level is `Doctor` (never `Self-Care` by default).
 
-### 2. Retrieval Translation (Bridge to Knowledge)
-* Because all WHO medical guideline documents stored in Neo4j are written in English, searching with Roman Urdu keywords yields poor semantic matches.
-* The system uses an LLM translation prompt to convert the Roman Urdu query into clean English before searching the knowledge base.
+### Step 5 — Hybrid search (`chat/vector_store_service.py` → `hybrid_search`)
+1. **Neo4j vector search** (top 10) runs in a background thread **while** **BM25** (top 10) runs locally.
+2. **Reciprocal Rank Fusion**: `score = 0.4/(rank_bm25+60) + 0.6/(rank_neo4j+60)`.
+3. **SBERT rerank**: all candidates encoded in one batch; cosine similarity to the query.
+4. If the best score is **< 0.48** → no results ("no relevant content"). Otherwise keep chunks ≥ 0.35, max 5.
 
-### 3. Response Generation & The "Purity Check"
-* If the user originally asked in Roman Urdu, the generation prompt enforces strict language constraints:
-  * *"CRITICAL LANGUAGE RULE: You MUST write the ENTIRE answer in Roman Urdu. Use ONLY Urdu words written in English script... DO NOT write English sentences or phrases."*
-* **The Purity Check:** Large Language Models frequently lapse into English when explaining technical medical concepts. The backend monitors this by scanning the generated Roman Urdu answer for common English words (such as *"fever"*, *"infection"*, *"hospital"*, *"treatment"*, *"disease"*).
-* If more than 3 English words are detected, the system intercepts the response and invokes an automatic retry prompt: *"Convert the following text to PURE Roman Urdu"*.
+### Step 6 — Writing the answer (`chat/rag_service.py` → `generate_with_context`)
+Branches by status: clarifying, meta_history, translation, off_topic, small_talk, **emergency**, greeting, capabilities, invalid, unclear, Hindi, then the main pipeline:
 
-### 4. Arabic-Script (Nastaliq) Urdu: An Unhandled Edge Case
-* In code, the prompt instructions only define two valid options: `roman_urdu` or `english`.
-* If a user pastes native Arabic-script Urdu (e.g., "مجھے بخار ہے"), the system does not have dedicated Nastaliq OCR, transliteration, or Urdu-script embeddings. It falls back to generic LLM classification and may produce erratic retrieval results.
+1. No chunks → triage-aware fallback: `Self-Care` → "not found in documents"; otherwise → "Please see a doctor soon."
+2. **In parallel**: `verify_relevance()` (does the text answer the question?) and `generate_answer()` (Gemini). If relevance says NO, the generated answer is discarded and the fallback above is used.
+3. `generate_answer()` prompt rules: answer only from the retrieved text, strict language (English or Roman Urdu), 4–6 points, highlight red flags, **no follow-up questions in the final answer**, always end with the disclaimer. Roman Urdu answers get a purity check (Arabic script / English leakage → one re-write).
+4. RAGAS metrics run in a background thread (0.5 s wait); faithfulness < 0.25 would replace the answer with the no-info message.
+5. Citations are built by `_build_citations()` (curated display title + page numbers) and appended as `--- Sources ---`.
+6. `triage_level` comes from the intake classifier (`classify_triage` only if missing).
 
----
-
-## 7. How Triage Guidance Works
-
-**Medical Triage** is the process of deciding how urgently a patient needs to see a doctor based on the severity of their symptoms.
-
-### What the System ACTUALLY Does in Code:
-1. **Hardcoded Suicide & Self-Harm Emergency Detection:**
-   * In `llm_service.py`, regex patterns scan for crisis keywords (`suicide`, `want to die`, `kill myself`, `end my life`).
-   * If detected, the system immediately bypasses the document database and returns an emergency response in the user's language:
-     * *English:* *"⚠️ Emergency: If you're thinking about self-harm or suicide, please seek help immediately. In Pakistan, call 1122 for emergency services..."*
-     * *Roman Urdu:* *"⚠️ Emergency: Agar aap self-harm ya suicide ke baare mein soch rahe hain, to please turant madad lein. Pakistan mein emergency helpline 1122 hai..."*
-2. **Mandatory Medical Disclaimer Enforcement:**
-   * Every generated answer is programmatically verified to include the sentence: *"This is not a substitute for professional medical advice."* If the LLM omits it, the backend appends it to the end of the text.
-3. **Emergency Warning Rules in Prompt:**
-   * In `rag_service.py`, the capabilities prompt instructs the LLM that it can advise on *"whether you should see a doctor"*. If the retrieved WHO booklet specifies red-flag symptoms (such as high fever lasting over 3 days, blood in stool, or dehydration), the model includes those warnings in the text.
-
-### The Missing Piece: Disconnected Triage Tags
-* **The Frontend UI Expectation:** In `chatbot.jsx`, the frontend has UI components to display color-coded triage tags:
-  * **Emergency** (Red tag & bubble)
-  * **Monitor** (Orange tag & bubble)
-  * **Self-Care** (Green tag & bubble)
-* **The Backend Reality:** The backend serializer (`serializers.py`) declares a field `triage_level`, but defaults it to `"Info"`. **The RAG pipeline (`rag_service.py`) never populates `triage_level` or `possible_condition` in the response metadata.**
-* Consequently, during normal chat sessions, the structured triage tags and disease badges never appear on screen (they only appear if a network connection error triggers the hardcoded fallback message).
+**Emergency reply** = "call **1122**" header in the user's language + the classifier's situation-specific `emergency_advice` (generic first-aid text if empty).
 
 ---
 
-## 8. How Source Citations Work
+## 4. LLM providers (`chat/llm_service.py`)
 
-A core pillar of trustworthy medical AI is citation: proving that an answer came from a verified medical manual rather than an AI hallucination.
+| Call type | Chain | Notes |
+|---|---|---|
+| Aux calls (`_call_aux_llm`): classifier, validate, language, relevance, triage backup, greeting, translation | **Groq** `openai/gpt-oss-20b` → **Gemini** `gemini-3.1-flash-lite` → **OpenAI** `gpt-4o` | Order set by `AUX_LLM_PROVIDER_ORDER` (`groq_first` default) |
+| Answer generation (`_call_generation_llm`) | **Gemini** → Groq | |
 
-```
-+-------------------------------------------------------------------------------+
-| User: "What are the common symptoms of typhoid?"                              |
-+-------------------------------------------------------------------------------+
-| Bot:                                                                          |
-| Typhoid bukhar aik sanjeeda infection hai. Iski aam alamaat ye hain:         |
-| - Musalsal aur tez bukhar jo waqt ke sath barhta hai                          |
-| - Sar dard aur jism mein shadeed kamzori                                      |
-| - Pait mein dard ya kharab pait                                               |
-|                                                                               |
-| Ye kisi professional doctor ki salah ka mutbadil nahi hai.                    |
-|                                                                               |
-| --- Sources ---                                                               |
-| WHO: Background Document on the Diagnosis, Treatment and Prevention of...    |
-+-------------------------------------------------------------------------------+
-```
+Safety / speed behaviour:
+- Groq `max_retries=0`; on a **429** Groq is skipped until its `retry-after` passes (circuit breaker `_groq_blocked_until`).
+- A Groq reply cut off at `max_tokens` (`finish_reason == "length"`, gpt-oss spends tokens on reasoning) is treated as a failure → next provider.
+- OpenAI `insufficient_quota` → OpenAI skipped for 1 hour (`_openai_blocked_until`).
+- Clients are created once and reused (`_aux_clients`).
 
-### How the System Builds Citations:
-1. **Metadata Preservation During Loading:** When `DocumentService` loads a PDF using `PyPDFLoader`, LangChain records the source file path, the curated `display_title`, and the 0-indexed page number on each chunk object.
-2. **Citation Aggregator (`_build_citations`):**
-   * After the hybrid search selects the top 5 chunks, `_build_citations()` loops through them.
-   * It extracts `display_title` (falling back to filename if absent).
-   * It extracts `page = doc.metadata.get("page")`, converts it to a human-readable page number, and collects them into a Python `set` grouped by book.
-3. **Citation Formatting:**
-   * It constructs both a clean text block for plain text fallback and a structured `sources` list `[{title, filename, pages}]` for the mobile UI:
-     ```text
-     --- Sources ---
-     <Display Title>: Pages <page_1>, <page_2>
-     ```
-4. **Structured Delivery:**
-   * The citations list and clean answer body are delivered in the API response metadata, enabling the frontend to render collapsible source accordions.
+Free-tier limits (current keys): Groq 8,000 tokens/min and 200,000 tokens/day; Gemini requests/min limit; OpenAI key has no credits.
 
 ---
 
-## 9. Development Approach & Engineering Analysis
+## 5. Triage
 
-### Architecture Pattern
-* **Monolithic Django Core + Separate Mobile Client:** The backend follows a service-oriented architectural pattern inside a single Django app (`chat`). Responsibilities are partitioned cleanly:
-  * `views.py`: HTTP parsing, validation, session lookup, rate limiting.
-  * `services.py`: High-level business coordinator between PostgreSQL and AI services.
-  * `rag_service.py`: Pipeline coordinator (sanitization, validation, retrieval, generation).
-  * `document_service.py`: PDF ingestion and chunk splitting.
-  * `vector_store_service.py`: Hybrid search, Neo4j connection, SBERT re-ranking.
-  * `llm_service.py`: Model wrappers, prompt templates, language logic, RAGAS calculations.
+| Level | Meaning (used in both classifier and `classify_triage`) | App badge (`chatbot.jsx`) |
+|---|---|---|
+| `Emergency` | Possible threat to life, limb or safety of anyone, incl. self-harm | Red "Emergency" |
+| `Doctor` | Needs in-person exam, tests or prescription | Orange "Consult Doctor" |
+| `Self-Care` | Mild, safe to manage at home | Green "Self-Care" |
+| `null` | No clinical content (greeting, small talk, off-topic, meta, translation) | No badge |
 
-### Evidence of Team Workflow
-* **Git Repository History:** Inspection of git commit logs reveals **7 total commits** by two identified contributors:
-  * **Sharafat** (6 commits): Implemented complete backend refactoring, splitting the RAG service into modular service classes, fixing merge conflicts, and updating mobile screens.
-  * **Rahman Ali** (1 commit): Initialized the repository.
-* *(Note: The project owner stated there was a 3-person team. The third team member likely worked on documentation, research, presentation slides, or contributed code via paired programming or through Sharafat's commits).*
+If unsure, the more urgent level is chosen.
 
-### Testing Approach
-* **Automated Unit & Integration Tests:** **None.** The file `Backend/sehat_backend/chat/tests.py` is an empty 4-line template file. There are no Jest/React Native tests in the frontend and no `pytest` or `unittest` test suites in the backend.
-* **Manual Test Scripts:** The team wrote standalone connection test scripts:
-  * `test_connect.py`: Validates Aura cloud connectivity.
-  * `test_neo4j_aura.py`: Tests local/remote bolt protocol connectivity.
+---
 
-### Error Handling & Safety Fallbacks
-* **In-Memory Rate Limiting:** Prevents basic API flooding (10 calls/minute per user).
-* **Length Constraints:** Hard rejection of prompts over 500 characters.
-* **Database Session Security:** Users cannot read or delete chat sessions belonging to a different `firebase_uid`.
-* **Relevance Safeguard:** If retrieved medical text does not match the question, the system falls back to a safe "no information" response.
-* **Faithfulness Guardrail (RAGAS Gate):** If the cosine similarity between generated statements and source chunks scores below `0.25`, the answer is suppressed.
-* **Crisis Detection:** Automated bypass to Pakistan's 1122 helpline for self-harm queries.
+## 6. Data model (`chat/models.py`)
 
-### Deployment & Environment Setup
-* **Development Server Setup:** Development relies on local execution:
-  * Backend: `python manage.py runserver 0.0.0.0:8000`
-  * Frontend: `npx expo start`
-* **Hardcoded Network Addresses:** The frontend configuration files contain hardcoded local IP addresses (e.g., `10.10.40.138`, `10.185.171.104`, `localhost`).
-* **CI/CD & Containerization:** There are **no Dockerfiles**, no `docker-compose.yml`, and no automated GitHub Actions pipelines present in the repository.
+- **`ChatSession`** (`chat_sessions`): `id` (UUID), `firebase_uid`, `title`, `session_metadata` (JSON: `clarification_round`, `active_subject`), `rolling_summary`, `patient_context` (JSON facts), `summarized_up_to_turn`, timestamps.
+- **`Message`** (`messages`): `id`, `session`, `sender` (`user`/`bot`), `message_text`, `metadata` (JSON: `triage_level`, `sources`, `answer_body`, `disclaimer`, `language`, `model`, `ragas_metrics`, `stage_timings`), `timestamp`, `sequence_number`.
+
+Database: Neon PostgreSQL with `conn_max_age=600` and `conn_health_checks=True` (Neon drops idle connections).
+
+---
+
+## 7. Knowledge base
+
+- **15 PDFs** in `Backend/medical_documents/` covering 10 diseases: Dengue, Diarrhoea, Hepatitis A, Influenza, Tuberculosis, Malaria, Skin allergy / contact dermatitis, Typhoid, Common cold, UTI.
+- Ingestion: `python manage.py ingest_documents` → `DocumentService` (PyPDFLoader, cleaning, 500-char chunks / 100 overlap, disease tag) → `VectorStoreService.add_chunks_to_store` (Neo4j `MedicalDocument` nodes with `text`, `embedding`, `source_file`, `page`, `disease`, `source_hash`).
+- Unchanged PDFs are skipped by SHA-256 hash (`FORCE_REINGEST=true` to force).
+- ~9,360 chunks currently indexed.
+
+---
+
+## 8. Measured latency (typical, free tiers)
+
+| Turn type | Before optimisation | Now (normal pace) |
+|---|---|---|
+| Full answer (doctor / self-care / follow-up) | 35–81 s | 8–19 s |
+| Emergency | 42 s | 4–8 s |
+| Greeting | 57 s | 3–4 s |
+
+Biggest remaining costs: Gemini answer generation (3–6 s), classifier (1–4 s), Neon DB round-trips (~2.5 s per turn, ~250 ms each from Pakistan to US-East), Neo4j vector search (~1 s).
+
+---
+
+## 9. Known limitations & next steps
+
+1. **Free-tier LLM quotas** cap throughput (~2–3 full turns/min); heavy use falls back to slower providers.
+2. **Warm-up 503**: the first ~50 s after a restart return `warming_up`; the app does not auto-retry yet.
+3. **No streaming**: the app waits for the full JSON. Streaming would need frontend changes and must respect the post-generation checks (language purity, disclaimer, citations).
+4. **Admin document endpoints are not authenticated** (`admin_list_documents`, `admin_add_document`, `admin_remove_document`).
+5. **Validation gate**: for messages > 7 words, `validate_query` may still return "unclear" for vague non-emergency messages (emergencies are protected by the classifier override).
+6. Frontend `getBaseUrl()` is currently a fixed LAN IP; change it per network.
+7. Neo4j is used as a **vector store** only (no graph relationships).
 
 ---
 
 ## 10. Glossary
-
-* **RAG (Retrieval-Augmented Generation):** A method where an AI searches through a private library of factual documents to find real information before generating an answer, preventing the AI from making things up.
-* **Vector Embedding:** A way of converting a sentence into a long list of numbers that captures its conceptual meaning, allowing a computer to calculate how similar two ideas are mathematically.
-* **Dense Retrieval:** Searching for documents based on conceptual meaning using vector math, which can match words even if they don't share the exact same spelling.
-* **Sparse Retrieval (BM25):** A traditional search method that scores documents based on exact keyword matches and word frequency.
-* **Reciprocal Rank Fusion (RRF):** A mathematical formula that combines results from two different search engines (like keyword search and vector search) into a single, fairly balanced ranking.
-* **Knowledge Graph:** A database that stores information as interconnected objects and relationships (such as *"Typhoid is caused by Salmonella"*).
-* **Vector Store:** A specialized database optimized for saving and quickly searching through vector embeddings.
-* **Triage:** The medical practice of sorting illnesses by urgency so patients know whether they need an emergency room, a routine clinic visit, or simple home rest.
-* **Faithfulness:** A metric measuring whether every claim made in an AI's answer is directly backed up by the source context documents.
-* **Roman Urdu:** Urdu language written using the Latin/English alphabet rather than the traditional Arabic-based script (for example, *"Mujhe bukhar hai"* instead of *"مجھے بخار ہے"*).
-* **Chunking:** The process of breaking down a large multi-page PDF book into small, manageable paragraphs so an AI search engine can find specific facts.
-
----
-
-## 11. Open Questions, Gaps Found, and Honesty Check
-
-This section provides an objective comparison between the project owner's summary and the actual codebase, highlighting critical architectural discrepancies and security risks.
-
-### 1. Neo4j: Vector Database vs. Knowledge Graph Discrepancy
-* **Claim:** Neo4j is part of the technology stack.
-* **Finding:** While Neo4j Aura is indeed used, it is utilized **strictly as a vector store** (`Neo4jVector`). There are **no graph relationships**, no disease-to-symptom nodes, and no Cypher graph traversals. The system uses Neo4j in the same manner as a simple vector index like Pinecone or ChromaDB.
-
-### 2. Disconnected Triage Engine
-* **Claim:** The system provides medical triage guidance.
-* **Finding:** The React Native mobile frontend has sophisticated UI components for triage levels (`Emergency`, `Monitor`, `Self-Care`), and the Django serializer exposes `triage_level`. However, **the backend RAG pipeline never classifies or generates this triage level**. It defaults to `"Info"`, meaning the structured visual triage tags are never shown to real users during normal conversations.
-
-### 3. Missing Backend WHO Documents (1 PDF vs 10 Diseases)
-* **Claim:** A RAG pipeline covering 10 minor Pakistani diseases based on WHO material.
-* **Finding:** The frontend app assets folder contains all 14 PDF books covering all 10 diseases. However, the backend directory `medical_documents/` contains **only 1 PDF file** (`8-Typhoid-Fever-WHO-BOOK.pdf`). Unless an administrator manually uploads the other 9 books through the admin screen, the live backend RAG search is only capable of answering questions about Typhoid Fever.
-
-### 4. Critical Security Risk: Hardcoded API Keys and Passwords
-* **Finding:** The root `.env` file and test scripts in the repository contain active, raw credentials:
-  * OpenRouter API key (`OR_API_KEY1`)
-  * Google API key (`GOOGLE_API_KEY`)
-  * Groq API key (`GROQ_API_KEY`)
-  * OpenAI API key (`OPEN_AI_API_KEY`)
-  * HuggingFace User Token (`HUGGINGFACEHUB_API_TOKEN`)
-  * Neo4j Aura Cloud username and password (`NEO4J_PASSWORD`)
-  * Google Firebase client credentials (`firebase.config.js`)
-* **Risk:** Anyone with repository access can make billable API requests and read or delete the entire Neo4j cloud database.
-
-### 5. Unauthenticated Backend Endpoints (Trusting Client-Supplied UID)
-* **Finding:** In `chat/services.py`, `AuthenticationService.verify_firebase_token()` is an empty `pass` statement.
-* **Risk:** The Django backend does not verify Firebase ID tokens using the Firebase Admin SDK. It blindly trusts whatever `firebase_uid` string is passed in the JSON body. Any malicious actor who knows a user's UID can view, delete, or inject chat messages into their history.
-
-### 6. Team Contributor Count
-* **Claim:** Built by a 3-person team.
-* **Finding:** The git log records commits from only 2 contributors: Sharafat (6 commits) and Rahman Ali (1 commit).
-
-### 7. In-Memory Search Index Ephemerality
-* **Finding:** The BM25 keyword search index runs entirely in server RAM (`self._all_chunks`). If the Django server restarts, it only indexes whatever PDF files physically reside in `medical_documents/`. If files were added dynamically in previous runs and the server restarts, the BM25 index loses those chunks until re-indexed.
+- **RAG** — search trusted documents first, then let the LLM answer only from them.
+- **BM25** — keyword search. **Vector search** — meaning-based search using embeddings.
+- **RRF** — merges two ranked lists into one.
+- **Triage** — how urgently the patient should get care.
+- **Roman Urdu** — Urdu written in English letters ("Mujhe bukhar hai").

@@ -84,7 +84,8 @@ else:
     DATABASES = {
         'default': dj_database_url.config(
             default=os.getenv("DATABASE_URL"),
-            conn_max_age=600
+            conn_max_age=600,
+            conn_health_checks=True,  # Neon drops idle connections; re-check before reuse
         ) or {
             'ENGINE': 'django.db.backends.postgresql',
             'NAME': config('DB_NAME', default='sehat'),
