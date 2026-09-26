@@ -231,10 +231,14 @@ class ChatService:
     
     # backend/chat/services.py
 
-    def process_user_query(self, session_id, query, chat_history=None):
-        """Process user query through RAG pipeline with backend-authoritative memory."""
+    def process_user_query(self, session_id, query, chat_history=None, session=None):
+        """Process user query through RAG pipeline with backend-authoritative memory.
+
+        `session` may be passed by the view (already fetched + ownership-checked) to
+        avoid a second identical SELECT."""
         t_req_start = time.time()
-        session = ChatSession.objects.get(id=session_id)
+        if session is None:
+            session = ChatSession.objects.get(id=session_id)
         
         # [MEMORY] Phase 2: Backend is authoritative source of truth.
         # Ignore client-supplied chat_history; fetch full ordered messages from Postgres for this session.
@@ -277,6 +281,7 @@ class ChatService:
         subject_reference = context.get("subject_reference")  # str or None
         meta = session.session_metadata if isinstance(session.session_metadata, dict) else {}
         active_subject = meta.get("active_subject")  # None = "self" (default)
+        session_changed = False  # session fields updated this turn; persisted by the final session.save()
         is_emergency = context.get("status") == "emergency"
 
         if is_emergency and (subject_reference or None) != active_subject:
@@ -285,7 +290,7 @@ class ChatService:
             meta["clarification_round"] = 0
             clarification_round = 0
             session.session_metadata = meta
-            session.save(update_fields=["session_metadata", "updated_at"])
+            session_changed = True
         elif subject_reference is not None:
             # Normalize for comparison (case-insensitive, strip whitespace)
             ref_norm = subject_reference.strip().lower()
@@ -301,7 +306,7 @@ class ChatService:
                 meta["clarification_round"] = 0
                 clarification_round = 0  # also reset local variable for this turn
                 session.session_metadata = meta
-                session.save(update_fields=["patient_context", "session_metadata", "updated_at"])
+                session_changed = True
         elif subject_reference is None and active_subject is not None:
             # User switched back to talking about themselves — reset context
             logger.info(
@@ -313,7 +318,7 @@ class ChatService:
             meta["clarification_round"] = 0
             clarification_round = 0
             session.session_metadata = meta
-            session.save(update_fields=["patient_context", "session_metadata", "updated_at"])
+            session_changed = True
         # ── end Fix 1b ────────────────────────────────────────────────────────
         
         # Phase 3: Merge new_facts into session.patient_context
@@ -322,14 +327,20 @@ class ChatService:
             updated_ctx, changed = merge_patient_facts(session.patient_context, new_facts)
             if changed:
                 session.patient_context = updated_ctx
-                session.save(update_fields=['patient_context', 'updated_at'])
+                session_changed = True
 
         # Phase 5: Wire rolling_summary and patient_context into final generation
-        response = self.rag_service.generate_with_context(
-            query, context, recent_history,
-            rolling_summary=session.rolling_summary,
-            patient_context=session.patient_context
-        )
+        try:
+            response = self.rag_service.generate_with_context(
+                query, context, recent_history,
+                rolling_summary=session.rolling_summary,
+                patient_context=session.patient_context
+            )
+        except Exception:
+            # Keep the previous behaviour on failure: subject/fact updates are still persisted
+            if session_changed:
+                session.save(update_fields=["patient_context", "session_metadata", "updated_at"])
+            raise
 
         status_type = context.get("status")
         if status_type == "clarifying":
@@ -342,7 +353,9 @@ class ChatService:
 
         t_db_1 = time.time()
         bot_meta = dict(response.get('metadata', {}))
-        stage_timings = dict(bot_meta.get("stage_timings", {}))
+        # Pipeline timings live in the retrieval context for every branch (greeting, clarifying,
+        # emergency, ...); the full-answer branch adds its own on top.
+        stage_timings = {**(context.get("stage_timings") or {}), **(bot_meta.get("stage_timings") or {})}
         # Store timings with the single bot INSERT (no second metadata UPDATE round-trip);
         # stored values cover the request up to this final write.
         stage_timings["db_writes_ms"] = round(t_user_create_ms, 2)

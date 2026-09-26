@@ -5,6 +5,7 @@ from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
+from django.db.models import Count
 from django.views.decorators.csrf import csrf_exempt
 import time
 from collections import defaultdict
@@ -60,9 +61,13 @@ def extract_and_verify_token(request):
 # ==========================================================
 # HELPER: Validate User Owns Session
 # ==========================================================
-def get_user_session_or_404(session_id, firebase_uid):
+def get_user_session_or_404(session_id, firebase_uid, with_message_count=False):
     try:
-        session = ChatSession.objects.get(id=session_id)
+        qs = ChatSession.objects
+        if with_message_count:
+            # Same lookup + message count in one query (no extra COUNT round trip)
+            qs = qs.annotate(message_count_value=Count('messages'))
+        session = qs.get(id=session_id)
         if session.firebase_uid != firebase_uid:
             from django.http import Http404
             raise Http404("Session not found")
@@ -92,6 +97,7 @@ def create_session(request):
 
     title = request.data.get('title', 'New Chat')
     session = get_chat_service().create_new_session(firebase_uid, title)
+    session.message_count_value = 0  # brand-new session: skip the COUNT query
     serializer = ChatSessionSerializer(session)
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -102,7 +108,10 @@ def get_user_sessions(request):
     if error_response:
         return error_response
 
-    sessions = ChatSession.objects.filter(firebase_uid=firebase_uid).order_by('-updated_at')
+    # Count messages in the same query (was one COUNT query per session)
+    sessions = (ChatSession.objects.filter(firebase_uid=firebase_uid)
+                .annotate(message_count_value=Count('messages'))
+                .order_by('-updated_at'))
     serializer = ChatSessionSerializer(sessions, many=True)
     return Response(serializer.data)
 
@@ -141,10 +150,11 @@ def get_session_messages(request):
     session = get_user_session_or_404(session_id, firebase_uid)
     messages = session.messages.all().order_by('timestamp')
     serializer = MessageSerializer(messages, many=True)
+    data = serializer.data  # evaluate once; count from the fetched rows (no extra COUNT query)
 
     return Response({
-        'count': messages.count(),
-        'messages': serializer.data
+        'count': len(data),
+        'messages': data
     }, status=status.HTTP_200_OK)
 
 
@@ -223,7 +233,7 @@ def process_query(request):
     try:
         # [MEMORY] Pass chat_history to service
         user_msg, bot_msg = get_chat_service().process_user_query(
-            str(session.id), query, chat_history
+            str(session.id), query, chat_history, session=session
         )
         return Response({
             'user_message': MessageSerializer(user_msg).data,
@@ -315,9 +325,9 @@ def update_session_title(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    session = get_user_session_or_404(session_id, firebase_uid)
+    session = get_user_session_or_404(session_id, firebase_uid, with_message_count=True)
     session.title = title
-    session.save()
+    session.save(update_fields=['title', 'updated_at'])
 
     serializer = ChatSessionSerializer(session)
     return Response(serializer.data)

@@ -360,13 +360,13 @@ const handleSend = async () => {
       recentMessages
     );
 
-    // Update title on first user message
+    // Update title on first user message (in the background, so the reply is shown without
+    // waiting for the title round trip; the history list refreshes once the title is saved)
     const userMsgCount = updatedMessages.filter(m => !m.isBot).length;
     if (userMsgCount === 1) {
       const newTitle = userText.length > 25 ? userText.substring(0, 25) + "..." : userText;
       setCurrentChatTitle(newTitle);
-      await apiService.updateSessionTitle(activeSessionId, newTitle);
-      loadAllChatSessions(userUid);
+      apiService.updateSessionTitle(activeSessionId, newTitle).then(() => loadAllChatSessions(userUid));
     }
 
     const botText = response.botMessage?.message_text || response.response || "I've received your message.";

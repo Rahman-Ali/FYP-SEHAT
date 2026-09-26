@@ -278,9 +278,14 @@ Is this a capabilities question?"""
         q_clean = query.lower().strip().rstrip('!.,;:? ')
         if any(re.match(p, q_clean) for p in self.llm_service.GREETING_PATTERNS):
             use_classifier = False  # regex greeting returns early; skip the classifier call
+            is_regex_greeting = True
+        else:
+            is_regex_greeting = False
         t0 = time.time()
         f_status = _EXECUTOR.submit(self.llm_service.validate_query, query)
-        f_lang = _EXECUTOR.submit(self.llm_service.detect_language, query)
+        # Regex greetings: local language rule (matched the LLM on all 26 greeting forms tested:
+        # salam family -> roman_urdu, everything else -> english). Others keep the LLM detector.
+        f_lang = None if is_regex_greeting else _EXECUTOR.submit(self.llm_service.detect_language, query)
         f_cls = _EXECUTOR.submit(
             self.llm_service.classify_and_rewrite_query, query,
             chat_history=chat_history, patient_context=patient_context,
@@ -291,7 +296,10 @@ Is this a capabilities question?"""
         stage_timings["validate_query_ms"] = round((time.time() - t0) * 1000, 2)
         logger.info("[STAGE TIMING] validate_query: %.2f ms", stage_timings["validate_query_ms"])
 
-        language = f_lang.result()
+        if f_lang is not None:
+            language = f_lang.result()
+        else:
+            language = "roman_urdu" if re.search(r"salam|walekum|walaikum|^aoa", q_clean) else "english"
         stage_timings["detect_language_ms"] = round((time.time() - t0) * 1000, 2)
         logger.info("[STAGE TIMING] detect_language: %.2f ms", stage_timings["detect_language_ms"])
         cls_english_query = ""
@@ -837,41 +845,33 @@ Is this a capabilities question?"""
         # BRANCH 2: GREETING
         # ══════════════════════════════════════════════════════════════
         if st == "greeting":
-            greeting_prompt = (
-                f"You are SEHAT, a friendly medical assistant.\n"
-                f"The user just greeted you. Respond warmly in {language}.\n"
-                f"Keep it brief (2-3 sentences). Mention you help with health questions.\n"
-                f"User greeting: {query}\n"
-                f"Response:"
-            )
-            try:
-                greeting_resp = self.llm_service.llm.invoke(greeting_prompt)
+            # Template reply for regex-matched greetings (no LLM call); same style as the
+            # previous LLM greeting: return the greeting, introduce SEHAT, invite a health question.
+            g = query.lower().strip().rstrip('!.,;:? ')
+            if language == "roman_urdu":
                 greeting_text = (
-                    greeting_resp.content if hasattr(greeting_resp, "content")
-                    else str(greeting_resp)
-                ).strip()
-                return {
-                    "response": greeting_text,
-                    "metadata": {"source": "Greeting (Dynamic)", "ragas_metrics": {}}
-                }
-            except Exception as e:
-                logger.error("Greeting generation error: %s", e)
-                if language == "roman_urdu":
-                    greeting_text = (
-                        "Assalam-o-Alaikum! Main SEHAT AI hoon.\n\n"
-                        "Main aapki sehat se mutaliq madad kar sakta hoon — "
-                        "apni takleef ya alamaat batayein!"
-                    )
-                else:
-                    greeting_text = (
-                        "Hello! I am SEHAT AI, your personal health assistant.\n\n"
-                        "I can help you with understanding symptoms, medical guidance, "
-                        "and emergency triage. How can I help you today?"
-                    )
-                return {
-                    "response": greeting_text,
-                    "metadata": {"source": "Greeting (Fallback)", "ragas_metrics": {}}
-                }
+                    "Walaikum Assalam! Main SEHAT hoon, aapka medical assistant. "
+                    "Aap apni sehat se mutaliq koi bhi sawal pooch sakte hain — batayein, main aapki kya madad kar sakta hoon?"
+                )
+            elif g.startswith("good"):
+                greeting_text = (
+                    f"{g.title()}! I'm SEHAT, your friendly medical assistant. "
+                    "I'm here to help with any health-related questions — how can I help you today?"
+                )
+            elif g.startswith("how"):
+                greeting_text = (
+                    "I'm doing well, thank you for asking! I'm SEHAT, your friendly medical assistant. "
+                    "How can I help you with your health today?"
+                )
+            else:
+                greeting_text = (
+                    "Hello! I'm SEHAT, your friendly medical assistant. "
+                    "I'm here to help with any health-related questions — how can I help you today?"
+                )
+            return {
+                "response": greeting_text,
+                "metadata": {"source": "Greeting (Template)", "language": language, "ragas_metrics": {}}
+            }
 
                 # ══════════════════════════════════════════════════════════════
         # BRANCH 3: CAPABILITIES (LLM-generated, no hardcoded text)

@@ -54,6 +54,10 @@ class ChatSessionSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
     
     def get_message_count(self, obj):
+        # Use the count annotated by the view when present (avoids one query per session)
+        annotated = getattr(obj, 'message_count_value', None)
+        if annotated is not None:
+            return annotated
         return obj.messages.count()
 
 
