@@ -16,9 +16,54 @@ SECRET_KEY = config('SECRET_KEY', default='django-insecure-temp-key-change-in-pr
 DJANGO_DEBUG = os.getenv('DJANGO_DEBUG', 'False')
 DEBUG = DJANGO_DEBUG.lower() in ('true', '1', 't')
 
+RUNNING_DEV_SERVER = any('runserver' in arg for arg in sys.argv)
+
+
+class _LocalIPAllowedHosts(list):
+    """ALLOWED_HOSTS that also admits this machine's current IPv4 addresses.
+
+    Re-resolved (with a short cache) on every host check, so the dev server keeps
+    working when the Wi-Fi/LAN IP changes, without editing .env or restarting.
+    """
+    _TTL_SECONDS = 10
+
+    def __init__(self, hosts):
+        super().__init__(hosts)
+        self._cached_ips = []
+        self._cached_at = 0.0
+
+    def _local_ips(self):
+        import socket
+        import time
+        now = time.monotonic()
+        if now - self._cached_at < self._TTL_SECONDS:
+            return self._cached_ips
+        ips = set()
+        try:
+            ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+        except OSError:
+            pass
+        try:
+            # Primary outbound interface; UDP connect sends no packets
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(('8.8.8.8', 80))
+                ips.add(s.getsockname()[0])
+        except OSError:
+            pass
+        self._cached_ips = sorted(ips)
+        self._cached_at = now
+        return self._cached_ips
+
+    def __iter__(self):
+        yield from super().__iter__()
+        yield from self._local_ips()
+
+
 ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', '').split(',') if host.strip()]
-if not ALLOWED_HOSTS and any('runserver' in arg for arg in sys.argv):
+if not ALLOWED_HOSTS and RUNNING_DEV_SERVER:
     ALLOWED_HOSTS = ['localhost', '127.0.0.1', '0.0.0.0', '*']
+elif RUNNING_DEV_SERVER:
+    ALLOWED_HOSTS = _LocalIPAllowedHosts(ALLOWED_HOSTS)
 
 # Applications
 INSTALLED_APPS = [

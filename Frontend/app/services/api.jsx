@@ -4,9 +4,31 @@ import { Platform } from "react-native";
 import Constants from "expo-constants";
 import { getAuth, onAuthStateChanged } from "firebase/auth";
 
-const getBaseUrl = () => {
+const API_PORT = 8000;
+const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
 
-  return 'http://10.185.171.104:8000/api';
+// In development the backend runs on the same PC as Metro, so reuse the LAN IP
+// Expo serves the bundle from. It follows Wi-Fi changes automatically.
+const getDevMachineHost = () => {
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    Constants.expoGoConfig?.debuggerHost ||
+    Constants.manifest2?.extra?.expoGo?.debuggerHost ||
+    Constants.manifest?.debuggerHost;
+  const host = hostUri?.split(":")[0];
+  // Tunnel hosts (*.exp.direct) point at Metro, not the backend, so only accept raw IPs
+  return host && IPV4_RE.test(host) ? host : null;
+};
+
+const getBaseUrl = () => {
+  if (__DEV__) {
+    const host = getDevMachineHost();
+    if (host) return `http://${host}:${API_PORT}/api`;
+  }
+  if (process.env.EXPO_PUBLIC_API_URL) return process.env.EXPO_PUBLIC_API_URL;
+  // Android emulator reaches the host PC via 10.0.2.2
+  const fallbackHost = Platform.OS === "android" ? "10.0.2.2" : "localhost";
+  return `http://${fallbackHost}:${API_PORT}/api`;
 };
 
 export const BASE_URL = getBaseUrl();
