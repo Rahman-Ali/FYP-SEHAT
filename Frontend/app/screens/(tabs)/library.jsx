@@ -17,7 +17,8 @@ import {
 } from "react-native";
 import { Asset } from "expo-asset";
 import { WebView } from "react-native-webview";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useLocalSearchParams } from "expo-router";
 import { booksData } from "../../books";
 
 // Filter Chip
@@ -216,6 +217,32 @@ export default function LibraryScreen() {
   const [expandedId, setExpandedId] = useState(null);
   const [isUrdu, setIsUrdu] = useState(false);
   const [pdfModal, setPdfModal] = useState({ visible: false, item: null });
+  const listRef = useRef(null);
+  const cardY = useRef({});
+  const pendingScrollId = useRef(null);
+
+  // Opened from Home with { diseaseId, nonce }: show that disease expanded
+  const { diseaseId, nonce } = useLocalSearchParams();
+  useEffect(() => {
+    if (!diseaseId) return;
+    const id = Number(diseaseId);
+    setSearchQuery("");
+    setActiveFilter("All");
+    setExpandedId(id);
+    pendingScrollId.current = id;
+    if (cardY.current[id] !== undefined) {
+      listRef.current?.scrollTo({ y: Math.max(cardY.current[id] - 8, 0), animated: true });
+      pendingScrollId.current = null;
+    }
+  }, [diseaseId, nonce]);
+
+  const onCardLayout = (id, y) => {
+    cardY.current[id] = y;
+    if (pendingScrollId.current === id) {
+      pendingScrollId.current = null;
+      setTimeout(() => listRef.current?.scrollTo({ y: Math.max(y - 8, 0), animated: true }), 50);
+    }
+  };
 
   const filters = [
     "All",
@@ -328,20 +355,22 @@ export default function LibraryScreen() {
 
       {/* Cards */}
       <ScrollView
+        ref={listRef}
         style={styles.container}
         contentContainerStyle={styles.contentContainer}
         showsVerticalScrollIndicator={false}
       >
         {filteredDiseases.length > 0 ? (
           filteredDiseases.map((item) => (
-            <DiseaseCard
-              key={item.id}
-              item={item}
-              expanded={expandedId === item.id}
-              toggleExpand={() => toggleExpand(item.id)}
-              isUrdu={isUrdu}
-              onViewPDF={() => openPDF(item)}
-            />
+            <View key={item.id} onLayout={(e) => onCardLayout(item.id, e.nativeEvent.layout.y)}>
+              <DiseaseCard
+                item={item}
+                expanded={expandedId === item.id}
+                toggleExpand={() => toggleExpand(item.id)}
+                isUrdu={isUrdu}
+                onViewPDF={() => openPDF(item)}
+              />
+            </View>
           ))
         ) : (
           <View style={styles.emptyState}>
