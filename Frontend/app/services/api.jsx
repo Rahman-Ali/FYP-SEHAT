@@ -2,6 +2,7 @@
 import axios from "axios";
 import { Platform } from "react-native";
 import Constants from "expo-constants";
+import { File, Paths } from "expo-file-system";
 import { getAuth, onAuthStateChanged } from "firebase/auth";
 
 const API_PORT = 8000;
@@ -295,6 +296,53 @@ export const apiService = {
       return response.data;
     } catch (error) {
       console.error("Delete Message Error:", error.message);
+      throw error;
+    }
+  },
+
+
+  // Speech to text; returns the transcript (Roman Urdu or English). Audio is not stored server-side.
+  transcribeAudio: async (fileUri) => {
+    try {
+      const ext = (fileUri.split("?")[0].match(/\.(m4a|webm|wav)$/i)?.[1] || "m4a").toLowerCase();
+      const mimeTypes = { m4a: "audio/m4a", webm: "audio/webm", wav: "audio/wav" };
+      const form = new FormData();
+      form.append("audio", { uri: fileUri, name: `recording.${ext}`, type: mimeTypes[ext] });
+
+      const response = await api.post("/chat/voice/transcribe/", form, {
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: 60000,
+      });
+      return response.data?.text || "";
+    } catch (error) {
+      console.error("Transcribe Error:", error.message);
+      throw error;
+    }
+  },
+
+
+  // Fetches the reply's MP3 (cached on device per message) and returns a local file URI
+  getTtsAudio: async (messageId) => {
+    try {
+      const file = new File(Paths.cache, `tts_${messageId}.mp3`);
+      if (file.exists && file.size > 0) return file.uri;
+
+      const response = await api.post(
+        "/chat/voice/tts/",
+        { message_id: messageId },
+        {
+          responseType: "arraybuffer",
+          headers: { Accept: "audio/mpeg, application/json" },
+          timeout: 120000,
+        }
+      );
+
+      if (file.exists) file.delete();
+      file.create();
+      file.write(new Uint8Array(response.data));
+      return file.uri;
+    } catch (error) {
+      console.error("TTS Error:", error.message);
       throw error;
     }
   },

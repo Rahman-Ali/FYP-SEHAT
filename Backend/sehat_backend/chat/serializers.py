@@ -5,6 +5,7 @@ class MessageSerializer(serializers.ModelSerializer):
     is_bot = serializers.SerializerMethodField()
     possible_condition = serializers.SerializerMethodField()
     triage_level = serializers.SerializerMethodField()
+    response_type = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
@@ -17,7 +18,8 @@ class MessageSerializer(serializers.ModelSerializer):
             'metadata',         
             'is_bot',           
             'possible_condition', 
-            'triage_level'       
+            'triage_level',
+            'response_type'
         ]
         read_only_fields = ['id', 'timestamp', 'sequence_number']
 
@@ -34,6 +36,11 @@ class MessageSerializer(serializers.ModelSerializer):
     def get_triage_level(self, obj):
         if obj.metadata and isinstance(obj.metadata, dict):
             return obj.metadata.get('triage_level', None)  # None = not a clinical response
+        return None
+
+    def get_response_type(self, obj):
+        if obj.metadata and isinstance(obj.metadata, dict):
+            return obj.metadata.get('response_type', None)  # None = older message
         return None
 
 

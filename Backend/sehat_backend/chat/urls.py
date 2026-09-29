@@ -18,7 +18,11 @@ urlpatterns = [
     
     # Query Processing
     path('query/', views.process_query, name='process_query'),
-    
+
+    # Voice
+    path('voice/transcribe/', views.voice_transcribe, name='voice_transcribe'),
+    path('voice/tts/', views.voice_tts, name='voice_tts'),
+
     # Admin Panel
     path('admin/documents/list/', views.admin_list_documents, name='admin_list_documents'),
     path('admin/documents/add/', views.admin_add_document, name='admin_add_document'),

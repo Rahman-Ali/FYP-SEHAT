@@ -247,6 +247,127 @@ def process_query(request):
         )
 
 
+MAX_VOICE_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_VOICE_SECONDS = 60
+ALLOWED_VOICE_EXTENSIONS = {'.m4a', '.webm', '.wav'}
+
+
+@api_view(['POST'])
+def voice_transcribe(request):
+    """Speech to text for the query box (English + Roman Urdu). Audio is never stored."""
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
+    if not check_rate_limit(firebase_uid):
+        return Response(
+            {'error': 'Too many requests. Please wait a moment.'},
+            status=status.HTTP_429_TOO_MANY_REQUESTS
+        )
+
+    # Reject oversize bodies before Django parses/spools the upload
+    try:
+        content_length = int(request.META.get('CONTENT_LENGTH') or 0)
+    except ValueError:
+        content_length = 0
+    if content_length > MAX_VOICE_UPLOAD_BYTES + 64 * 1024:
+        return Response(
+            {'error': 'Recording is too large. Maximum size is 5 MB.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    audio = request.FILES.get('audio')
+    if not audio:
+        return Response({'error': 'audio file is required'}, status=status.HTTP_400_BAD_REQUEST)
+    if audio.size > MAX_VOICE_UPLOAD_BYTES:
+        return Response(
+            {'error': 'Recording is too large. Maximum size is 5 MB.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    if audio.size == 0:
+        return Response({'error': 'Recording is empty.'}, status=status.HTTP_400_BAD_REQUEST)
+    ext = os.path.splitext(audio.name or '')[1].lower()
+    if ext not in ALLOWED_VOICE_EXTENSIONS:
+        return Response(
+            {'error': 'Unsupported audio format. Use m4a, webm or wav.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    from . import voice_service
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        # Read into memory; Django removes any spooled temp upload file after the request
+        text, duration = voice_service.transcribe_audio(f"recording{ext}", audio.read())
+    except voice_service.VoiceRateLimited:
+        return Response(
+            {'error': 'Voice input is busy right now. Please wait a minute and try again.'},
+            status=status.HTTP_429_TOO_MANY_REQUESTS
+        )
+    except Exception as e:
+        logger.error("[VOICE] Transcription failed: %s", e)
+        return Response(
+            {'error': 'Could not transcribe the recording. Please try again or type your question.'},
+            status=status.HTTP_502_BAD_GATEWAY
+        )
+    finally:
+        audio.close()
+
+    if duration is not None and duration > MAX_VOICE_SECONDS + 1:
+        return Response(
+            {'error': 'Recording is too long. Maximum length is 60 seconds.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    return Response({'text': voice_service.to_roman_urdu(text)})
+
+
+@api_view(['POST'])
+def voice_tts(request):
+    """MP3 of any bot reply owned by the user; cached in media/tts/<message_id>.mp3."""
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
+    message_id = request.data.get('message_id')
+    if not message_id:
+        return Response({'error': 'message_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    from django.core.exceptions import ValidationError
+    try:
+        message = Message.objects.select_related('session').get(id=message_id)
+    except (Message.DoesNotExist, ValidationError, ValueError):
+        return Response({'error': 'Message not found'}, status=status.HTTP_404_NOT_FOUND)
+    if message.session.firebase_uid != firebase_uid:
+        return Response({'error': 'Message not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    from . import voice_service
+    meta = message.metadata if isinstance(message.metadata, dict) else {}
+    if message.sender != 'bot':
+        return Response(
+            {'error': 'Audio is only available for SEHAT replies.'},
+            status=status.HTTP_403_FORBIDDEN
+        )
+
+    from django.http import FileResponse
+    cached = voice_service.tts_cache_path(message.id)
+    if cached.exists() and cached.stat().st_size > 0:
+        return FileResponse(open(cached, 'rb'), content_type='audio/mpeg')
+
+    import logging
+    try:
+        language = voice_service.message_language(meta, message.message_text)
+        text = voice_service.speakable_text(meta, message.message_text, language)
+        path = voice_service.synthesize_to_cache(message.id, text, language)
+    except Exception as e:
+        logging.getLogger(__name__).error("[VOICE] TTS failed for %s: %s", message.id, e)
+        return Response(
+            {'error': 'Could not prepare audio right now. Please try again.'},
+            status=status.HTTP_502_BAD_GATEWAY
+        )
+    return FileResponse(open(path, 'rb'), content_type='audio/mpeg')
+
+
 @api_view(['DELETE'])
 def delete_session(request):
     firebase_uid, error_response = extract_and_verify_token(request)

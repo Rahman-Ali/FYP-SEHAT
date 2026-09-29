@@ -56,7 +56,13 @@
           }
         }
       ],
-      "expo-font"
+      "expo-font",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "SEHAT uses the microphone so you can speak your health question instead of typing it."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

@@ -1,15 +1,29 @@
 //D:\project\Frontend\app\screens\(tabs)\chatbot.jsx
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import {
+  RecordingPresets,
+  createAudioPlayer,
+  requestRecordingPermissionsAsync,
+  setAudioModeAsync,
+  useAudioRecorder,
+  useAudioRecorderState,
+} from "expo-audio";
+import * as Clipboard from "expo-clipboard";
+import { File } from "expo-file-system";
+import { useFocusEffect } from "expo-router";
+import * as Speech from "expo-speech";
 import { StatusBar } from "expo-status-bar";
 import { getAuth } from "firebase/auth";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   FlatList,
   Keyboard,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   ScrollView,
   StyleSheet,
@@ -35,6 +49,42 @@ const getTriageBadgeConfig = (triageStr) => {
     return { label: "Consult Doctor", bg: "#FFF3E0", border: "#FFCC80", text: "#E65100", icon: "doctor" };
   }
   return { label: triageStr, bg: "#E3F2FD", border: "#90CAF9", text: "#1565C0", icon: "information" };
+};
+
+const MAX_RECORDING_MS = 60000;
+const VOICE_RECORDING_OPTIONS = { ...RecordingPresets.HIGH_QUALITY, numberOfChannels: 1, bitRate: 64000 };
+const ROMAN_URDU_HINT = /\b(hai|hain|aap|apni|nahi|karein|mein|kisi|baraye|meharbani|jald|takleef|bukhar)\b/gi;
+
+const formatDuration = (ms) => {
+  const total = Math.floor((ms || 0) / 1000);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+};
+
+// Play/Stop on every bot reply that has text
+const isPlayableMessage = (message) => message.isBot && !!String(message.text || "").trim();
+
+const isRomanUrduMessage = (message) => {
+  const lang = String(message.language || "").toLowerCase();
+  if (lang.includes("urdu")) return true;
+  if (lang === "english") return false;
+  return (String(message.text || "").match(ROMAN_URDU_HINT) || []).length >= 2;
+};
+
+// answer_body without source lists, citation markers or markdown symbols, plus the short disclaimer
+const toSpeakableText = (message) => {
+  let text = String(message.text || "").split("--- Sources ---")[0];
+  text = text
+    .replace(/\[(\d+(\s*[,-]\s*\d+)*)\]/g, "")
+    .replace(/^\s*#{1,6}\s*/gm, "")
+    .replace(/^\s*([-*•>]|\d+[.)-])\s+/gm, "")
+    .replace(/[*_`#~|>]/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/ +([.,;:!?])/g, "$1")
+    .trim();
+  if (message.disclaimer && !text.toLowerCase().includes(message.disclaimer.toLowerCase())) {
+    text = `${text}\n${message.disclaimer}`;
+  }
+  return text.slice(0, Speech.maxSpeechInputLength || 4000);
 };
 
 // Formatted medical text renderer supporting bold, italics, section headers, and bullet lists
@@ -151,6 +201,20 @@ export default function ChatbotScreen() {
 
   const scrollViewRef = useRef();
 
+  // Voice input / playback / copy
+  const recorder = useAudioRecorder(VOICE_RECORDING_OPTIONS);
+  const recorderState = useAudioRecorderState(recorder, 250);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [playingId, setPlayingId] = useState(null);
+  const [ttsLoadingId, setTtsLoadingId] = useState(null);
+  const [toastText, setToastText] = useState(null);
+  const isRecordingRef = useRef(false);
+  const playerRef = useRef(null);
+  const playerSubRef = useRef(null);
+  const playTokenRef = useRef(0); // bumps on every stop/start so stale callbacks are ignored
+  const toastTimerRef = useRef(null);
+
   const quickQuestions = [
     "I have fever and headache",
     "What to do for cough?",
@@ -181,6 +245,230 @@ export default function ChatbotScreen() {
     });
     return () => keyboardDidShowListener.remove();
   }, []);
+
+  const showToast = useCallback((text) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastText(text);
+    toastTimerRef.current = setTimeout(() => setToastText(null), 1600);
+  }, []);
+
+  const stopPlayback = useCallback(() => {
+    playTokenRef.current += 1;
+    Speech.stop();
+    playerSubRef.current?.remove();
+    playerSubRef.current = null;
+    if (playerRef.current) {
+      try {
+        playerRef.current.pause();
+        playerRef.current.remove();
+      } catch {}
+      playerRef.current = null;
+    }
+    setPlayingId(null);
+    setTtsLoadingId(null);
+  }, []);
+
+  const deleteRecordingFile = (uri) => {
+    try {
+      if (uri) new File(uri).delete();
+    } catch {}
+  };
+
+  // Stops the recorder without transcribing (screen leave / app background)
+  const cancelRecording = useCallback(async () => {
+    if (!isRecordingRef.current) return;
+    isRecordingRef.current = false;
+    setIsRecording(false);
+    try {
+      await recorder.stop();
+    } catch {}
+    deleteRecordingFile(recorder.uri);
+    setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).catch(() => {});
+  }, [recorder]);
+
+  const startRecording = async () => {
+    if (isRecordingRef.current || isTranscribing || isSending) return;
+    stopPlayback();
+    try {
+      const permission = await requestRecordingPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert(
+          "Microphone access needed",
+          permission.canAskAgain
+            ? "Allow microphone access to ask your question by voice."
+            : "Microphone access is turned off for SEHAT. You can enable it in Settings, or type your question instead.",
+          permission.canAskAgain
+            ? [{ text: "OK" }]
+            : [{ text: "Cancel", style: "cancel" }, { text: "Open Settings", onPress: () => Linking.openSettings() }]
+        );
+        return;
+      }
+      await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+      await recorder.prepareToRecordAsync();
+      recorder.record();
+      isRecordingRef.current = true;
+      setIsRecording(true);
+    } catch (error) {
+      console.error("Recording Error:", error);
+      isRecordingRef.current = false;
+      setIsRecording(false);
+      Alert.alert("Microphone unavailable", "Couldn't start recording. Please try again or type your question.");
+    }
+  };
+
+  const stopRecordingAndTranscribe = async () => {
+    if (!isRecordingRef.current) return;
+    isRecordingRef.current = false;
+    setIsRecording(false);
+    const durationMs = recorderState.durationMillis || 0;
+    let uri = null;
+    try {
+      await recorder.stop();
+      uri = recorder.uri;
+    } catch (error) {
+      console.error("Stop Recording Error:", error);
+    }
+    setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }).catch(() => {});
+
+    if (!uri) {
+      showToast("Recording failed. Please try again.");
+      return;
+    }
+    if (durationMs > 0 && durationMs < 700) {
+      deleteRecordingFile(uri);
+      showToast("Recording too short. Hold on a bit longer.");
+      return;
+    }
+
+    setIsTranscribing(true);
+    try {
+      const transcript = (await apiService.transcribeAudio(uri)).trim();
+      if (!transcript) {
+        showToast("Couldn't catch that. Please try again.");
+      } else {
+        // Never auto-send: the user reviews/edits the transcript first
+        setInputText((prev) => (prev.trim() ? `${prev.trim()} ${transcript}` : transcript));
+      }
+    } catch (error) {
+      const status = error?.response?.status;
+      const serverMsg = error?.response?.data?.error;
+      let msg = "Couldn't convert your voice to text. Please try again or type your question.";
+      if (status === 429) msg = serverMsg || "Voice input is busy. Please wait a minute and try again.";
+      else if (status === 400 && serverMsg) msg = serverMsg;
+      else if (!error?.response) msg = "Couldn't reach SEHAT AI. Check your connection and try again.";
+      Alert.alert("Voice input", msg);
+    } finally {
+      deleteRecordingFile(uri);
+      setIsTranscribing(false);
+    }
+  };
+
+  const handleMicPress = () => {
+    if (isRecordingRef.current) stopRecordingAndTranscribe();
+    else startRecording();
+  };
+
+  // Auto-stop at 60 s
+  useEffect(() => {
+    if (isRecording && recorderState.durationMillis >= MAX_RECORDING_MS) {
+      stopRecordingAndTranscribe();
+    }
+  }, [isRecording, recorderState.durationMillis]);
+
+  const handleCopy = async (message) => {
+    const fullText = message.isBot && message.disclaimer
+      ? `${message.text}\n\n${message.disclaimer}`
+      : message.text;
+    try {
+      await Clipboard.setStringAsync(fullText || "");
+      showToast("Copied");
+    } catch {
+      showToast("Couldn't copy");
+    }
+  };
+
+  const handlePlayPress = async (message) => {
+    const key = message.id;
+    if (playingId === key || ttsLoadingId === key) {
+      stopPlayback();
+      return;
+    }
+    stopPlayback(); // only one audio at a time
+    const token = playTokenRef.current;
+    const isCurrent = () => token === playTokenRef.current;
+
+    if (!isRomanUrduMessage(message)) {
+      const finish = () => {
+        if (isCurrent()) setPlayingId(null);
+      };
+      setPlayingId(key);
+      Speech.speak(toSpeakableText(message), {
+        language: "en-US",
+        onDone: finish,
+        onStopped: finish,
+        onError: () => {
+          finish();
+          showToast("Couldn't play audio");
+        },
+      });
+      return;
+    }
+
+    if (!message.serverId) {
+      showToast("Audio isn't available for this message");
+      return;
+    }
+    setTtsLoadingId(key);
+    try {
+      const uri = await apiService.getTtsAudio(message.serverId);
+      if (!isCurrent()) return; // stopped or replaced while loading
+      await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+      if (!isCurrent()) return;
+      const player = createAudioPlayer({ uri });
+      playerRef.current = player;
+      playerSubRef.current = player.addListener("playbackStatusUpdate", (status) => {
+        if (status.didJustFinish && isCurrent()) stopPlayback();
+      });
+      player.play();
+      setTtsLoadingId(null);
+      setPlayingId(key);
+    } catch (error) {
+      if (!isCurrent()) return;
+      setTtsLoadingId(null);
+      const status = error?.response?.status;
+      showToast(
+        status === 403 || status === 404
+          ? "Audio isn't available for this message"
+          : !error?.response
+            ? "Couldn't reach SEHAT AI"
+            : "Couldn't prepare audio. Please try again."
+      );
+    }
+  };
+
+  // Stop audio / recording when leaving the screen or backgrounding the app
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        stopPlayback();
+        cancelRecording();
+      };
+    }, [stopPlayback, cancelRecording])
+  );
+
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state !== "active") {
+        stopPlayback();
+        cancelRecording();
+      }
+    });
+    return () => {
+      sub.remove();
+      stopPlayback();
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, [stopPlayback, cancelRecording]);
 
   const initApp = async (uid) => {
     try {
@@ -222,6 +510,7 @@ const loadAllChatSessions = async (uid) => {
 
  const loadPreviousChat = async (sid, title) => {
   try {
+    stopPlayback();
     setIsLoading(true);
     setShowHistory(false);
     setSessionId(sid);
@@ -251,6 +540,9 @@ const loadAllChatSessions = async (uid) => {
           triage: rawTriage,
           sources: sources,
           disclaimer: meta.disclaimer || null,
+          serverId: msg.id || null,
+          responseType: msg.response_type || meta.response_type || null,
+          language: meta.language || null,
         };
       });
       setMessages(formatted);
@@ -277,6 +569,7 @@ const loadAllChatSessions = async (uid) => {
 
   const createNewSession = () => {
     // No API call here: the server session is created on the first message (avoids empty sessions)
+    stopPlayback();
     setSessionId(null); // null = pending, not yet on server
     setCurrentChatTitle("New Chat");
     const welcomeMsg = createMessage("Hello! I am SEHAT AI. How can I help you?", true);
@@ -375,7 +668,11 @@ const handleSend = async () => {
     const botAnswerBody = botMeta.answer_body || botText;
     const botDisclaimer = botMeta.disclaimer || null;
 
-    const botMessage = createMessage(botAnswerBody, true, botCondition, botTriage, botSources, botDisclaimer);
+    const botMessage = createMessage(botAnswerBody, true, botCondition, botTriage, botSources, botDisclaimer, {
+      serverId: response.botMessage?.id || null,
+      responseType: botMeta.response_type || null,
+      language: botMeta.language || null,
+    });
     const finalMessages = [...updatedMessages, botMessage];
     setMessages(finalMessages);
     await saveMessagesLocally(activeSessionId, finalMessages);
@@ -434,7 +731,7 @@ const toggleHistory = () => {
   });
 };
 
-  const createMessage = (text, isBot, condition = null, triage = null, sources = [], disclaimer = null) => ({
+  const createMessage = (text, isBot, condition = null, triage = null, sources = [], disclaimer = null, voice = {}) => ({
     id: Date.now() + Math.random(),
     text,
     isBot,
@@ -442,6 +739,9 @@ const toggleHistory = () => {
     triage,
     sources,      // [{title, filename, pages:[]}]
     disclaimer,   // plain string or null
+    serverId: voice.serverId || null,         // backend message id (needed for server TTS)
+    responseType: voice.responseType || null, // "final" | "emergency" | "other"
+    language: voice.language || null,
     time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
   });
 
@@ -669,9 +969,43 @@ const toggleHistory = () => {
                         <Text style={styles.bubbleDisclaimer}>{message.disclaimer}</Text>
                       )}
 
-                      <Text style={[styles.messageTime, message.isBot ? styles.botTime : styles.userTime]}>
-                        {message.time}
-                      </Text>
+                      <View style={styles.messageFooter}>
+                        <Text style={[styles.messageTime, message.isBot ? styles.botTime : styles.userTime]}>
+                          {message.time}
+                        </Text>
+                        <View style={styles.messageActions}>
+                          {isPlayableMessage(message) && (
+                            <TouchableOpacity
+                              style={styles.messageActionBtn}
+                              onPress={() => handlePlayPress(message)}
+                              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                              accessibilityLabel={playingId === msgKey ? "Stop audio" : "Play audio"}
+                            >
+                              {ttsLoadingId === msgKey ? (
+                                <ActivityIndicator size="small" color="#0D47A1" />
+                              ) : (
+                                <MaterialCommunityIcons
+                                  name={playingId === msgKey ? "stop-circle-outline" : "play-circle-outline"}
+                                  size={20}
+                                  color="#0D47A1"
+                                />
+                              )}
+                            </TouchableOpacity>
+                          )}
+                          <TouchableOpacity
+                            style={styles.messageActionBtn}
+                            onPress={() => handleCopy(message)}
+                            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                            accessibilityLabel="Copy message"
+                          >
+                            <MaterialCommunityIcons
+                              name="content-copy"
+                              size={16}
+                              color={message.isBot ? "rgba(0,0,0,0.45)" : "rgba(255,255,255,0.85)"}
+                            />
+                          </TouchableOpacity>
+                        </View>
+                      </View>
                     </View>
                   </View>
                 );
@@ -691,8 +1025,31 @@ const toggleHistory = () => {
               )}
             </ScrollView>
 
+            {toastText && (
+              <View style={styles.toast} pointerEvents="none">
+                <Text style={styles.toastText}>{toastText}</Text>
+              </View>
+            )}
+
             {/* Input bar */}
             <View style={[styles.inputBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>
+              {(isRecording || isTranscribing) && (
+                <View style={styles.voiceStatusRow}>
+                  {isRecording ? (
+                    <>
+                      <View style={styles.recordingDot} />
+                      <Text style={styles.voiceStatusText}>
+                        Recording {formatDuration(recorderState.durationMillis)} / {formatDuration(MAX_RECORDING_MS)} · tap stop when done
+                      </Text>
+                    </>
+                  ) : (
+                    <>
+                      <ActivityIndicator size="small" color="#00BCD4" />
+                      <Text style={styles.voiceStatusText}>Converting voice to text...</Text>
+                    </>
+                  )}
+                </View>
+              )}
               <View style={styles.inputRow}>
                 <TextInput
                   style={styles.textInput}
@@ -705,9 +1062,25 @@ const toggleHistory = () => {
                   returnKeyType="default"
                 />
                 <TouchableOpacity
-                  style={[styles.sendBtn, (!inputText.trim() || isSending) && styles.sendBtnDisabled]}
+                  style={[
+                    styles.micBtn,
+                    isRecording && styles.micBtnRecording,
+                    (isSending || isTranscribing) && styles.micBtnDisabled,
+                  ]}
+                  onPress={handleMicPress}
+                  disabled={isSending || isTranscribing}
+                  activeOpacity={0.8}
+                  accessibilityLabel={isRecording ? "Stop recording" : "Speak your question"}
+                >
+                  {isTranscribing
+                    ? <ActivityIndicator size="small" color="#00BCD4" />
+                    : <MaterialCommunityIcons name={isRecording ? "stop" : "microphone"} size={22} color={isRecording ? "#FFF" : "#00BCD4"} />
+                  }
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.sendBtn, (!inputText.trim() || isSending || isRecording || isTranscribing) && styles.sendBtnDisabled]}
                   onPress={handleSend}
-                  disabled={!inputText.trim() || isSending}
+                  disabled={!inputText.trim() || isSending || isRecording || isTranscribing}
                   activeOpacity={0.8}
                 >
                   {isSending
@@ -936,6 +1309,42 @@ const styles = StyleSheet.create({
     marginBottom: 0,
   },
   sendBtnDisabled: { backgroundColor: "#CBD5E1", elevation: 0 },
+
+  // Voice input
+  micBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "#F1F5F9",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  micBtnRecording: { backgroundColor: "#EF4444", borderColor: "#EF4444" },
+  micBtnDisabled: { opacity: 0.5 },
+  voiceStatusRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingBottom: 8, paddingHorizontal: 4 },
+  recordingDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#EF4444" },
+  voiceStatusText: { fontSize: 12, color: "#475569", fontWeight: "500" },
+
+  // Message footer: time + copy / play actions
+  messageFooter: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
+  messageActions: { flexDirection: "row", alignItems: "center", gap: 12, marginTop: 6 },
+  messageActionBtn: { minWidth: 20, alignItems: "center", justifyContent: "center" },
+
+  // "Copied" toast
+  toast: {
+    position: "absolute",
+    alignSelf: "center",
+    bottom: 120,
+    backgroundColor: "rgba(15,23,42,0.88)",
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 16,
+    zIndex: 10,
+    elevation: 10,
+  },
+  toastText: { color: "#FFF", fontSize: 13, fontWeight: "600" },
   disclaimer: {
     flexDirection: "row",
     alignItems: "center",

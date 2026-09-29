@@ -20,3 +20,6 @@ local.properties
 # Environment variables
 .env
 backend/.env
+
+# Generated TTS audio cache
+media/

@@ -329,6 +329,15 @@ class ChatService:
         stage_timings["total_wall_clock_ms"] = round((t_db_1 - t_req_start) * 1000, 2)
         bot_meta["stage_timings"] = stage_timings
 
+        # Reply type drives voice playback: only final answers and emergency replies are spoken
+        if status_type == "emergency" or bot_meta.get("source") == "Emergency":
+            bot_meta["response_type"] = "emergency"
+            bot_meta.setdefault("language", context.get("language") or "english")  # emergency branch omits it
+        elif bot_meta.get("source") == "Document Knowledge Base":
+            bot_meta["response_type"] = "final"
+        else:
+            bot_meta["response_type"] = "other"
+
         bot_msg = Message.objects.create(
             session=session,
             sender='bot',
