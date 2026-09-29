@@ -11,7 +11,7 @@ import {
 } from "expo-audio";
 import * as Clipboard from "expo-clipboard";
 import { File } from "expo-file-system";
-import { useFocusEffect } from "expo-router";
+import { useFocusEffect, useLocalSearchParams } from "expo-router";
 import * as Speech from "expo-speech";
 import { StatusBar } from "expo-status-bar";
 import { getAuth } from "firebase/auth";
@@ -19,6 +19,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   AppState,
   FlatList,
   Keyboard,
@@ -60,8 +61,9 @@ const formatDuration = (ms) => {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 };
 
-// Play/Stop on every bot reply that has text
-const isPlayableMessage = (message) => message.isBot && !!String(message.text || "").trim();
+// Play/Stop on every bot reply that has text (not while it is still streaming)
+const isPlayableMessage = (message) =>
+  message.isBot && !message.streaming && !!String(message.text || "").trim();
 
 const isRomanUrduMessage = (message) => {
   const lang = String(message.language || "").toLowerCase();
@@ -86,6 +88,54 @@ const toSpeakableText = (message) => {
   }
   return text.slice(0, Speech.maxSpeechInputLength || 4000);
 };
+
+const STREAM_FLUSH_MS = 50;
+const STATUS_DELAY_MS = 700;
+const NEAR_BOTTOM_PX = 120;
+
+const useBlink = (duration = 500) => {
+  const opacity = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(opacity, { toValue: 0.15, duration, useNativeDriver: true }),
+        Animated.timing(opacity, { toValue: 1, duration, useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [opacity, duration]);
+  return opacity;
+};
+
+// Blinking cursor shown after streamed text
+const StreamingCursor = () => {
+  const opacity = useBlink(450);
+  return <Animated.Text style={[cursorStyles.cursor, { opacity }]}>▍</Animated.Text>;
+};
+
+// Animated "typing" dots while waiting for the first token; status text only when given
+const TypingStatus = ({ text }) => {
+  const opacity = useBlink(400);
+  return (
+    <View style={cursorStyles.statusRow}>
+      <Animated.View style={[cursorStyles.dots, { opacity }]}>
+        <View style={cursorStyles.dot} />
+        <View style={cursorStyles.dot} />
+        <View style={cursorStyles.dot} />
+      </Animated.View>
+      {text ? <Text style={cursorStyles.statusText}>{text}</Text> : null}
+    </View>
+  );
+};
+
+const cursorStyles = StyleSheet.create({
+  cursor: { color: "#0D47A1", fontSize: 15, lineHeight: 22 },
+  statusRow: { flexDirection: "row", alignItems: "center", gap: 10, minHeight: 22 },
+  dots: { flexDirection: "row", gap: 4 },
+  dot: { width: 7, height: 7, borderRadius: 4, backgroundColor: "#00BCD4" },
+  statusText: { fontSize: 14, color: "#475569", fontStyle: "italic", flexShrink: 1 },
+});
 
 // Formatted medical text renderer supporting bold, italics, section headers, and bullet lists
 const FormattedMedicalText = ({ text, isBot, isEmergency, styles }) => {
@@ -215,6 +265,18 @@ export default function ChatbotScreen() {
   const playTokenRef = useRef(0); // bumps on every stop/start so stale callbacks are ignored
   const toastTimerRef = useRef(null);
 
+  // Streaming replies
+  const [isStreaming, setIsStreaming] = useState(false);
+  const streamControllerRef = useRef(null);
+  const streamTextRef = useRef("");
+  const streamFlushTimerRef = useRef(null);
+  const nearBottomRef = useRef(true);
+  const chatEpochRef = useRef(0); // bumps on chat switch so late replies don't land in another chat
+
+  // Deep links from Home: { nonce, prefill?, sessionId?, title?, openHistory? }
+  const routeParams = useLocalSearchParams();
+  const handledNonceRef = useRef(null);
+
   const quickQuestions = [
     "I have fever and headache",
     "What to do for cough?",
@@ -237,6 +299,26 @@ export default function ChatbotScreen() {
     }
   }, []);
 
+  // Handle navigation from Home once per nonce, after the initial load finished
+  useEffect(() => {
+    const nonce = routeParams?.nonce;
+    if (!nonce || isLoading || handledNonceRef.current === nonce) return;
+    handledNonceRef.current = nonce;
+    if (routeParams.sessionId) {
+      loadPreviousChat(String(routeParams.sessionId), routeParams.title ? String(routeParams.title) : "Chat");
+      return;
+    }
+    if (routeParams.openHistory) {
+      setShowHistory(true);
+      if (userUid) loadAllChatSessions(userUid);
+      return;
+    }
+    // New chat, optionally with the input prefilled (never auto-sent)
+    createNewSession();
+    setShowHistory(false);
+    setInputText(routeParams.prefill ? String(routeParams.prefill) : "");
+  }, [routeParams?.nonce, isLoading]);
+
   useEffect(() => {
     const keyboardDidShowListener = Keyboard.addListener("keyboardDidShow", () => {
       if (scrollViewRef.current) {
@@ -245,6 +327,13 @@ export default function ChatbotScreen() {
     });
     return () => keyboardDidShowListener.remove();
   }, []);
+
+  // Abort an in-flight stream (the server still saves the reply) and mark the chat as switched
+  const leaveCurrentChat = () => {
+    chatEpochRef.current += 1;
+    nearBottomRef.current = true;
+    streamControllerRef.current?.abort();
+  };
 
   const showToast = useCallback((text) => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -470,6 +559,9 @@ export default function ChatbotScreen() {
     };
   }, [stopPlayback, cancelRecording]);
 
+  // Screen unmounts mid-stream: abort it (no-op once the stream has finished)
+  useEffect(() => () => streamControllerRef.current?.abort(), []);
+
   const initApp = async (uid) => {
     try {
       setIsLoading(true);
@@ -511,6 +603,7 @@ const loadAllChatSessions = async (uid) => {
  const loadPreviousChat = async (sid, title) => {
   try {
     stopPlayback();
+    leaveCurrentChat();
     setIsLoading(true);
     setShowHistory(false);
     setSessionId(sid);
@@ -570,6 +663,7 @@ const loadAllChatSessions = async (uid) => {
   const createNewSession = () => {
     // No API call here: the server session is created on the first message (avoids empty sessions)
     stopPlayback();
+    leaveCurrentChat();
     setSessionId(null); // null = pending, not yet on server
     setCurrentChatTitle("New Chat");
     const welcomeMsg = createMessage("Hello! I am SEHAT AI. How can I help you?", true);
@@ -604,6 +698,132 @@ const loadAllChatSessions = async (uid) => {
     createNewSession();
   }, []);
 
+// Bot message from the (non-streaming) /query/ response
+const botMessageFromResponse = (response) => {
+    const botText = response.botMessage?.message_text || response.response || "I've received your message.";
+    const botMeta = response.botMessage?.metadata || {};
+    const botCondition = botMeta.condition || null;
+    const botSources = Array.isArray(botMeta.sources) ? botMeta.sources : [];
+    // Resilient triage extraction: ensure medical answers with sources always get a triage badge
+    const botTriage = botMeta.triage_level || response.botMessage?.triage_level || (botSources.length > 0 ? "Doctor" : null);
+    const botAnswerBody = botMeta.answer_body || botText;
+    const botDisclaimer = botMeta.disclaimer || null;
+
+    return createMessage(botAnswerBody, true, botCondition, botTriage, botSources, botDisclaimer, {
+      serverId: response.botMessage?.id || null,
+      responseType: botMeta.response_type || null,
+      language: botMeta.language || null,
+    });
+};
+
+// Streams the reply into a placeholder bubble; falls back to /query/ once if streaming is unavailable
+const getBotReply = async (activeSessionId, userText, recentMessages, epoch) => {
+  const placeholderId = Date.now() + Math.random();
+  const inThisChat = () => epoch === chatEpochRef.current;
+  const updatePlaceholder = (patch) => {
+    if (!inThisChat()) return;
+    setMessages((prev) => prev.map((m) => (m.id === placeholderId ? { ...m, ...patch } : m)));
+  };
+  const clearFlush = () => {
+    if (streamFlushTimerRef.current) clearTimeout(streamFlushTimerRef.current);
+    streamFlushTimerRef.current = null;
+  };
+
+  streamTextRef.current = "";
+  const controller = new AbortController();
+  streamControllerRef.current = controller;
+  setMessages((prev) => [
+    ...prev,
+    { ...createMessage("", true), id: placeholderId, streaming: true, statusText: null, statusVisible: false },
+  ]);
+  setIsStreaming(true);
+
+  // Dots only at first; status text appears only if no meta/final arrives within 700 ms
+  let metaSeen = false;
+  let hideStatus = false; // meta said "other" (greeting, small talk, off-topic)
+  const statusTimer = setTimeout(() => {
+    if (!metaSeen) updatePlaceholder({ statusVisible: true });
+  }, STATUS_DELAY_MS);
+
+  try {
+    const result = await apiService.streamMessage(activeSessionId, userText, recentMessages, {
+      signal: controller.signal,
+      onEvent: (event, payload) => {
+        if (event === "status") {
+          updatePlaceholder({ statusText: payload?.text || null });
+        } else if (event === "meta") {
+          metaSeen = true;
+          if (payload?.response_type === "other") hideStatus = true;
+          updatePlaceholder({
+            triage: payload?.triage_level || null,
+            responseType: payload?.response_type || null,
+            language: payload?.language || null,
+            ...(hideStatus ? { statusVisible: false } : {}),
+          });
+        } else if (event === "token") {
+          streamTextRef.current += payload?.text || "";
+          if (!streamFlushTimerRef.current) {
+            streamFlushTimerRef.current = setTimeout(() => {
+              streamFlushTimerRef.current = null;
+              updatePlaceholder({ text: streamTextRef.current });
+            }, STREAM_FLUSH_MS);
+          }
+        }
+      },
+    });
+    clearFlush();
+
+    if (result.event === "error") {
+      const err = new Error(result.payload?.message || "Stream error");
+      err.streamMessage = result.payload?.message;
+      err.receivedEvents = true;
+      throw err;
+    }
+
+    // Canonical saved message replaces the streamed draft (same shape as the /query/ path)
+    const p = result.payload || {};
+    const sources = Array.isArray(p.sources) ? p.sources : [];
+    return {
+      ...createMessage(
+        p.answer_body || p.text || "",
+        true,
+        null,
+        p.triage_level || (sources.length > 0 ? "Doctor" : null),
+        sources,
+        p.disclaimer || null,
+        { serverId: p.message_id || null, responseType: p.response_type || null, language: p.language || null }
+      ),
+      id: placeholderId,
+    };
+  } catch (error) {
+    clearFlush();
+    if (error.aborted) {
+      // Stopped by the user: keep what arrived; the server still saves the full reply
+      return {
+        ...createMessage(streamTextRef.current.trim() || "Response stopped.", true),
+        id: placeholderId,
+        stopped: true,
+      };
+    }
+    // Nothing reached us (network / HTTP error / unsupported): retry once with the old endpoint
+    if (!error.streamMessage && (error.status || error.unsupported || !error.receivedEvents)) {
+      if (inThisChat()) setMessages((prev) => prev.filter((m) => m.id !== placeholderId));
+      setIsStreaming(false);
+      const response = await apiService.sendMessage(activeSessionId, userText, recentMessages);
+      return botMessageFromResponse(response);
+    }
+    throw error;
+  } finally {
+    clearTimeout(statusTimer);
+    streamControllerRef.current = null;
+    setIsStreaming(false);
+  }
+};
+
+const handleStopStreaming = () => {
+  streamControllerRef.current?.abort();
+};
+
 const handleSend = async () => {
   if (!inputText.trim() || isSending) return;
 
@@ -621,6 +841,8 @@ const handleSend = async () => {
   const updatedMessages = [...messages, userMessage];
   setMessages(updatedMessages);
   setIsSending(true);
+  nearBottomRef.current = true;
+  const epoch = chatEpochRef.current;
 
   try {
     let activeSessionId = sessionId;
@@ -645,45 +867,32 @@ const handleSend = async () => {
       text: msg.text
     }));
 
-    const response = await apiService.sendMessage(
-      activeSessionId,
-      userText,
-      recentMessages
-    );
+    const botMessage = await getBotReply(activeSessionId, userText, recentMessages, epoch);
 
     // Update the title in the background so the reply shows immediately
     const userMsgCount = updatedMessages.filter(m => !m.isBot).length;
-    if (userMsgCount === 1) {
+    if (userMsgCount === 1 && epoch === chatEpochRef.current) {
       const newTitle = userText.length > 25 ? userText.substring(0, 25) + "..." : userText;
       setCurrentChatTitle(newTitle);
       apiService.updateSessionTitle(activeSessionId, newTitle).then(() => loadAllChatSessions(userUid));
     }
 
-    const botText = response.botMessage?.message_text || response.response || "I've received your message.";
-    const botMeta = response.botMessage?.metadata || {};
-    const botCondition = botMeta.condition || null;
-    const botSources = Array.isArray(botMeta.sources) ? botMeta.sources : [];
-    // Resilient triage extraction: ensure medical answers with sources always get a triage badge
-    const botTriage = botMeta.triage_level || response.botMessage?.triage_level || (botSources.length > 0 ? "Doctor" : null);
-    const botAnswerBody = botMeta.answer_body || botText;
-    const botDisclaimer = botMeta.disclaimer || null;
-
-    const botMessage = createMessage(botAnswerBody, true, botCondition, botTriage, botSources, botDisclaimer, {
-      serverId: response.botMessage?.id || null,
-      responseType: botMeta.response_type || null,
-      language: botMeta.language || null,
-    });
     const finalMessages = [...updatedMessages, botMessage];
-    setMessages(finalMessages);
+    if (epoch === chatEpochRef.current) setMessages(finalMessages);
     await saveMessagesLocally(activeSessionId, finalMessages);
 
   } catch (error) {
     console.error("Send Error:", error);
+    if (epoch !== chatEpochRef.current) return; // user already switched chats
     isCurrentSessionEmpty.current = false; // don't reset to empty — user's message is there
     // Determine user-facing message based on error type (never show Emergency badge)
     const status = error?.response?.status;
     let errText = "Couldn't connect to SEHAT AI. Please try again.";
-    if (status === 429) {
+    if (error?.streamMessage) {
+      errText = error.streamMessage;
+    } else if (error?.receivedEvents) {
+      errText = "Connection lost while answering. Open this chat again from history to see the full answer.";
+    } else if (status === 429) {
       errText = "Too many requests. Please wait a moment and try again.";
     } else if (status === 503) {
       errText = "SEHAT AI is warming up. Please retry in a few seconds.";
@@ -750,10 +959,17 @@ const toggleHistory = () => {
   };
 
   useEffect(() => {
-    if (scrollViewRef.current && messages.length > 0) {
-      setTimeout(() => scrollViewRef.current.scrollToEnd({ animated: true }), 100);
+    // Follow new content only while the user is at (or near) the bottom
+    if (scrollViewRef.current && messages.length > 0 && nearBottomRef.current) {
+      setTimeout(() => scrollViewRef.current?.scrollToEnd({ animated: true }), 100);
     }
   }, [messages]);
+
+  const handleMessagesScroll = (e) => {
+    const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+    nearBottomRef.current =
+      contentSize.height - (contentOffset.y + layoutMeasurement.height) < NEAR_BOTTOM_PX;
+  };
 
   if (isLoading) {
     return (
@@ -846,6 +1062,8 @@ const toggleHistory = () => {
               style={styles.messagesContainer}
               contentContainerStyle={styles.messagesContent}
               keyboardShouldPersistTaps="handled"
+              onScroll={handleMessagesScroll}
+              scrollEventThrottle={100}
             >
               {messages.length <= 1 && (
                 <View style={styles.welcomeSection}>
@@ -892,13 +1110,23 @@ const toggleHistory = () => {
                         </View>
                       )}
 
-                      {/* Formatted answer body */}
-                      <FormattedMedicalText
-                        text={message.text}
-                        isBot={message.isBot}
-                        isEmergency={triageBadge?.label === "Emergency"}
-                        styles={styles}
-                      />
+                      {/* Streaming: status line until the first token, then the draft with a cursor */}
+                      {message.streaming && !message.text ? (
+                        <TypingStatus text={message.statusVisible ? message.statusText : null} />
+                      ) : (
+                        <FormattedMedicalText
+                          text={message.text}
+                          isBot={message.isBot}
+                          isEmergency={triageBadge?.label === "Emergency"}
+                          styles={styles}
+                        />
+                      )}
+                      {message.streaming && !!message.text && <StreamingCursor />}
+                      {message.stopped && (
+                        <Text style={styles.stoppedNote}>
+                          Stopped. The full answer is saved in this chat&apos;s history.
+                        </Text>
+                      )}
 
                       {/* Legacy condition tag (history messages) */}
                       {message.condition && !triageBadge && (
@@ -992,18 +1220,20 @@ const toggleHistory = () => {
                               )}
                             </TouchableOpacity>
                           )}
-                          <TouchableOpacity
-                            style={styles.messageActionBtn}
-                            onPress={() => handleCopy(message)}
-                            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                            accessibilityLabel="Copy message"
-                          >
-                            <MaterialCommunityIcons
-                              name="content-copy"
-                              size={16}
-                              color={message.isBot ? "rgba(0,0,0,0.45)" : "rgba(255,255,255,0.85)"}
-                            />
-                          </TouchableOpacity>
+                          {!message.streaming && (
+                            <TouchableOpacity
+                              style={styles.messageActionBtn}
+                              onPress={() => handleCopy(message)}
+                              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                              accessibilityLabel="Copy message"
+                            >
+                              <MaterialCommunityIcons
+                                name="content-copy"
+                                size={16}
+                                color={message.isBot ? "rgba(0,0,0,0.45)" : "rgba(255,255,255,0.85)"}
+                              />
+                            </TouchableOpacity>
+                          )}
                         </View>
                       </View>
                     </View>
@@ -1011,7 +1241,7 @@ const toggleHistory = () => {
                 );
               })}
 
-              {isSending && (
+              {isSending && !isStreaming && (
                 <View style={styles.botWrapper}>
                   <View style={[styles.messageBubble, styles.botBubble]}>
                     <View style={styles.thinkingContainer}>
@@ -1077,17 +1307,28 @@ const toggleHistory = () => {
                     : <MaterialCommunityIcons name={isRecording ? "stop" : "microphone"} size={22} color={isRecording ? "#FFF" : "#00BCD4"} />
                   }
                 </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.sendBtn, (!inputText.trim() || isSending || isRecording || isTranscribing) && styles.sendBtnDisabled]}
-                  onPress={handleSend}
-                  disabled={!inputText.trim() || isSending || isRecording || isTranscribing}
-                  activeOpacity={0.8}
-                >
-                  {isSending
-                    ? <ActivityIndicator size="small" color="#FFF" />
-                    : <MaterialCommunityIcons name="send" size={20} color="#FFF" />
-                  }
-                </TouchableOpacity>
+                {isStreaming ? (
+                  <TouchableOpacity
+                    style={[styles.sendBtn, styles.stopStreamBtn]}
+                    onPress={handleStopStreaming}
+                    activeOpacity={0.8}
+                    accessibilityLabel="Stop answer"
+                  >
+                    <MaterialCommunityIcons name="stop" size={22} color="#FFF" />
+                  </TouchableOpacity>
+                ) : (
+                  <TouchableOpacity
+                    style={[styles.sendBtn, (!inputText.trim() || isSending || isRecording || isTranscribing) && styles.sendBtnDisabled]}
+                    onPress={handleSend}
+                    disabled={!inputText.trim() || isSending || isRecording || isTranscribing}
+                    activeOpacity={0.8}
+                  >
+                    {isSending
+                      ? <ActivityIndicator size="small" color="#FFF" />
+                      : <MaterialCommunityIcons name="send" size={20} color="#FFF" />
+                    }
+                  </TouchableOpacity>
+                )}
               </View>
 
               <View style={styles.disclaimer}>
@@ -1309,6 +1550,8 @@ const styles = StyleSheet.create({
     marginBottom: 0,
   },
   sendBtnDisabled: { backgroundColor: "#CBD5E1", elevation: 0 },
+  stopStreamBtn: { backgroundColor: "#0D47A1" },
+  stoppedNote: { fontSize: 11, color: "#64748B", fontStyle: "italic", marginTop: 6 },
 
   // Voice input
   micBtn: {

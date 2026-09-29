@@ -1,6 +1,7 @@
 //D:\project\Frontend\app\services\api.jsx
 import axios from "axios";
 import { Platform } from "react-native";
+import { fetch as expoFetch } from "expo/fetch";
 import Constants from "expo-constants";
 import { File, Paths } from "expo-file-system";
 import { getAuth, onAuthStateChanged } from "firebase/auth";
@@ -111,6 +112,28 @@ api.interceptors.response.use(
   },
 );
 
+
+// expo/fetch can throw this from its native "didComplete" listener when a body stream we
+// aborted (Stop / unmount) is closed again. It is thrown outside our promise chain, so it is
+// filtered at the global handler, and only for a short window after a mid-stream abort.
+const STREAM_CLOSE_ERROR_RE = /stream is not in a state that permits close/i;
+let ignoreStreamCloseErrorUntil = 0;
+
+const isBenignStreamError = (e) =>
+  e?.name === "AbortError" ||
+  /aborted|cancel/i.test(String(e?.message || "")) ||
+  STREAM_CLOSE_ERROR_RE.test(String(e?.message || e || ""));
+
+if (global.ErrorUtils?.getGlobalHandler && !global.__sehatStreamErrorFilter) {
+  global.__sehatStreamErrorFilter = true;
+  const previousHandler = global.ErrorUtils.getGlobalHandler();
+  global.ErrorUtils.setGlobalHandler((error, isFatal) => {
+    if (Date.now() < ignoreStreamCloseErrorUntil && STREAM_CLOSE_ERROR_RE.test(String(error?.message || ""))) {
+      return;
+    }
+    previousHandler?.(error, isFatal);
+  });
+}
 
 export const apiService = {
 
@@ -240,6 +263,153 @@ export const apiService = {
     } catch (error) {
       console.error("Send Message Error:", error.message);
       throw error;
+    }
+  },
+
+
+  // Streams the reply from /chat/query/stream/ (SSE). onEvent(event, payload) gets
+  // status / meta / token / final / error. Resolves with {event, payload} of the last
+  // final|error event. Thrown errors carry: status (HTTP), aborted, receivedEvents.
+  streamMessage: async (sessionId, messageText, chatHistory = [], { onEvent, signal } = {}) => {
+    const firebaseUid = apiService._getFirebaseUid();
+    const controller = new AbortController();
+    // Set once final/error arrives: a finished stream is never aborted (expo/fetch would
+    // then close an already-closed body stream and throw)
+    let finished = false;
+    const abortMidStream = () => {
+      if (finished || controller.signal.aborted) return;
+      ignoreStreamCloseErrorUntil = Date.now() + 10000;
+      controller.abort();
+    };
+    const abortFromCaller = () => abortMidStream();
+    if (signal) {
+      if (signal.aborted) abortMidStream();
+      else signal.addEventListener("abort", abortFromCaller);
+    }
+    // Server sends a keep-alive every 15 s; give up if nothing arrives for 45 s
+    let idleTimer = null;
+    let timedOut = false;
+    const resetIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (finished) return;
+        timedOut = true;
+        abortMidStream();
+      }, 45000);
+    };
+
+    let receivedEvents = false;
+    try {
+      const headers = {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        "ngrok-skip-browser-warning": "true",
+      };
+      const user = await getResolvedUser(getAuth(), 3000);
+      if (user) headers.Authorization = `Bearer ${await user.getIdToken()}`;
+
+      resetIdle();
+      console.log("API Request: POST /chat/query/stream/");
+      const response = await expoFetch(`${BASE_URL}/chat/query/stream/`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          session_id: sessionId,
+          query: messageText,
+          firebase_uid: firebaseUid,
+          chat_history: (chatHistory || []).slice(-6),
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const err = new Error(`Stream request failed with status ${response.status}`);
+        err.status = response.status;
+        try {
+          err.data = JSON.parse(await response.text());
+        } catch {}
+        throw err;
+      }
+      if (!response.body || typeof response.body.getReader !== "function") {
+        const err = new Error("Streaming not supported");
+        err.unsupported = true;
+        throw err;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let resolveFinal;
+      const finalReceived = new Promise((resolve) => {
+        resolveFinal = resolve;
+      });
+
+      // Reads until done:true. After final/error it only drains (no cancel/releaseLock/abort),
+      // so expo/fetch completes and closes the body stream itself.
+      const pump = (async () => {
+        let last = null;
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (last) continue;
+          resetIdle();
+          buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
+
+          let sep;
+          while (!last && (sep = buffer.indexOf("\n\n")) !== -1) {
+            const block = buffer.slice(0, sep);
+            buffer = buffer.slice(sep + 2);
+            let event = "message";
+            const dataLines = [];
+            for (const line of block.split("\n")) {
+              if (line.startsWith(":")) continue; // keep-alive comment
+              if (line.startsWith("event:")) event = line.slice(6).trim();
+              else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+            }
+            if (!dataLines.length) continue;
+            let payload;
+            try {
+              payload = JSON.parse(dataLines.join("\n"));
+            } catch {
+              continue;
+            }
+            receivedEvents = true;
+            onEvent?.(event, payload);
+            if (event === "final" || event === "error") {
+              last = { event, payload };
+              finished = true;
+              if (idleTimer) clearTimeout(idleTimer);
+              resolveFinal(last);
+            }
+          }
+        }
+        return last;
+      })();
+      // Errors after final don't affect the answer; only unexpected ones are logged
+      pump.catch((e) => {
+        if (finished && !isBenignStreamError(e)) console.warn("Stream drain error:", e?.message || e);
+      });
+
+      // Return as soon as final arrives; the drain keeps running in the background
+      const last = await Promise.race([finalReceived, pump]);
+      if (!last) {
+        const err = new Error("Stream ended before the final answer");
+        throw err;
+      }
+      return last;
+    } catch (error) {
+      error.receivedEvents = receivedEvents;
+      // Anything thrown after our own mid-stream abort (Stop / unmount) is that AbortError
+      error.aborted = !timedOut && (signal?.aborted || controller.signal.aborted || error?.name === "AbortError");
+      if (timedOut) error.message = "Stream timed out";
+      // Stop / unmount: AbortError and expo's stream-close TypeError are expected, stay quiet
+      if (!error.aborted && !isBenignStreamError(error)) {
+        console.error("Stream Message Error:", error.message);
+      }
+      throw error;
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
+      if (signal) signal.removeEventListener("abort", abortFromCaller);
     }
   },
 
