@@ -621,8 +621,21 @@ Your response:"""
         )
 
     # ANSWER GENERATION (GEMINI PRIMARY -> GROQ FALLBACK)
-    def _call_generation_llm(self, prompt: str) -> str:
-        """Generate the answer with Gemini; fall back to Groq (GROQ_MODEL) on error, timeout or empty output."""
+    def _call_generation_llm(self, prompt: str, on_token=None) -> str:
+        """Generate the answer with Gemini; fall back to Groq (GROQ_MODEL) on error, timeout or empty output.
+
+        With on_token, the same prompt/model run in stream mode and each text piece is passed to on_token.
+        """
+        streamed_any = False
+
+        def _emit(piece):
+            nonlocal streamed_any
+            streamed_any = True
+            try:
+                on_token(piece)
+            except Exception as e:
+                logger.warning("on_token callback failed: %s", e)
+
         # 1. Primary: Google Gemini (gemini-3.1-flash-lite)
         google_api_key = os.getenv("GOOGLE_API_KEY")
         if google_api_key:
@@ -634,6 +647,28 @@ Your response:"""
                 if model is None:
                     genai.configure(api_key=google_api_key)
                     model = _aux_clients[("gemini", google_api_key)] = genai.GenerativeModel("gemini-3.1-flash-lite")
+                if on_token is not None:
+                    parts = []
+                    for chunk in model.generate_content(
+                        prompt,
+                        generation_config={
+                            "temperature": 0.3,
+                            "max_output_tokens": 1024,
+                        },
+                        stream=True,
+                    ):
+                        try:
+                            piece = chunk.text
+                        except ValueError:  # chunk without text (e.g. finish/safety metadata)
+                            piece = ""
+                        if piece:
+                            parts.append(piece)
+                            _emit(piece)
+                    text = "".join(parts).strip()
+                    if text:
+                        logger.info("Generated answer using Gemini (gemini-3.1-flash-lite, streamed)")
+                        return text, "gemini-3.1-flash-lite"
+                    raise ValueError("Gemini stream returned empty response")
                 resp = model.generate_content(
                     prompt,
                     generation_config={
@@ -667,8 +702,18 @@ Your response:"""
                     timeout=30,
                     max_retries=2,
                 )
-                resp = groq_client.invoke(prompt)
-                text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+                if on_token is not None and not streamed_any:
+                    # Stream the fallback only if Gemini sent nothing (no mixed partial output)
+                    parts = []
+                    for chunk in groq_client.stream(prompt):
+                        piece = chunk.content if hasattr(chunk, "content") else str(chunk)
+                        if piece:
+                            parts.append(piece)
+                            _emit(piece)
+                    text = "".join(parts).strip()
+                else:
+                    resp = groq_client.invoke(prompt)
+                    text = (resp.content if hasattr(resp, "content") else str(resp)).strip()
                 if text:
                     logger.info("Generated answer using Groq fallback (%s)", groq_model)
                     return text, groq_model
@@ -684,9 +729,10 @@ Your response:"""
     def generate_answer(
         self, original_query: str, retrieved_text: str,
         language: str, chat_history: list = None,
-        rolling_summary: str = None, patient_context: dict = None
+        rolling_summary: str = None, patient_context: dict = None,
+        on_token=None
     ) -> tuple[str, str]:
-        """Generate answer with security, memory, and language handling."""
+        """Generate answer with security, memory, and language handling (on_token streams the main draft)."""
 
         # Emergency check
         sanitize_result = self.sanitize_input(original_query)
@@ -794,7 +840,10 @@ Your response:"""
         )
 
         try:
-            answer, model_name = self._call_generation_llm(prompt)
+            if on_token is not None:
+                answer, model_name = self._call_generation_llm(prompt, on_token=on_token)
+            else:
+                answer, model_name = self._call_generation_llm(prompt)
             answer = answer.strip()
 
             # Handle contradictory content

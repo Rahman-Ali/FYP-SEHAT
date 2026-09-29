@@ -209,9 +209,21 @@ class ChatService:
     
     # backend/chat/services.py
 
-    def process_user_query(self, session_id, query, chat_history=None, session=None):
-        """Run the RAG pipeline for a query; `session` may be passed by the view to skip a second SELECT."""
+    def process_user_query(self, session_id, query, chat_history=None, session=None, on_event=None):
+        """Run the RAG pipeline for a query; `session` may be passed by the view to skip a second SELECT.
+
+        on_event(event, payload), when given, receives status/meta/token events for the streaming endpoint.
+        """
         t_req_start = time.time()
+        meta_sent = False
+        stream_kwargs = {}
+        if on_event is not None:
+            def _on_event(event, payload):
+                nonlocal meta_sent
+                if event == "meta":
+                    meta_sent = True
+                on_event(event, payload)
+            stream_kwargs["on_event"] = _on_event
         if session is None:
             session = ChatSession.objects.get(id=session_id)
         
@@ -244,7 +256,8 @@ class ChatService:
             query, recent_history,
             clarification_round=clarification_round,
             rolling_summary=session.rolling_summary,
-            patient_context=session.patient_context
+            patient_context=session.patient_context,
+            **stream_kwargs
         )
 
         # Subject switch: a new third-party patient resets patient_context so prior facts don't carry over.
@@ -303,7 +316,8 @@ class ChatService:
             response = self.rag_service.generate_with_context(
                 query, context, recent_history,
                 rolling_summary=session.rolling_summary,
-                patient_context=session.patient_context
+                patient_context=session.patient_context,
+                **stream_kwargs
             )
         except Exception:
             # Keep the previous behaviour on failure: subject/fact updates are still persisted
@@ -337,6 +351,14 @@ class ChatService:
             bot_meta["response_type"] = "final"
         else:
             bot_meta["response_type"] = "other"
+
+        # Template/non-LLM replies: meta goes out just before the final event
+        if on_event is not None and not meta_sent:
+            on_event("meta", {
+                "triage_level": bot_meta.get("triage_level"),
+                "response_type": bot_meta["response_type"],
+                "language": bot_meta.get("language") or context.get("language"),
+            })
 
         bot_msg = Message.objects.create(
             session=session,

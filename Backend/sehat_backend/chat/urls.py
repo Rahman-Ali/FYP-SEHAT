@@ -18,6 +18,7 @@ urlpatterns = [
     
     # Query Processing
     path('query/', views.process_query, name='process_query'),
+    path('query/stream/', views.process_query_stream, name='process_query_stream'),
 
     # Voice
     path('voice/transcribe/', views.voice_transcribe, name='voice_transcribe'),

@@ -218,9 +218,13 @@ Is this a capabilities question?"""
         self, query: str, chat_history: list = None,
         clarification_round: int = 0,
         rolling_summary: str = None,
-        patient_context: dict = None
+        patient_context: dict = None,
+        on_event=None
     ) -> dict:
-        """Classify, rewrite and retrieve context for a query (clarification capped at 5 rounds)."""
+        """Classify, rewrite and retrieve context for a query (clarification capped at 5 rounds).
+
+        on_event(event, payload), when given, receives progress events for the streaming endpoint.
+        """
         # Also run the existing LLM-based sanitize_input for prompt-injection / jailbreak detection
         sanitize_result = self.llm_service.sanitize_input(query)
         if sanitize_result.get('is_emergency'):
@@ -441,6 +445,9 @@ Is this a capabilities question?"""
             logger.warning("Vector store not ready")
             return base_response
 
+        if on_event is not None:
+            on_event("status", {"stage": "searching", "language": language})
+
         t0 = time.time()
         if language != "english" and cls_english_query:
             english_query = cls_english_query  # already translated by the intake classifier
@@ -538,9 +545,10 @@ Is this a capabilities question?"""
 
     def generate_with_context(
         self, query: str, context_data: dict, chat_history: list = None,
-        rolling_summary: str = None, patient_context: dict = None
+        rolling_summary: str = None, patient_context: dict = None,
+        on_event=None
     ) -> dict:
-        """Steps 5-6 of RAG pipeline with full response handling."""
+        """Steps 5-6 of RAG pipeline with full response handling (on_event streams progress and tokens)."""
 
         # No-info message
         def no_info(lang):
@@ -925,6 +933,12 @@ Your response:"""
 
         stage_timings = dict(context_data.get("stage_timings") or {})
 
+        stream_kwargs = {}
+        if on_event is not None:
+            on_event("status", {"stage": "writing", "language": language})
+            on_event("meta", {"triage_level": triage_level, "response_type": "final", "language": language})
+            stream_kwargs["on_token"] = lambda piece: on_event("token", {"text": piece})
+
         # Relevance check runs alongside generation; the answer is dropped if it fails.
         t0 = time.time()
         f_answer = _EXECUTOR.submit(
@@ -934,7 +948,8 @@ Your response:"""
             language,
             chat_history,
             rolling_summary=rolling_summary,
-            patient_context=patient_context
+            patient_context=patient_context,
+            **stream_kwargs
         )
         try:
             is_relevant = self.llm_service.verify_relevance(english_query, retrieved_text, chat_history)

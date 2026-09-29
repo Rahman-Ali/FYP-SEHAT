@@ -8,7 +8,14 @@ from django.shortcuts import get_object_or_404
 from django.db.models import Count
 from django.views.decorators.csrf import csrf_exempt
 import time
+import json
+import queue
+import re
+import threading
 from collections import defaultdict
+from django.http import StreamingHttpResponse
+from rest_framework.decorators import renderer_classes
+from rest_framework.renderers import BaseRenderer, JSONRenderer
 
 from .models import ChatSession, Message
 from .serializers import (
@@ -366,6 +373,163 @@ def voice_tts(request):
             status=status.HTTP_502_BAD_GATEWAY
         )
     return FileResponse(open(path, 'rb'), content_type='audio/mpeg')
+
+
+# STREAMING QUERY (Server-Sent Events)
+
+STREAM_STATUS_TEXT = {
+    "understanding": {"english": "Understanding your question...", "roman_urdu": "Aap ka sawal samajh raha hoon..."},
+    "searching": {"english": "Searching medical documents...", "roman_urdu": "Medical documents mein talaash kar raha hoon..."},
+    "writing": {"english": "Writing answer...", "roman_urdu": "Jawab likh raha hoon..."},
+}
+STREAM_ERROR_TEXT = {
+    "english": "Something went wrong while answering. Please try again.",
+    "roman_urdu": "Jawab dete hue masla hua. Baraye meharbani dobara koshish karein.",
+}
+_ROMAN_URDU_QUERY_HINT = re.compile(
+    r"\b(hai|hain|mujhe|mera|meri|mere|aap|ap|se|aur|ka|ki|ke|mein|kya|nahi|bukhar|dard|ulti|khansi|"
+    r"pait|sar|din|raat|takleef|dast|zukam|salam|kal|kaise|kia)\b",
+    re.IGNORECASE,
+)
+_STREAM_DONE = object()
+
+
+def _stream_language(query):
+    """Cheap guess used only for the first status line (the pipeline detects the real language)."""
+    return "roman_urdu" if _ROMAN_URDU_QUERY_HINT.search(query or "") else "english"
+
+
+def _sse(event, data):
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+class _EventStreamRenderer(BaseRenderer):
+    """Lets clients send Accept: text/event-stream (errors before streaming are rendered as JSON text)."""
+    media_type = 'text/event-stream'
+    format = 'sse'
+    charset = 'utf-8'
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        return json.dumps(data).encode('utf-8')
+
+
+@api_view(['POST'])
+@renderer_classes([JSONRenderer, _EventStreamRenderer])
+def process_query_stream(request):
+    """Same checks and pipeline as process_query, streamed as SSE: status, meta, token..., final | error."""
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+
+    session_id = request.data.get('session_id')
+    query = request.data.get('query')
+    chat_history = request.data.get('chat_history', [])
+
+    if not session_id or not query:
+        return Response(
+            {'error': 'session_id and query are required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    from .warmup import get_warmup_state, start_warmup
+    warmup_state = get_warmup_state()
+    if warmup_state == "idle":
+        start_warmup()
+        warmup_state = get_warmup_state()
+
+    if warmup_state in ("idle", "loading"):
+        resp = Response(
+            {'error': 'warming_up'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        resp['Retry-After'] = '15'
+        return resp
+    elif warmup_state == "failed":
+        return Response(
+            {'error': 'knowledge_base_unavailable'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+
+    if not check_rate_limit(firebase_uid):
+        return Response(
+            {'error': 'Too many requests. Please wait a moment.'},
+            status=status.HTTP_429_TOO_MANY_REQUESTS
+        )
+
+    if len(query) > 500:
+        return Response(
+            {'error': 'Query too long. Maximum 500 characters allowed.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    session = get_user_session_or_404(session_id, firebase_uid)
+    guess_lang = _stream_language(query)
+    # Same local greeting regex as validate_query: greetings get only meta + final (no status line)
+    from .llm_service import LLMService
+    q_clean = query.lower().strip().rstrip('!.,;:? ')
+    is_greeting = any(re.match(p, q_clean) for p in LLMService.GREETING_PATTERNS)
+    events = queue.Queue()
+    finished = threading.Event()  # set after final/error: late tokens are dropped
+
+    def emit(event, payload):
+        if finished.is_set():
+            return
+        if event == "status":
+            texts = STREAM_STATUS_TEXT.get(payload.get("stage"), {})
+            lang = "roman_urdu" if "urdu" in str(payload.get("language") or guess_lang) else "english"
+            payload = {"text": texts.get(lang) or texts.get("english", "")}
+        events.put((event, payload))
+
+    def worker():
+        import logging
+        from django.db import connection
+        try:
+            _, bot_msg = get_chat_service().process_user_query(
+                str(session.id), query, chat_history, session=session, on_event=emit
+            )
+            data = MessageSerializer(bot_msg).data
+            meta = data.get('metadata') or {}
+            events.put(("final", {
+                'message_id': str(bot_msg.id),
+                'text': data['message_text'],
+                'answer_body': meta.get('answer_body') or data['message_text'],
+                'sources': meta.get('sources') or [],
+                'disclaimer': meta.get('disclaimer'),
+                'triage_level': data.get('triage_level'),
+                'response_type': data.get('response_type'),
+                'language': meta.get('language'),
+                'timestamp': data.get('timestamp'),
+            }))
+        except Exception as e:
+            logging.getLogger(__name__).error("Error processing streamed query: %s", e, exc_info=True)
+            events.put(("error", {'message': STREAM_ERROR_TEXT[guess_lang]}))
+        finally:
+            finished.set()
+            events.put(_STREAM_DONE)
+            connection.close()  # this thread's DB connection
+
+    def event_stream():
+        if not is_greeting:
+            yield _sse("status", {"text": STREAM_STATUS_TEXT["understanding"][guess_lang]})
+        # Non-daemon: the bot message is still saved if the client disconnects mid-stream
+        threading.Thread(target=worker, name="sehat-query-stream").start()
+        while True:
+            try:
+                item = events.get(timeout=15)
+            except queue.Empty:
+                yield ": keep-alive\n\n"
+                continue
+            if item is _STREAM_DONE:
+                break
+            event, payload = item
+            yield _sse(event, payload)
+            if event in ("final", "error"):
+                break
+
+    response = StreamingHttpResponse(event_stream(), content_type='text/event-stream; charset=utf-8')
+    response['Cache-Control'] = 'no-cache'
+    response['X-Accel-Buffering'] = 'no'
+    return response
 
 
 @api_view(['DELETE'])
