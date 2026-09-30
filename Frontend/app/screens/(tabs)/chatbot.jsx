@@ -11,7 +11,7 @@ import {
 } from "expo-audio";
 import * as Clipboard from "expo-clipboard";
 import { File } from "expo-file-system";
-import { useFocusEffect, useLocalSearchParams } from "expo-router";
+import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import * as Speech from "expo-speech";
 import { StatusBar } from "expo-status-bar";
 import { getAuth } from "firebase/auth";
@@ -35,6 +35,7 @@ import {
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import apiService from "../../services/api";
+import { citationPages } from "../../../components/library/libraryUtils";
 
 // Case-insensitive, resilient triage badge resolver
 const getTriageBadgeConfig = (triageStr) => {
@@ -275,6 +276,7 @@ export default function ChatbotScreen() {
 
   // Deep links from Home: { nonce, prefill?, sessionId?, title?, openHistory? }
   const routeParams = useLocalSearchParams();
+  const router = useRouter();
   const handledNonceRef = useRef(null);
 
   const quickQuestions = [
@@ -463,6 +465,21 @@ export default function ChatbotScreen() {
       stopRecordingAndTranscribe();
     }
   }, [isRecording, recorderState.durationMillis]);
+
+  // Citation -> in-app Library at that book (openAtPage: open the reader directly)
+  const openCitation = (source, page, openAtPage) => {
+    router.push({
+      pathname: "/screens/library",
+      params: {
+        diseaseId: "",
+        doc: source?.doc_id || "",
+        title: source?.doc_id ? "" : source?.clean_title || "", // older messages: match by title
+        page: page ? String(page) : "",
+        open: openAtPage ? "1" : "",
+        citeNonce: String(Date.now()),
+      },
+    });
+  };
 
   const handleCopy = async (message) => {
     const fullText = message.isBot && message.disclaimer
@@ -1171,17 +1188,34 @@ const toggleHistory = () => {
                                 const seqNum = src.sequence || si + 1;
                                 const titleStr = src.title || `${seqNum}- ${src.clean_title || src.filename}`;
                                 const displayTitle = titleStr.match(/^\d+-\s*/) ? titleStr : `${seqNum}- ${titleStr}`;
+                                const pages = citationPages(src);
                                 return (
                                   <View key={si} style={styles.sourceItem}>
                                     <MaterialCommunityIcons name="file-document-outline" size={14} color="#0D47A1" style={{ marginTop: 2 }} />
                                     <View style={{ flex: 1 }}>
-                                      <Text style={styles.sourceItemTitle}>
-                                        {displayTitle}
-                                      </Text>
-                                      {src.pages && src.pages.length > 0 && (
-                                        <Text style={styles.sourceItemPages}>
-                                          Pages: {src.pages.join(", ")}
+                                      <TouchableOpacity
+                                        onPress={() => openCitation(src, pages[0], false)}
+                                        accessibilityRole="link"
+                                        accessibilityLabel={`Open ${src.clean_title || displayTitle} in the Library`}
+                                      >
+                                        <Text style={[styles.sourceItemTitle, styles.sourceItemLink]}>
+                                          {displayTitle}
                                         </Text>
+                                      </TouchableOpacity>
+                                      {pages.length > 0 && (
+                                        <View style={styles.pageChips}>
+                                          {pages.map((p) => (
+                                            <TouchableOpacity
+                                              key={p}
+                                              style={styles.pageChip}
+                                              onPress={() => openCitation(src, p, true)}
+                                              hitSlop={{ top: 6, bottom: 6, left: 2, right: 2 }}
+                                              accessibilityLabel={`Open page ${p}`}
+                                            >
+                                              <Text style={styles.pageChipText}>p. {p}</Text>
+                                            </TouchableOpacity>
+                                          ))}
+                                        </View>
                                       )}
                                     </View>
                                   </View>
@@ -1497,6 +1531,13 @@ const styles = StyleSheet.create({
   sourceItemPages: {
     fontSize: 11, color: "#64748B", marginTop: 2, fontWeight: "500",
   },
+  sourceItemLink: { color: "#0D47A1", textDecorationLine: "underline" },
+  pageChips: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 6 },
+  pageChip: {
+    minHeight: 28, paddingHorizontal: 10, borderRadius: 14,
+    backgroundColor: "#FFF", borderWidth: 1, borderColor: "#BBDEFB", justifyContent: "center",
+  },
+  pageChipText: { fontSize: 12, fontWeight: "700", color: "#0D47A1" },
 
   // Disclaimer inside bubble
   bubbleDisclaimer: {

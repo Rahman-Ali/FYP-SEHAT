@@ -20,6 +20,11 @@ urlpatterns = [
     path('query/', views.process_query, name='process_query'),
     path('query/stream/', views.process_query_stream, name='process_query_stream'),
 
+    # Reference-book library
+    path('library/documents/', views.library_documents, name='library_documents'),
+    path('library/documents/<str:doc_id>/link/', views.library_document_link, name='library_document_link'),
+    path('library/file/<str:signed>/', views.library_file, name='library_file'),
+
     # Voice
     path('voice/transcribe/', views.voice_transcribe, name='voice_transcribe'),
     path('voice/tts/', views.voice_tts, name='voice_tts'),

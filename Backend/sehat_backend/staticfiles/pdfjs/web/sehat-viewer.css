@@ -1,0 +1,11 @@
+/* SEHAT: the app has its own Download button; hide file actions that do not apply in-app */
+#printButton,
+#downloadButton,
+#secondaryPrint,
+#secondaryDownload,
+#secondaryOpenFile,
+#openFile,
+#editorModeButtons,
+#editorModeSeparator {
+  display: none !important;
+}

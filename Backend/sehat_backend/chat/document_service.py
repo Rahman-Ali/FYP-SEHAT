@@ -17,9 +17,30 @@ _TOC_LINE_RE = re.compile(r'\.{3,}\s*\d+\s*$')
 # Standalone page-number line: optional whitespace, digits only, optional whitespace
 _PAGE_NUMBER_LINE_RE = re.compile(r'^\s*\d{1,4}\s*$')
 
+# A line that reads like a bibliography entry (year, "et al", doi, URL, volume/pages markers)
+_CITATION_LINE_RE = re.compile(
+    r'(\b(19|20)\d{2}[a-z]?\b|\bet\s+al\b|\bdoi\b|https?://|www\.|\bvol\.|\bpp\.|\bibid\b)',
+    re.IGNORECASE,
+)
+
+
+# Author-with-initials pattern ("Coleman W,", "Nutting PA"); two on one line = author list
+_AUTHOR_INITIALS_RE = re.compile(r"\b[A-Z][a-zA-Z'\-]+,?\s+[A-Z]{1,3}[,.]?(?=\s|$)")
+
+
+def _looks_like_reference_page(non_empty_lines) -> bool:
+    """True when a large share of a page's lines read like bibliography entries."""
+    if not non_empty_lines:
+        return True
+    cited = sum(
+        1 for l in non_empty_lines
+        if _CITATION_LINE_RE.search(l) or len(_AUTHOR_INITIALS_RE.findall(l)) >= 2
+    )
+    return cited / len(non_empty_lines) >= 0.35
+
 
 def _clean_pages(docs):
-    """Strip repeated headers/footers, page numbers, TOC pages and reference sections from PDF pages."""
+    """Strip repeated headers/footers, page numbers, TOC pages and reference-list pages from PDF pages."""
     if not docs:
         return docs
 
@@ -43,16 +64,20 @@ def _clean_pages(docs):
     }
 
     # Steps 2-4: process each page
-    ref_section_started = False  # once True, all subsequent pages are dropped
+    # After a reference heading, following pages are skipped while they still read like
+    # reference lists; indexing resumes at the next content page (multi-chapter books have
+    # a reference list per chapter, so the rest of the book must not be dropped).
+    ref_section_started = False
     cleaned_docs = []
 
     for doc in docs:
-        # If we hit a reference section in a previous page, drop remainder
-        if ref_section_started:
-            continue
-
         lines = doc.page_content.splitlines()
         non_empty = [l for l in lines if l.strip()]
+
+        if ref_section_started:
+            if _looks_like_reference_page(non_empty):
+                continue
+            ref_section_started = False
 
         # Step 3: skip TOC pages
         if non_empty:
@@ -74,10 +99,11 @@ def _clean_pages(docs):
             if _PAGE_NUMBER_LINE_RE.match(line):
                 continue
 
-            # Detect reference/bibliography heading — truncate from here onward
+            # Detect reference/bibliography heading: drop the rest of this page and any
+            # following reference-list pages
             if stripped and _REFERENCE_HEADING_RE.match(stripped):
                 ref_section_started = True
-                break  # drop rest of this page and all subsequent pages
+                break
 
             cleaned_lines.append(line)
 

@@ -478,10 +478,13 @@ Is this a capabilities question?"""
 
     def _build_citations(self, context_docs: list) -> tuple:
         """Return (retrieved_text, cite_block, pages_str, sources) for the retrieved chunks."""
+        from .library_service import doc_id_for
+
         blocks = []
         pages = []
         citations_dict = {}    # book_name  -> set of page nums
         title_map = {}         # book_name  -> display_title
+        disease_map = {}       # book_name  -> disease tag
 
         for i, doc in enumerate(context_docs, 1):
             blocks.append(f"[{i}] {doc.page_content.strip()}")
@@ -498,10 +501,11 @@ Is this a capabilities question?"""
                 or book_name  # filename fallback
             )
             title_map[book_name] = display_title
+            disease_map.setdefault(book_name, doc.metadata.get("disease") or "general")
 
             if page != "Unknown":
                 try:
-                    page_num = int(page)
+                    page_num = int(page) + 1  # stored 0-based; users and the PDF viewer count from 1
                     pages.append(page_num)
                 except (ValueError, TypeError):
                     page_num = str(page)
@@ -509,7 +513,10 @@ Is this a capabilities question?"""
                 citations_dict.setdefault(book_name, set()).add(page_num)
 
         retrieved_text = "\n\n".join(blocks)
-        pages_str = ", ".join(str(p) for p in sorted(set(pages))) if pages else "Unknown"
+        def _page_order(p):
+            return (isinstance(p, str), p if isinstance(p, int) else 0, str(p))
+
+        pages_str = ", ".join(str(p) for p in sorted(set(pages), key=_page_order)) if pages else "Unknown"
 
         # Plain-text citation block (kept for backward compat / plain responses)
         cite = ""
@@ -517,26 +524,22 @@ Is this a capabilities question?"""
             cite = "\n\n--- Sources ---\n"
             for idx, book in enumerate(sorted(citations_dict), 1):
                 title = title_map.get(book, book)
-                sp = sorted(
-                    citations_dict[book],
-                    key=lambda x: (isinstance(x, str), str(x))
-                )
+                sp = sorted(citations_dict[book], key=_page_order)
                 cite += f"{idx}- {title}: Pages {', '.join(str(p) for p in sp)}\n"
 
         # Structured sources list for the API response metadata
         sources = []
         for idx, book in enumerate(sorted(citations_dict), 1):
-            sp = sorted(
-                citations_dict[book],
-                key=lambda x: (isinstance(x, str), str(x))
-            )
+            sp = sorted(citations_dict[book], key=_page_order)
             raw_title = title_map.get(book, book)
             sources.append({
                 "sequence": idx,
                 "title": f"{idx}- {raw_title}",
                 "clean_title": raw_title,
                 "filename": book,
-                "pages": [str(p) for p in sp],
+                "doc_id": doc_id_for(book),           # opens the book in the in-app Library
+                "disease": disease_map.get(book, "general"),
+                "pages": [p for p in sp if isinstance(p, int)],  # 1-based page numbers
             })
 
         return retrieved_text, cite, pages_str, sources

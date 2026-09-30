@@ -157,6 +157,16 @@ STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
+# Reference-book download policy: JSON {"<pdf file name>": false} for books that may only be read
+# in-app. Books not listed are downloadable.
+try:
+    import json as _json
+    LIBRARY_DOWNLOADABLE = {
+        str(k): bool(v) for k, v in _json.loads(os.getenv('LIBRARY_DOWNLOADABLE_JSON', '{}') or '{}').items()
+    }
+except (ValueError, AttributeError):
+    LIBRARY_DOWNLOADABLE = {}
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # CORS Settings (React Native & Web)

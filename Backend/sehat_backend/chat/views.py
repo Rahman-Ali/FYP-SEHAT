@@ -375,6 +375,93 @@ def voice_tts(request):
     return FileResponse(open(path, 'rb'), content_type='audio/mpeg')
 
 
+# REFERENCE-BOOK LIBRARY
+
+@api_view(['GET'])
+def library_documents(request):
+    """Reference books per disease, built from Neo4j + medical_documents/ (no file names or paths)."""
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+    from . import library_service
+    try:
+        return Response(library_service.get_library())
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("[LIBRARY] documents list failed: %s", e)
+        return Response({'error': 'Library is unavailable right now.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+@api_view(['GET'])
+def library_document_link(request, doc_id):
+    """Short-lived signed URLs (10 min) for reading in the in-app viewer or downloading one book."""
+    firebase_uid, error_response = extract_and_verify_token(request)
+    if error_response:
+        return error_response
+    from . import library_service
+    from urllib.parse import quote
+    from django.conf import settings as dj_settings
+    from django.urls import reverse
+
+    resolved = library_service.resolve(doc_id)
+    if resolved is None:
+        return Response({'error': 'not_available', 'message': 'This source is no longer available.'},
+                        status=status.HTTP_404_NOT_FOUND)
+    _, doc = resolved
+    purpose = request.GET.get('purpose', 'read')
+    if purpose not in ('read', 'download'):
+        return Response({'error': 'purpose must be read or download'}, status=status.HTTP_400_BAD_REQUEST)
+    if purpose == 'download' and not doc['downloadable']:
+        return Response({'error': 'not_downloadable', 'message': 'This book can be read in the app but not downloaded.'},
+                        status=status.HTTP_403_FORBIDDEN)
+
+    # Relative paths: the app joins them to its own server origin, so the viewer and the PDF are
+    # always same-origin (pdf.js requirement), also behind proxies such as ngrok.
+    token = library_service.sign_link(doc_id, purpose)
+    file_path = reverse('library_file', args=[token])
+    body = {
+        'doc_id': doc_id,
+        'purpose': purpose,
+        'file_path': file_path,
+        'expires_in': library_service.LINK_MAX_AGE_SECONDS,
+        'pages': doc['pages'],
+    }
+    if purpose == 'read':
+        static_url = '/' + dj_settings.STATIC_URL.strip('/') + '/'
+        body['viewer_path'] = f"{static_url}pdfjs/web/viewer.html?file={quote(file_path, safe='')}"
+    return Response(body)
+
+
+def library_file(request, signed):
+    """Serve one book for a valid, unexpired signed token. The token names a doc id, never a path."""
+    from django.core import signing
+    from django.http import FileResponse, JsonResponse
+    from . import library_service
+
+    if request.method not in ('GET', 'HEAD'):
+        return JsonResponse({'error': 'method not allowed'}, status=405)
+    try:
+        data = library_service.unsign_link(signed)
+    except signing.SignatureExpired:
+        return JsonResponse({'error': 'link_expired'}, status=403)
+    except signing.BadSignature:
+        return JsonResponse({'error': 'invalid_link'}, status=403)
+
+    resolved = library_service.resolve(data['d'])
+    if resolved is None:
+        return JsonResponse({'error': 'not_available'}, status=404)
+    path, doc = resolved
+    download = data['p'] == 'download'
+    if download and not doc['downloadable']:
+        return JsonResponse({'error': 'not_downloadable'}, status=403)
+
+    safe_name = re.sub(r'[^A-Za-z0-9._ -]+', '', doc['title'])[:80].strip() or 'reference-book'
+    response = FileResponse(open(path, 'rb'), content_type='application/pdf',
+                            as_attachment=download, filename=f"{safe_name}.pdf")
+    response['Cache-Control'] = 'private, max-age=600'
+    return response
+
+
 # STREAMING QUERY (Server-Sent Events)
 
 STREAM_STATUS_TEXT = {
@@ -658,7 +745,9 @@ def admin_add_document(request):
     try:
         result = get_chat_service().add_document(uploaded_file, filename)
         print(f"[ADMIN ADD] Result: {result}")
-        
+        from . import library_service
+        library_service.clear_cache()  # new book shows up in the Library on the next request
+
         if result.get('success'):
             return Response(result, status=status.HTTP_201_CREATED)
         else:
@@ -691,7 +780,9 @@ def admin_remove_document(request):
     try:
         result = get_chat_service().remove_document(filename)
         print(f"[ADMIN DELETE] Result: {result}")
-        
+        from . import library_service
+        library_service.clear_cache()  # removed book disappears from the Library
+
         if result.get('success'):
             return Response(result)
         else:

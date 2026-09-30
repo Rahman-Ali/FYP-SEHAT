@@ -1,5 +1,7 @@
 //D:\project\Frontend\app\services\api.jsx
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import axios from "axios";
+import * as LegacyFileSystem from "expo-file-system/legacy";
 import { Platform } from "react-native";
 import { fetch as expoFetch } from "expo/fetch";
 import Constants from "expo-constants";
@@ -34,6 +36,9 @@ const getBaseUrl = () => {
 };
 
 export const BASE_URL = getBaseUrl();
+// Server origin (BASE_URL without /api): the library returns relative paths that are joined to it
+export const SERVER_ORIGIN = BASE_URL.replace(/\/api\/?$/, "");
+const LIBRARY_CACHE_KEY = "library_documents_v1";
 console.log("[API Service] Active BASE_URL:", BASE_URL);
 
 const api = axios.create({
@@ -515,6 +520,69 @@ export const apiService = {
       console.error("TTS Error:", error.message);
       throw error;
     }
+  },
+
+
+  // Reference books per disease. Falls back to the last saved list when the server can't be
+  // reached: { library, offline, savedAt }.
+  getLibraryDocuments: async () => {
+    try {
+      const response = await api.get("/chat/library/documents/", { timeout: 20000 });
+      const library = response.data || { diseases: [] };
+      const savedAt = Date.now();
+      AsyncStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify({ library, savedAt })).catch(() => {});
+      return { library, offline: false, savedAt };
+    } catch (error) {
+      console.warn("Library documents unavailable:", error.message);
+      try {
+        const cached = JSON.parse((await AsyncStorage.getItem(LIBRARY_CACHE_KEY)) || "null");
+        if (cached?.library) return { library: cached.library, offline: true, savedAt: cached.savedAt };
+      } catch {}
+      throw error;
+    }
+  },
+
+
+  // Signed, short-lived link for one book. purpose "read" -> { viewerUrl, fileUrl, pages };
+  // "download" -> { fileUrl }. 404 means the book was removed.
+  getLibraryLink: async (docId, purpose = "read") => {
+    const response = await api.get(`/chat/library/documents/${encodeURIComponent(docId)}/link/`, {
+      params: { purpose },
+      timeout: 20000,
+    });
+    const data = response.data || {};
+    return {
+      fileUrl: data.file_path ? `${SERVER_ORIGIN}${data.file_path}` : null,
+      viewerUrl: data.viewer_path ? `${SERVER_ORIGIN}${data.viewer_path}` : null,
+      pages: data.pages,
+    };
+  },
+
+
+  // Downloads a book into the app's documents folder; onProgress(0..1). Returns the local file URI.
+  downloadLibraryBook: async (doc, onProgress) => {
+    const { fileUrl } = await apiService.getLibraryLink(doc.doc_id, "download");
+    const dir = `${LegacyFileSystem.documentDirectory}library/`;
+    await LegacyFileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => {});
+    const safeName = String(doc.title || "reference-book").replace(/[^A-Za-z0-9 ._-]+/g, "").trim().slice(0, 80) || "reference-book";
+    const target = `${dir}${safeName}.pdf`;
+
+    const task = LegacyFileSystem.createDownloadResumable(
+      fileUrl,
+      target,
+      { headers: { "ngrok-skip-browser-warning": "true" } },
+      ({ totalBytesWritten, totalBytesExpectedToWrite }) => {
+        if (totalBytesExpectedToWrite > 0) onProgress?.(totalBytesWritten / totalBytesExpectedToWrite);
+      }
+    );
+    const result = await task.downloadAsync();
+    if (!result || result.status !== 200) {
+      await LegacyFileSystem.deleteAsync(target, { idempotent: true }).catch(() => {});
+      const err = new Error(`Download failed (${result?.status ?? "no response"})`);
+      err.status = result?.status;
+      throw err;
+    }
+    return result.uri;
   },
 
 

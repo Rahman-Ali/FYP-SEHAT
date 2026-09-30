@@ -229,7 +229,9 @@ class CitationTitleFallbackTest(unittest.TestCase):
             sources[0]["clean_title"],
             "Dengue: Guidelines for Diagnosis, Treatment, Prevention and Control",
         )
-        self.assertEqual(sources[0]["pages"], ["5"])
+        # Stored page 5 is 0-based; citations use the real (1-based) page number
+        self.assertEqual(sources[0]["pages"], [6])
+        self.assertIn("Pages 6", cite_block)
 
     def test_falls_back_to_filename_when_display_title_absent(self):
         rag = RAGService.__new__(RAGService)
@@ -246,7 +248,7 @@ class CitationTitleFallbackTest(unittest.TestCase):
         self.assertEqual(len(sources), 1)
         self.assertEqual(sources[0]["title"], "1- 3-INFLUENZA-WHO.pdf")
         self.assertEqual(sources[0]["clean_title"], "3-INFLUENZA-WHO.pdf")
-        self.assertEqual(sources[0]["pages"], ["12"])
+        self.assertEqual(sources[0]["pages"], [13])
 
 
 # 5. Clarifying question tests
